@@ -1,0 +1,46 @@
+{
+  "method": "pyannote/segmentation-3.0",
+  "n_files": 160,
+  "profiles": {
+    "clean": {
+      "label": "Clean Speech (LibriSpeech-like)",
+      "n_samples": 40,
+      "mean_overlap_true": 0.0,
+      "mean_overlap_detected": 0.13279761904761905,
+      "mean_snr": 40.64741296768189,
+      "mean_duration": 9.2914984375,
+      "quality_v1": 0.8672023809523809,
+      "quality_v2": 0.6137128643836964
+    },
+    "light": {
+      "label": "Light Overlap (VoxCeleb-like)",
+      "n_samples": 40,
+      "mean_overlap_true": 0.02213501693622675,
+      "mean_overlap_detected": 0.2550841750841751,
+      "mean_snr": 40.54883675575256,
+      "mean_duration": 18.569396875000002,
+      "quality_v1": 0.744915824915825,
+      "quality_v2": 0.6055025691319018
+    },
+    "moderate": {
+      "label": "Moderate Overlap (Meeting-like)",
+      "n_samples": 40,
+      "mean_overlap_true": 0.13682260140217295,
+      "mean_overlap_detected": 0.27059829059829055,
+      "mean_snr": 42.16950364112854,
+      "mean_duration": 16.622446875,
+      "quality_v1": 0.7294017094017095,
+      "quality_v2": 0.612507120875345
+    },
+    "heavy": {
+      "label": "Heavy Overlap (Cocktail party)",
+      "n_samples": 40,
+      "mean_overlap_true": 0.25796167040243745,
+      "mean_overlap_detected": 0.29940476190476184,
+      "mean_snr": 38.660319805145264,
+      "mean_duration": 14.328434375,
+      "quality_v1": 0.7005952380952382,
+      "quality_v2": 0.5626275564997979
+    }
+  }
+}
