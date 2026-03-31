@@ -1,0 +1,8 @@
+Install before run:
+pip install torchaudio pyannote.audio pandas numpy torch
+
+How to run:
+1. Overlapping detection inlucded, with token
+python feature_extractor.py --audio_dir ./audio_samples --output features.csv --hf_token YOUR_HF_TOKEN
+2. With out overlapping, no know neede, faster
+python Feature_Extraction.py --audio_dir ./audio_samples  --output features.csv --no_overlap
