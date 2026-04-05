@@ -9,7 +9,7 @@ from mamba_ssm import Mamba
 MODEL_DIM = 1024
 LM_DIM = 4096  # LM hidden dims
 AUDIO_DIM = 1024  # WavLM output dims
-OVERLAP_FEATURES = 3  # per frame: (is_overlap, n_speakers, overlap_ratio)
+OVERLAP_FEATURES = 2  # per frame: (is_overlap, overlap_ratio)
 OVERLAP_DIM = 32  # output of OverlapEmbedding to learn representation
 
 
@@ -21,7 +21,7 @@ class OverlapEmbedding(nn.Module):
         self.embedding = nn.Sequential(nn.Linear(in_features, embed_dim), nn.GELU(), nn.Linear(embed_dim, embed_dim))
 
     def forward(self, overlap_info: torch.Tensor) -> torch.Tensor:
-        """(B, T, 3) -> (B, T, OVERLAP_DIM)"""
+        """(B, T, 2) -> (B, T, OVERLAP_DIM)"""
         return self.embedding(overlap_info)
 
 
