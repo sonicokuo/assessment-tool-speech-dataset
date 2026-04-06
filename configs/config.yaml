@@ -1,0 +1,58 @@
+# ── Model ──────────────────────────
+lm_name: "Qwen/Qwen3.5-9B" # swappeable to other models
+adapter_variant: "film-mamba"
+lora_rank: 16 # can go up after variant ablations; use use_rslora=True when expanding capacity
+lora_alpha: 32 # can go up after variant ablations; use use_rslora=True when expanding capacity
+lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_dropout: 0.05
+
+# ── Optimizer ──────────────────────────
+optimizer: "adamw"
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1e-8
+lr_adapter: 1e-4
+lr_lora: 2e-5
+weight_decay: 0.01
+grad_clip: 1.0
+
+# ── Scheduler ──────────────────────────
+lr_scheduler: "cosine"
+warmup_ratio: 0.03
+min_lr_ratio: 0.0
+
+# ── Training ──────────────────────────
+bf16: True
+batch_size: 16
+gradient_accumulation_steps: 1 # change to 2 or larger if training unstable
+gradient_checkpointing: false
+epochs: 3 # change to 10-15 for after variant ablations
+seed: 73
+max_target_length: 256
+resume_from: null  # path to checkpoint to resume, e.g. "./checkpoints/last.pt"
+
+# ── Data ──────────────────────────
+# TODO: Data directories need to be updated to whatever dataset is used
+data_dir: "./data/processed"
+descriptions_path: "./data/descriptions.json"
+features_path: null  # path to SP ground truth JSON from Person A (e.g. "./data/features.json")
+num_workers: 4
+pin_memory: true
+
+# ── Evaluation ──────────────────────────
+eval_every_epoch: 1
+prompt: "Describe the quality of this recording."
+
+# ── Generation ──────────────────────────
+temperature: 1.0  # 1.0 = greedy, < 1.0 = sharper, > 1.0 = more random
+top_k: 0          # 0 = disabled, > 0 = sample from top-k tokens
+top_p: 1.0        # 1.0 = disabled, < 1.0 = nucleus sampling
+
+# ── Saving ──────────────────────────
+save_dir: "./checkpoints"
+
+# ── Logging ──────────────────────────
+wandb_project: "speech-quality-adapter"
+wandb_run_name: null
+log_every: 10
+
