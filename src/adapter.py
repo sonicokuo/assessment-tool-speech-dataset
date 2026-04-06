@@ -245,11 +245,11 @@ class ConcatOnlyAdapter(nn.Module):
 
     def __init__(
         self,
-        audio_dim=AUDIO_DIM,
-        overlap_features=OVERLAP_FEATURES,
-        overlap_dim=OVERLAP_DIM,
-        mamba_dim=MODEL_DIM,
-        lm_dim=LM_DIM,
+        audio_dim: int = AUDIO_DIM,
+        overlap_features: int = OVERLAP_FEATURES,
+        overlap_dim: int = OVERLAP_DIM,
+        mamba_dim: int = MODEL_DIM,
+        lm_dim: int = LM_DIM,
     ):
         super().__init__()
         self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=mamba_dim)
@@ -260,7 +260,7 @@ class ConcatOnlyAdapter(nn.Module):
             nn.Linear(lm_dim, lm_dim),
         )
 
-    def forward(self, audio_features, overlap_info):
+    def forward(self, audio_features: torch.Tensor, overlap_info: torch.Tensor) -> torch.Tensor:
         x = self.compressor(audio_features)
         N = x.shape[1]
         o = self.overlap_embed(overlap_info)
@@ -278,11 +278,11 @@ class SigmoidGateAdapter(nn.Module):
 
     def __init__(
         self,
-        audio_dim=AUDIO_DIM,
-        overlap_features=OVERLAP_FEATURES,
-        overlap_dim=OVERLAP_DIM,
-        mamba_dim=MODEL_DIM,
-        lm_dim=LM_DIM,
+        audio_dim: int = AUDIO_DIM,
+        overlap_features: int = OVERLAP_FEATURES,
+        overlap_dim: int = OVERLAP_DIM,
+        mamba_dim: int = MODEL_DIM,
+        lm_dim: int = LM_DIM,
     ):
         super().__init__()
         self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=mamba_dim)
@@ -297,7 +297,7 @@ class SigmoidGateAdapter(nn.Module):
             nn.Linear(lm_dim, lm_dim),
         )
 
-    def forward(self, audio_features, overlap_info):
+    def forward(self, audio_features: torch.Tensor, overlap_info: torch.Tensor) -> torch.Tensor:
         x = self.compressor(audio_features)
         N = x.shape[1]
         x = self.proj_up(x)
@@ -317,12 +317,12 @@ class QFormerAdapter(nn.Module):
 
     def __init__(
         self,
-        audio_dim=AUDIO_DIM,
-        overlap_features=OVERLAP_FEATURES,
-        overlap_dim=OVERLAP_DIM,
-        lm_dim=LM_DIM,
-        n_queries=32,
-        n_heads=8,
+        audio_dim: int = AUDIO_DIM,
+        overlap_features: int = OVERLAP_FEATURES,
+        overlap_dim: int = OVERLAP_DIM,
+        lm_dim: int = LM_DIM,
+        n_queries: int = 32,
+        n_heads: int = 8,
     ):
         super().__init__()
         self.queries = nn.Parameter(torch.randn(1, n_queries, audio_dim) * 0.02)
@@ -337,7 +337,7 @@ class QFormerAdapter(nn.Module):
             nn.Linear(lm_dim, lm_dim),
         )
 
-    def forward(self, audio_features, overlap_info):
+    def forward(self, audio_features: torch.Tensor, overlap_info: torch.Tensor) -> torch.Tensor:
         B = audio_features.shape[0]
         N = self.queries.shape[1]
         q = self.queries.expand(B, -1, -1)
@@ -358,7 +358,7 @@ def build_adapter(variant: str = "film-mamba", **kwargs) -> nn.Module:
     """Build an adapter variant by name. Use this for wandb sweeps.
 
     All variants have the same interface:
-        forward(audio_features: (B,T,1024), overlap_info: (B,T,3)) → (B,N,lm_dim)
+        forward(audio_features: (B,T,1024), overlap_info: (B,T,2)) → (B,N,lm_dim)
     """
     variants = {
         "concat-only": lambda **kw: ConcatOnlyAdapter(**kw),
