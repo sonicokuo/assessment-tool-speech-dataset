@@ -18,6 +18,8 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
+from tqdm.auto import tqdm
+
 from adapter import build_adapter
 
 
@@ -280,6 +282,8 @@ def train(config: dict) -> None:
         train_loss = 0.0
         n_steps = 0
 
+        batch_bar = tqdm(total=len(train_loader), dynamic_ncols=True, leave=False, position=0, desc='Train')
+
         for batch_idx, batch in enumerate(train_loader):
             loss = compute_loss(
                 adapter,
@@ -315,6 +319,12 @@ def train(config: dict) -> None:
                     }
                 )
 
+            batch_bar.set_postfix(
+                loss="{:.04f}".format(float(train_loss / n_steps)),
+                lr="{:.06f}".format(float(curr_lr)))
+            batch_bar.update()
+
+        batch_bar.close()
         avg_train_loss = train_loss / n_steps
 
         # ── Validate ──
@@ -324,6 +334,8 @@ def train(config: dict) -> None:
             llm.eval()
             val_loss = 0.0
             n_val = 0
+
+            batch_bar = tqdm(total=len(val_loader), dynamic_ncols=True, leave=False, position=0, desc='Val')
 
             with torch.no_grad():
                 for batch in val_loader:
@@ -342,6 +354,11 @@ def train(config: dict) -> None:
                     val_loss += loss.item()
                     n_val += 1
 
+                    batch_bar.set_postfix(
+                        loss="{:.04f}".format(float(val_loss / n_val)))
+                    batch_bar.update()
+
+            batch_bar.close()
             avg_val_loss = val_loss / n_val
             wandb.log(
                 {
