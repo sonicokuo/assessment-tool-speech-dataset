@@ -32,13 +32,13 @@ class ClaimParser:
     # Each pattern: (regex, list of (feature_name, group_index_for_value, unit))
     # Group indices are 1-based.
     PATTERNS = [
+        # F0 with std dev (must be before base F0 to capture σ): "F0 = 187 Hz (σ = 34 Hz)"
+        (r"F0\s*=\s*(\d+\.?\d*)\s*Hz\s*\(?σ\s*=\s*(\d+\.?\d*)\s*Hz", [("f0_mean", 1, "Hz"), ("f0_std", 2, "Hz")]),
         # F0 / pitch
         (
             r"(?:F0|pitch|fundamental frequency)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
             [("f0_mean", 1, "Hz")],
         ),
-        # F0 with std dev: "F0 = 187 Hz (σ = 34 Hz)" or "F0 = 187 Hz with a standard deviation of 34 Hz"
-        (r"F0\s*=\s*(\d+\.?\d*)\s*Hz\s*\(?σ\s*=\s*(\d+\.?\d*)\s*Hz", [("f0_mean", 1, "Hz"), ("f0_std", 2, "Hz")]),
         # Formants: F1, F2, F3, F4
         (
             r"(F[1-4])\s*(?:=|≈|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
@@ -203,26 +203,33 @@ class SFSScorer:
         # Handle overlap IoU if both start and end are claimed
         claimed_starts = [c for c in claims if c.feature == "overlap_start"]
         claimed_ends = [c for c in claims if c.feature == "overlap_end"]
-        if claimed_starts and claimed_ends and "overlap_start" in ground_truth and "overlap_end" in ground_truth:
+        gt_segments = ground_truth.get("overlap_segments", [])
+
+        if claimed_starts and claimed_ends and gt_segments:
             pred_start = claimed_starts[0].value
             pred_end = claimed_ends[0].value
-            gt_start = ground_truth["overlap_start"]
-            gt_end = ground_truth["overlap_end"]
 
-            # IoU calculation
-            inter_start = max(pred_start, gt_start)
-            inter_end = min(pred_end, gt_end)
-            intersection = max(0, inter_end - inter_start)
-            union = (pred_end - pred_start) + (gt_end - gt_start) - intersection
-            iou = intersection / union if union > 0 else 0.0
-            correct = iou >= self.OVERLAP_IOU_THRESHOLD
+            # Match against best GT segment by IoU
+            best_iou = 0.0
+            best_gt = gt_segments[0]
+            for gt_start, gt_end in gt_segments:
+                inter_start = max(pred_start, gt_start)
+                inter_end = min(pred_end, gt_end)
+                intersection = max(0, inter_end - inter_start)
+                union = (pred_end - pred_start) + (gt_end - gt_start) - intersection
+                iou = intersection / union if union > 0 else 0.0
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt = (gt_start, gt_end)
+
+            correct = best_iou >= self.OVERLAP_IOU_THRESHOLD
 
             results.append(
                 {
                     "feature": "overlap_span",
                     "claimed": f"{pred_start}-{pred_end}s",
-                    "actual": f"{gt_start}-{gt_end}s",
-                    "error": 1.0 - iou,
+                    "actual": f"{best_gt[0]}-{best_gt[1]}s",
+                    "error": 1.0 - best_iou,
                     "tolerance": f"IoU≥{self.OVERLAP_IOU_THRESHOLD}",
                     "correct": correct,
                 }
@@ -236,8 +243,8 @@ class SFSScorer:
             precision = 0.0
 
         # Recall: how many ground-truth features were mentioned at all?
-        gt_features = set(ground_truth.keys()) - {"overlap_start", "overlap_end"}
-        if "overlap_start" in ground_truth:
+        gt_features = set(ground_truth.keys()) - {"overlap_segments"}
+        if gt_segments:
             gt_features.add("overlap_span")
 
         mentioned = set()
