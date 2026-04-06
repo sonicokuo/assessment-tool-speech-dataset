@@ -229,15 +229,19 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             output_entry["target"] = sample["target_text"]
 
         # Build ground truth: prefer SP measurements, fall back to parsing target text
+        # NOTE: SP features JSON format depends on Person A. SFSScorer expects
+        # numeric features as {"f0_mean": 187.0, "snr": 28.0, ...} and overlap
+        # as {"overlap_segments": [(start, end), ...]}. If Person A uses a
+        # different key (e.g. "overlap_start"/"overlap_end"), update this section.
         ground_truth = {}
         if sp_features and stem in sp_features:
-            ground_truth = sp_features[stem]
+            ground_truth = sp_features[stem].copy()
         elif "target_text" in sample:
             target_claims = claim_parser.parse(sample["target_text"])
             ground_truth = {c.feature: c.value for c in target_claims}
 
-        # Add all overlap segments as ground truth
-        if sample["overlap_segments"]:
+        # Add overlap segments from Pyannote (always available from .pt files)
+        if sample["overlap_segments"] and "overlap_segments" not in ground_truth:
             ground_truth["overlap_segments"] = sample["overlap_segments"]
 
         # SFS scoring
