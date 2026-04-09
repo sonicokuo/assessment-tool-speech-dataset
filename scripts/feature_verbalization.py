@@ -71,18 +71,33 @@ def build_feature_summary(row: dict) -> str:
     return " | ".join(lines)
 
 
+def _parse_overlap_segments(raw: str, sample_rate: int = 16000) -> str:
+    """Convert sample-index overlap segments to seconds. e.g. '40000-80000' -> '2.5-5.0 seconds'."""
+    if not raw or raw == "N/A" or raw.strip() == "":
+        return "None"
+    try:
+        parts = raw.split("-")
+        start_sec = int(parts[0]) / sample_rate
+        end_sec = int(parts[1]) / sample_rate
+        return f"{start_sec:.1f}-{end_sec:.1f} seconds"
+    except (ValueError, IndexError):
+        return "None"
+
+
 def generate_quality_description(row: dict) -> str:
     """
     Section 2: Call gemma4:e2b via Ollama to produce a descriptive quality paragraph.
     Temperature is 0 for deterministic output.
     """
+    overlap_segments_str = _parse_overlap_segments(row.get("overlap_segments", ""))
+
     prompt = f"""You are an expert speech audio quality evaluator. Given the following extracted audio features for a single speech sample, provide a concise natural language description of the sample's quality.
 
 Cover these aspects in order:
 1. Recording quality (SNR, reverberation/SRMR)
 2. Voice characteristics (F0/pitch, HNR, jitter, shimmer)
 3. Fluency & timing (speaking rate, pause patterns, silence ratio)
-4. Speaker overlap
+4. Speaker overlap (if overlap exists, state the time range and note that F0 and formant estimates are unreliable during overlap)
 5. Overall quality assessment
 
 Extracted Features:
@@ -92,6 +107,7 @@ Extracted Features:
 - SRMR (reverberation): {row.get('srmr', 'N/A')} (higher = cleaner)
 - Silence Ratio: {row.get('silence_ratio', 'N/A')}
 - Overlap Ratio: {row.get('overlap_ratio', 'N/A')}
+- Overlap Segments: {overlap_segments_str}
 - F0 Mean: {row.get('f0_mean_hz', 'N/A')} Hz
 - F0 Std Dev: {row.get('f0_sd_hz', 'N/A')} Hz
 - F0 Range: {row.get('f0_range_hz', 'N/A')} Hz ({row.get('f0_range_st', 'N/A')} semitones)

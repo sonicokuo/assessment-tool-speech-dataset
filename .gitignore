@@ -1,3 +1,14 @@
+# Data (too large for git)
+data/raw/**/*.wav
+data/raw/**/*.flac
+data/raw/**/*.mp3
+data/processed/**/*.pt
+!data/**/.gitkeep
+
+# Checkpoints
+checkpoints/
+*.pt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -205,3 +216,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.DS_Store
