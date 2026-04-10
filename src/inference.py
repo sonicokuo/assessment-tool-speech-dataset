@@ -131,8 +131,9 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         ),
     )
 
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    # Load checkpoint (use --checkpoint_device cpu for smaller GPUs)
+    map_loc = config.get("checkpoint_device", "cuda")
+    checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=map_loc)
     lm_hidden_size = llm.config.hidden_size
 
     adapter = (
@@ -284,6 +285,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--checkpoint_device", type=str, default="cuda", help="Device to load checkpoint (cpu for OOM on smaller GPUs)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -296,5 +298,6 @@ if __name__ == "__main__":
         config["top_k"] = args.top_k
     if args.top_p is not None:
         config["top_p"] = args.top_p
+    config["checkpoint_device"] = args.checkpoint_device
 
     evaluate(config, args.checkpoint, args.test_dir)

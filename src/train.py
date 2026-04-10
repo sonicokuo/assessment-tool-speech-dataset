@@ -271,7 +271,7 @@ def train(config: dict) -> None:
 
             batch_bar.set_postfix(
                 loss="{:.04f}".format(float(train_loss / n_steps)),
-                lr="{:.06f}".format(float(curr_lr)))
+                lr="{:.2e}".format(float(scheduler.get_last_lr()[0])))
             batch_bar.update()
 
         batch_bar.close()
