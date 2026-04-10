@@ -162,6 +162,22 @@ def load_overlap_pipeline():
         return None
 
 
+def _load_audio_for_pyannote(wav_path: str) -> dict:
+    """Load audio as in-memory dict to avoid pyannote's torchcodec dependency."""
+    try:
+        waveform, sr = torchaudio.load(wav_path)
+    except Exception:
+        import soundfile as sf
+
+        data, sr = sf.read(wav_path)
+        waveform = torch.from_numpy(data).float()
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+        else:
+            waveform = waveform.T
+    return {"waveform": waveform, "sample_rate": sr}
+
+
 def _get_overlap_mask(pipeline_output) -> tuple[np.ndarray, object]:
     """Extract per-frame binary overlap mask from segmentation model output.
 
@@ -191,7 +207,7 @@ def compute_overlap(wav_path: str, pipeline, sample_rate: int, duration_sec: flo
     if pipeline is None or duration_sec == 0:
         return {"overlap_ratio": float("nan"), "overlap_segments": float("nan")}
     try:
-        output = pipeline(wav_path)
+        output = pipeline(_load_audio_for_pyannote(wav_path))
         overlap_mask, frames = _get_overlap_mask(output)
         overlap_ratio = float(overlap_mask.mean())
 
@@ -232,8 +248,15 @@ def extract_overlap_info(wav_path: str, pipeline, sample_rate: int = 16000) -> t
       Column 0: is_overlap (binary)
       Column 1: overlap confidence (binary, matches column 0)
     """
-    info = torchaudio.info(wav_path)
-    T = int(info.num_frames / info.sample_rate * sample_rate) // 320
+    try:
+        info = torchaudio.info(wav_path)
+        num_frames, file_sr = info.num_frames, info.sample_rate
+    except Exception:
+        import soundfile as sf
+
+        info = sf.info(wav_path)
+        num_frames, file_sr = info.frames, info.samplerate
+    T = int(num_frames / file_sr * sample_rate) // 320
 
     overlap_info = torch.zeros(T, 2)
     segments = []
@@ -242,7 +265,7 @@ def extract_overlap_info(wav_path: str, pipeline, sample_rate: int = 16000) -> t
         return overlap_info, segments
 
     try:
-        output = pipeline(wav_path)
+        output = pipeline(_load_audio_for_pyannote(wav_path))
         overlap_mask, frames = _get_overlap_mask(output)
 
         # Map segmentation model frames → WavLM-aligned frames
@@ -693,9 +716,19 @@ def extract_features(wav_path: str, overlap_pipeline, srmr_model) -> dict:
     # Load waveform
     try:
         waveform, sr = torchaudio.load(wav_path)
-    except Exception as e:
-        print(f"    [ERROR] Could not load waveform: {e}")
-        return result  # remaining fields will be NaN in the DataFrame
+    except Exception:
+        try:
+            import soundfile as sf
+
+            data, sr = sf.read(wav_path)
+            waveform = torch.from_numpy(data).float()
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            else:
+                waveform = waveform.T  # (samples, channels) → (channels, samples)
+        except Exception as e:
+            print(f"    [ERROR] Could not load waveform: {e}")
+            return result  # remaining fields will be NaN in the DataFrame
 
     # SNR
     result["snr_db"] = estimate_snr(waveform)

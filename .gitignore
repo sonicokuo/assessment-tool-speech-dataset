@@ -3,6 +3,8 @@ data/raw/**/*.wav
 data/raw/**/*.flac
 data/raw/**/*.mp3
 data/processed/**/*.pt
+data/LibriSpeech/
+data/*.tar.gz
 !data/**/.gitkeep
 
 # Checkpoints

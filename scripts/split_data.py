@@ -18,7 +18,8 @@ from collections import defaultdict
 
 def get_speaker_id(filename: str) -> str:
     """Extract speaker ID from filename. e.g. '1089-134686-0000.flac' -> '1089'"""
-    return filename.split("-")[0]
+    basename = os.path.basename(filename)
+    return basename.split("-")[0]
 
 
 def split_data(
@@ -31,15 +32,18 @@ def split_data(
 ) -> None:
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
 
-    # Collect audio files
+    # Collect audio files (recursive to handle nested dirs like LibriSpeech)
+    import glob
+
     extensions = {".wav", ".flac", ".mp3", ".ogg"}
     audio_files = sorted([
-        f for f in os.listdir(audio_dir)
-        if os.path.splitext(f)[1].lower() in extensions
+        os.path.relpath(p, audio_dir)
+        for ext in extensions
+        for p in glob.glob(os.path.join(audio_dir, f"**/*{ext}"), recursive=True)
     ])
     assert len(audio_files) > 0, f"No audio files found in {audio_dir}"
 
-    # Group by speaker
+    # Group by speaker (uses filename, e.g. "1089-134686-0000.flac" -> "1089")
     speaker_files = defaultdict(list)
     for f in audio_files:
         speaker_id = get_speaker_id(f)
@@ -75,7 +79,7 @@ def split_data(
         for speaker in split_speakers:
             for f in speaker_files[speaker]:
                 src = os.path.join(audio_dir, f)
-                dst = os.path.join(split_dir, f)
+                dst = os.path.join(split_dir, os.path.basename(f))
                 shutil.copy2(src, dst)
                 count += 1
 

@@ -48,7 +48,17 @@ def preprocess(audio_dir: str, output_dir: str, sample_rate: int = 16000):
         stem = os.path.splitext(filename)[0]
 
         # Load and resample to target sample rate
-        waveform, sr = torchaudio.load(wav_path)
+        try:
+            waveform, sr = torchaudio.load(wav_path)
+        except Exception:
+            import soundfile as sf
+
+            data, sr = sf.read(wav_path)
+            waveform = torch.from_numpy(data).float()
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            else:
+                waveform = waveform.T
         if sr != sample_rate:
             waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
         waveform = waveform.mean(dim=0)  # wavlm expects mono

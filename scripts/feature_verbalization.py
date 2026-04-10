@@ -155,12 +155,15 @@ def main():
     parser.add_argument("--input",  default="features_final.csv", help="Input CSV")
     parser.add_argument("--output", default="verbalized_features_final_example.csv", help="Output CSV")
     parser.add_argument("--limit",  type=int, default=0, help="Limit rows (0 = all)")
+    parser.add_argument("--offset", type=int, default=0, help="Skip first N rows (for parallel work)")
     args = parser.parse_args()
 
     print(f"Feature Verbalization")
     print(f"  Model:  {MODEL} (temperature=0)")
     print(f"  Input:  {args.input}")
     print(f"  Output: {args.output}")
+    if args.offset:
+        print(f"  Offset: {args.offset} rows")
     if args.limit:
         print(f"  Limit:  {args.limit} rows")
     print()
@@ -169,8 +172,10 @@ def main():
         reader = csv.DictReader(f)
         rows = list(reader)
 
-    total = args.limit if args.limit else len(rows)
-    rows = rows[:total]
+    rows = rows[args.offset:]
+    if args.limit:
+        rows = rows[:args.limit]
+    total = len(rows)
     results = []
 
     for i, row in enumerate(rows):
