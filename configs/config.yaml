@@ -10,9 +10,9 @@ lora_dropout: 0.05
 optimizer: "adamw"
 adam_beta1: 0.9
 adam_beta2: 0.999
-adam_epsilon: 1e-8
-lr_adapter: 1e-4
-lr_lora: 2e-5
+adam_epsilon: 1.0e-8
+lr_adapter: 1.0e-4
+lr_lora: 2.0e-5
 weight_decay: 0.01
 grad_clip: 1.0
 
