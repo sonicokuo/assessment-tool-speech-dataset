@@ -5,6 +5,7 @@ data/raw/**/*.mp3
 data/processed/**/*.pt
 data/LibriSpeech/
 data/*.tar.gz
+*.csv
 !data/**/.gitkeep
 
 # Checkpoints

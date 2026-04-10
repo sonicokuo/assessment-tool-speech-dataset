@@ -125,6 +125,35 @@ class TestClaimParser:
     def test_no_claims(self):
         assert self.parser.parse("The audio quality is good.") == []
 
+    def test_jitter_parenthetical(self):
+        claims = self.parser.parse("jitter (2.28%)")
+        assert len(claims) == 1
+        assert claims[0].feature == "jitter"
+        assert claims[0].value == 2.28
+
+    def test_shimmer_parenthetical(self):
+        claims = self.parser.parse("shimmer (10.22%)")
+        assert len(claims) == 1
+        assert claims[0].feature == "shimmer"
+        assert claims[0].value == 10.22
+
+    def test_srmr(self):
+        claims = self.parser.parse("SRMR of 4.0478")
+        assert len(claims) == 1
+        assert claims[0].feature == "srmr"
+        assert claims[0].value == 4.0478
+
+    def test_real_description(self):
+        desc = "The recording quality is moderate, with an SNR of 26.15 dB and a low SRMR of 4.0478. Voice characteristics are stable, with a good HNR of 10.97 dB, though the jitter (2.28%) and shimmer (10.22%) suggest minor vocal instability. speaking rate of 4.312 syl/sec."
+        claims = self.parser.parse(desc)
+        features = {c.feature for c in claims}
+        assert "snr" in features
+        assert "srmr" in features
+        assert "hnr" in features
+        assert "jitter" in features
+        assert "shimmer" in features
+        assert "speaking_rate" in features
+
 
 class TestSFSScorer:
     def setup_method(self):

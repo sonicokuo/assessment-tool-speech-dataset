@@ -34,9 +34,9 @@ class ClaimParser:
     PATTERNS = [
         # F0 with std dev (must be before base F0 to capture σ): "F0 = 187 Hz (σ = 34 Hz)"
         (r"F0\s*=\s*(\d+\.?\d*)\s*Hz\s*\(?σ\s*=\s*(\d+\.?\d*)\s*Hz", [("f0_mean", 1, "Hz"), ("f0_std", 2, "Hz")]),
-        # F0 / pitch
+        # F0 / pitch (also matches "F0 mean of 96.96 Hz", "mean pitch of 150 Hz")
         (
-            r"(?:F0|pitch|fundamental frequency)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
+            r"(?:F0\s*(?:mean\s*)?|(?:mean\s+)?pitch|fundamental frequency)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
             [("f0_mean", 1, "Hz")],
         ),
         # Formants: F1, F2, F3, F4
@@ -44,15 +44,21 @@ class ClaimParser:
             r"(F[1-4])\s*(?:=|≈|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
             [("formant", 2, "Hz")],
         ),  # special handling: feature name includes F1/F2/etc
-        # SNR
-        (r"SNR\s*(?:=|≈|~|is|of)\s*(?:approximately\s+|estimated at\s+)?(\d+\.?\d*)\s*dB", [("snr", 1, "dB")]),
+        # SNR (also matches "Signal-to-Noise Ratio (SNR) is 18.54 dB")
+        (
+            r"(?:Signal-to-Noise\s+Ratio\s*(?:\(SNR\))?\s*|SNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+|estimated at\s+)?(\d+\.?\d*)\s*dB",
+            [("snr", 1, "dB")],
+        ),
         # RT60
         (r"RT60\s*(?:=|≈|~|<|>|is)\s*(?:approximately\s+)?(\d+\.?\d*)\s*s", [("rt60", 1, "s")]),
-        # HNR
-        (r"HNR\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*dB", [("hnr", 1, "dB")]),
-        # Speaking rate
+        # HNR (also matches "Harmonics-to-Noise Ratio (HNR) of 12.59 dB")
         (
-            r"(?:speaking rate|rate)\s*(?:=|≈|~|is|of|:)\s*(?:approximately\s+)?(\d+\.?\d*)\s*(?:syl(?:lables)?/s(?:ec(?:ond)?)?)",
+            r"(?:Harmonics?-to-Noise\s+Ratio\s*(?:\(HNR\))?\s*|HNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*dB",
+            [("hnr", 1, "dB")],
+        ),
+        # Speaking rate (matches "5.875 syl/s", "4.934 syllables per second")
+        (
+            r"(?:speaking rate|rate)\s*(?:=|≈|~|is|of|:)\s*(?:approximately\s+)?(\d+\.?\d*)\s*(?:syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?)",
             [("speaking_rate", 1, "syl/s")],
         ),
         # Spectral tilt
@@ -60,10 +66,12 @@ class ClaimParser:
             r"spectral (?:tilt|slope)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(-?\d+\.?\d*)\s*dB/oct(?:ave)?",
             [("spectral_tilt", 1, "dB/oct")],
         ),
-        # Jitter
-        (r"jitter\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*%", [("jitter", 1, "%")]),
-        # Shimmer
-        (r"shimmer\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*%", [("shimmer", 1, "%")]),
+        # Jitter (matches "jitter (2.28%)" and "jitter (local 1.26%)")
+        (r"jitter\s*(?:=|≈|~|is|of|\()\s*(?:local\s+)?(?:approximately\s+)?(\d+\.?\d*)\s*%", [("jitter", 1, "%")]),
+        # Shimmer (matches "shimmer (10.22%)" and "shimmer (local 3.45%)")
+        (r"shimmer\s*(?:=|≈|~|is|of|\()\s*(?:local\s+)?(?:approximately\s+)?(\d+\.?\d*)\s*%", [("shimmer", 1, "%")]),
+        # SRMR (reverberation metric, also matches "reverberation score (SRMR) of 9.65", "reverberation score of 10.22")
+        (r"(?:SRMR|reverberation\s+score\s*(?:\(SRMR\))?)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)", [("srmr", 1, "")]),
         # VOT
         (r"VOT\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(-?\d+\.?\d*)\s*ms", [("vot", 1, "ms")]),
         # Overlap temporal span: "overlap at 2.3-4.1s" or "overlapping speech from 2.3 to 4.1s"
@@ -155,6 +163,7 @@ class SFSScorer:
         "jitter": 0.3,  # ±0.3%
         "shimmer": 0.5,  # ±0.5%
         "vot": 8.0,  # ±8 ms
+        "srmr": 0.5,  # ±0.5
         "sample_rate": 0.0,  # exact match (it's an integer)
     }
 
