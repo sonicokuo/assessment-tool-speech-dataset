@@ -72,14 +72,20 @@ def build_feature_summary(row: dict) -> str:
 
 
 def _parse_overlap_segments(raw: str, sample_rate: int = 16000) -> str:
-    """Convert sample-index overlap segments to seconds. e.g. '40000-80000' -> '2.5-5.0 seconds'."""
+    """Convert sample-index overlap segments to seconds.
+    e.g. '40000-80000' -> '2.5-5.0s'
+    e.g. '40000-80000;120000-160000' -> '2.5-5.0s, 7.5-10.0s'
+    """
     if not raw or raw == "N/A" or raw.strip() == "":
         return "None"
     try:
-        parts = raw.split("-")
-        start_sec = int(parts[0]) / sample_rate
-        end_sec = int(parts[1]) / sample_rate
-        return f"{start_sec:.1f}-{end_sec:.1f} seconds"
+        result = []
+        for seg in raw.split(";"):
+            start_s, end_s = seg.strip().split("-")
+            start_sec = int(start_s) / sample_rate
+            end_sec = int(end_s) / sample_rate
+            result.append(f"{start_sec:.1f}-{end_sec:.1f}s")
+        return ", ".join(result)
     except (ValueError, IndexError):
         return "None"
 
