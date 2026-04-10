@@ -15,51 +15,18 @@ Usage:
 import argparse
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import yaml
-from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 from peft import LoraConfig, get_peft_model
 
 from adapter import build_adapter
+from dataset import PreprocessedDataset
 from sfs import ClaimParser, SFSScorer
-
-
-# ── Dataset ──────────────────────────────────────────────
-class PreprocessedDataset(Dataset):
-    """Loads pre-computed WavLM features + overlap info from .pt files."""
-
-    def __init__(self, data_dir: str, descriptions_path: str = None):
-        self.data_dir = data_dir
-        self.files = sorted([f for f in os.listdir(data_dir) if f.endswith(".pt")])
-
-        self.descriptions = None
-        if descriptions_path and os.path.exists(descriptions_path):
-            with open(descriptions_path) as f:
-                self.descriptions = json.load(f)
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        cached = torch.load(
-            os.path.join(self.data_dir, self.files[idx]),
-            weights_only=False,
-        )
-        stem = os.path.splitext(self.files[idx])[0]
-
-        result = {
-            "audio_features": cached["audio_features"],
-            "overlap_info": cached["overlap_info"],
-            "filename": cached.get("filename", self.files[idx]),
-            "overlap_segments": cached.get("overlap_segments", []),
-        }
-
-        if self.descriptions and stem in self.descriptions:
-            result["target_text"] = self.descriptions[stem]
-
-        return result
 
 
 # ── Generation ──────────────────────────────────────────────

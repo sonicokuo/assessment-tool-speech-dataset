@@ -7,75 +7,22 @@ Usage:
 """
 
 import argparse
-import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import torch.nn as nn
 import wandb
 import yaml
 from peft import LoraConfig, get_peft_model
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
-
 from tqdm.auto import tqdm
 
 from adapter import build_adapter
-
-
-# ── Collate ──────────────────────────────────────────────
-def collate_fn(batch):
-    """Pad variable-length audio features and overlap info to the longest in the batch."""
-    audio_features = [item["audio_features"] for item in batch]
-    overlap_info = [item["overlap_info"] for item in batch]
-    target_text = [item["target_text"] for item in batch]
-
-    max_len = max(f.shape[0] for f in audio_features)
-    B = len(batch)
-    audio_dim = audio_features[0].shape[-1]
-    overlap_dim = overlap_info[0].shape[-1]
-
-    audio_padded = torch.zeros(B, max_len, audio_dim)
-    overlap_padded = torch.zeros(B, max_len, overlap_dim)
-
-    for i, (af, oi) in enumerate(zip(audio_features, overlap_info)):
-        audio_padded[i, : af.shape[0]] = af
-        overlap_padded[i, : oi.shape[0]] = oi
-
-    return {
-        "audio_features": audio_padded,
-        "overlap_info": overlap_padded,
-        "target_text": target_text,
-    }
-
-
-# ── Dataset ──────────────────────────────────────────────
-class PreprocessedDataset(Dataset):
-    """Loads pre-computed WavLM features + overlap info from .pt files."""
-
-    def __init__(self, data_dir: str, descriptions_path: str):
-        self.data_dir = data_dir
-        self.files = sorted([f for f in os.listdir(data_dir) if f.endswith(".pt")])
-
-        with open(descriptions_path) as f:
-            self.descriptions = json.load(f)
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        cached = torch.load(
-            os.path.join(self.data_dir, self.files[idx]),
-            weights_only=False,
-        )
-        stem = os.path.splitext(self.files[idx])[0]
-        target_text = self.descriptions[stem]
-
-        return {
-            "audio_features": cached["audio_features"],
-            "overlap_info": cached["overlap_info"],
-            "target_text": target_text,
-        }
+from dataset import PreprocessedDataset, collate_fn
 
 
 # ── Loss ──────────────────────────────────────────────
@@ -182,6 +129,7 @@ def train(config: dict) -> None:
 
     train_set = PreprocessedDataset(train_dir, config["descriptions_path"])
     val_set = PreprocessedDataset(val_dir, config["descriptions_path"])
+    assert train_set.descriptions is not None, f"Descriptions not found: {config['descriptions_path']}"
     print(f"Loaded: train={len(train_set)}, val={len(val_set)}")
 
     train_loader = DataLoader(
@@ -223,6 +171,8 @@ def train(config: dict) -> None:
         T_max=total_steps - warmup_steps,
         eta_min=config["min_lr_ratio"] * config["lr_adapter"],
     )
+    # start_factor scales all param groups uniformly — the LoRA group
+    # (lr=2e-5) starts proportionally lower than the adapter group (lr=1e-4)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1e-8 / config["lr_adapter"],
@@ -422,18 +372,18 @@ if __name__ == "__main__":
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    # Override config with command line args
+    # Override config with command line args (expects --key value pairs)
+    if len(unknown) % 2 != 0:
+        parser.error(f"CLI overrides must be --key value pairs, got odd number of args: {unknown}")
     for i in range(0, len(unknown), 2):
         key = unknown[i].lstrip("-")
         val = unknown[i + 1]
-        if key in config:
-            if config[key] is None:
-                pass  # keep as string (e.g., resume_from path)
-            elif type(config[key]) == bool:
+        if key in config and config[key] is not None:
+            if isinstance(config[key], bool):
                 val = val.lower() in ("true", "1", "yes")
-            elif type(config[key]) == int:
+            elif isinstance(config[key], int):
                 val = int(val)
-            elif type(config[key]) == float:
+            elif isinstance(config[key], float):
                 val = float(val)
         config[key] = val
 

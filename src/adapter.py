@@ -188,13 +188,15 @@ class ReliabilityAwareAdapter(nn.Module):
 
         # Context Block
         if n_layers < 0:
-            raise ValueError(f"n_layers should > 0")
-        elif context_type == "mamba" and n_layers > 0:
+            raise ValueError("n_layers must be >= 0")
+        elif n_layers == 0 or context_type == "none":
+            self.context = nn.Identity()
+        elif context_type == "mamba":
             self.context = MambaContextBlock(d_model=d_model, n_layers=n_layers)
-        elif context_type == "attn" and n_layers > 0:
+        elif context_type == "attn":
             self.context = SelfAttentionContextBlock(d_model=d_model, n_layers=n_layers)
         else:
-            self.context = nn.Identity()
+            raise ValueError(f"Unknown context_type '{context_type}'. Choose from: mamba, attn, none")
 
         self.proj_up = nn.Linear(d_model, lm_dim)
 
