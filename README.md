@@ -84,3 +84,62 @@ tests/
 pip install pytest
 python -m pytest tests/ -v
 ```
+
+## PSC Team Workflow
+
+The team shares one conda environment on PSC Bridges-2 at:
+
+```
+/ocean/projects/cis260125p/shared/envs/project
+```
+
+### Daily workflow
+
+```bash
+# 1. Grab an H100 node (H100s on Bridges-2 are 80 GB, partition tag is h100-80)
+interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis260125p
+# Alternatives if H100s are full:
+#   --gres=gpu:v100-32:1
+#   --gres=gpu:l40s-48:1
+# If `-p GPU-shared` errors for H100, try `-p GPU` instead.
+
+# 2. Activate the shared env
+module load anaconda3
+conda deactivate
+conda activate /ocean/projects/cis260125p/shared/envs/project
+
+# 3. Stop your ~/.local site-packages from shadowing the shared env
+export PYTHONNOUSERSITE=1
+
+# 4. Sanity check
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+### Shorter activation name (one-time per teammate)
+
+Append the shared envs directory so `conda activate project` works instead of the full path:
+
+```bash
+conda config --append envs_dirs /ocean/projects/cis260125p/shared/envs
+# from now on:
+conda activate project
+```
+
+### Group membership check
+
+Confirm you're on the project allocation:
+
+```bash
+groups | tr ' ' '\n' | grep cis260125p
+```
+
+If this prints nothing, the PI needs to add you to the `cis260125p` allocation before `interact -A cis260125p` will work.
+
+### Valid Bridges-2 GPU types (for `--gres=gpu:<type>:N`)
+
+| Tag | Memory |
+|---|---|
+| `v100-16` | 16 GB |
+| `v100-32` | 32 GB |
+| `l40s-48` | 48 GB |
+| `h100-80` | 80 GB |
