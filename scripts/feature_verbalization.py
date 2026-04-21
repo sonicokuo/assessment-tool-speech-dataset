@@ -36,39 +36,93 @@ def fmt(val, suffix="", decimal=2):
         return str(val)
 
 
+# ─── Column → display / unit helpers (column-agnostic) ──────────────────────
+#
+# Adding a new feature column to the extraction CSV requires NO changes here,
+# provided the column name ends in one of the known unit suffixes below. The
+# verbalizer will auto-render "<pretty name> of <value> <unit>" and include it
+# in the prompt's Cover list.
+
+_SKIP_COLS = {"filename", "filepath", "feature_summary", "quality_description"}
+
+# Tokens that should be upper-cased when they appear as a word in a column name.
+_ACRONYMS = {"snr", "hnr", "srmr", "rt60", "cpp", "ltas", "f0", "sd", "rap"}
+
+# Ordered longest-first so e.g. "_syl_sec" wins over "_sec".
+_UNIT_SUFFIXES = [
+    ("_db_oct",      "dB/octave"),
+    ("_db_per_oct",  "dB/octave"),
+    ("_syl_sec",     "syl/sec"),
+    ("_per_min",     "per min"),
+    ("_per_sec",     "per sec"),
+    ("_db",          "dB"),
+    ("_hz",          "Hz"),
+    ("_pct",         "%"),
+    ("_sec",         "s"),
+    ("_ms",          "ms"),
+    ("_st",          "semitones"),
+]
+
+
+def _present(val) -> bool:
+    """True if a CSV value is usable (not empty/None/NaN/'N/A')."""
+    if val is None or val == "":
+        return False
+    s = str(val).strip()
+    if s == "" or s.upper() == "N/A" or s.lower() == "nan":
+        return False
+    if isinstance(val, float) and math.isnan(val):
+        return False
+    return True
+
+
+def _strip_unit_suffix(col: str) -> tuple[str, str]:
+    """Return (base_name_without_suffix, display_unit). Empty unit means no match."""
+    for suf, unit in _UNIT_SUFFIXES:
+        if col.endswith(suf):
+            return col[: -len(suf)], unit
+    return col, ""
+
+
+def _pretty_name(col: str) -> str:
+    """Turn a column name into a display name with acronyms upper-cased."""
+    if col.startswith("praat_"):
+        col = col[6:]
+    base, _ = _strip_unit_suffix(col)
+    words = []
+    for w in base.split("_"):
+        words.append(w.upper() if w.lower() in _ACRONYMS else w)
+    name = " ".join(words)
+    return name[:1].upper() + name[1:] if name else name
+
+
+def _render_claim(col: str, val) -> str | None:
+    """Render 'Pretty name of <val> <unit>' or None if skipped/missing."""
+    if col in _SKIP_COLS or not _present(val):
+        return None
+    _, unit = _strip_unit_suffix(col)
+    name = _pretty_name(col)
+    return f"{name} of {val} {unit}".rstrip()
+
+
 def build_feature_summary(row: dict) -> str:
     """
     Section 1: Structured feature numbers, directly from the CSV.
-    Designed to be easy to parse programmatically.
+    Column-agnostic — emits every non-metadata column as '<col>=<value><unit>'.
     """
-    lines = [
-        f"duration_sec={fmt(row.get('duration_sec'), 's', 3)}",
-        f"sample_rate_hz={fmt(row.get('sample_rate_hz'), 'Hz', 0)}",
-        f"snr_db={fmt(row.get('snr_db'), 'dB')}",
-        f"silence_ratio={fmt(row.get('silence_ratio'), '', 4)}",
-        f"overlap_ratio={fmt(row.get('overlap_ratio'), '', 4)}",
-        f"overlap_segments={row.get('overlap_segments', 'N/A') or 'N/A'}",
-        f"srmr={fmt(row.get('srmr'), '', 4)}",
-        f"f0_mean_hz={fmt(row.get('f0_mean_hz'), 'Hz')}",
-        f"f0_sd_hz={fmt(row.get('f0_sd_hz'), 'Hz')}",
-        f"f0_min_hz={fmt(row.get('f0_min_hz'), 'Hz')}",
-        f"f0_max_hz={fmt(row.get('f0_max_hz'), 'Hz')}",
-        f"f0_range_hz={fmt(row.get('f0_range_hz'), 'Hz')}",
-        f"f0_range_st={fmt(row.get('f0_range_st'), 'st')}",
-        f"f0_voiced_frac={fmt(row.get('f0_voiced_frac'), '', 4)}",
-        f"hnr_db={fmt(row.get('hnr_db'), 'dB')}",
-        f"shimmer_pct={fmt(row.get('shimmer_pct'), '%', 4)}",
-        f"jitter_local_pct={fmt(row.get('jitter_local_pct'), '%', 4)}",
-        f"jitter_rap_pct={fmt(row.get('jitter_rap_pct'), '%', 4)}",
-        f"praat_pause_count={fmt(row.get('praat_pause_count'), '', 0)}",
-        f"praat_pause_rate_per_min={fmt(row.get('praat_pause_rate_per_min'), '/min', 3)}",
-        f"praat_mean_pause_dur_sec={fmt(row.get('praat_mean_pause_dur_sec'), 's', 4)}",
-        f"praat_total_pause_dur_sec={fmt(row.get('praat_total_pause_dur_sec'), 's', 4)}",
-        f"praat_pause_to_speech_ratio={fmt(row.get('praat_pause_to_speech_ratio'), '', 4)}",
-        f"praat_speaking_rate_syl_sec={fmt(row.get('praat_speaking_rate_syl_sec'), 'syl/s', 3)}",
-        f"praat_articulation_rate_syl_sec={fmt(row.get('praat_articulation_rate_syl_sec'), 'syl/s', 3)}",
-    ]
-    return " | ".join(lines)
+    parts = []
+    for col, val in row.items():
+        if col in _SKIP_COLS:
+            continue
+        if col == "overlap_segments":
+            parts.append(f"overlap_segments={val or 'N/A'}")
+            continue
+        if not _present(val):
+            parts.append(f"{col}=N/A")
+            continue
+        _, unit = _strip_unit_suffix(col)
+        parts.append(f"{col}={val}{unit}")
+    return " | ".join(parts)
 
 
 def _parse_overlap_segments(raw: str, sample_rate: int = 16000) -> str:
@@ -92,44 +146,51 @@ def _parse_overlap_segments(raw: str, sample_rate: int = 16000) -> str:
 
 def generate_quality_description(row: dict) -> str:
     """
-    Section 2: Call gemma4:e2b via Ollama to produce a descriptive quality paragraph.
-    Temperature is 0 for deterministic output.
+    Section 2: Call gemma4:e2b via Ollama to produce a quality description.
+
+    Column-agnostic. The Cover list is auto-built from every populated non-
+    metadata column in the row, so adding new feature columns to the CSV
+    requires no change here (provided the new column uses a known unit suffix).
+
+    Prompt enforces:
+      - every populated feature MUST appear in the output,
+      - numeric claims use "of / is / =" phrasing (not ':') so the existing
+        src/sfs.py ClaimParser recognises them,
+      - abbreviations are kept verbatim — gemma4:e2b otherwise invents wrong
+        expansions like "Linear Time Amplitude Spectrum" for LTAS.
     """
     overlap_segments_str = _parse_overlap_segments(row.get("overlap_segments", ""))
 
-    prompt = f"""You are an expert speech audio quality evaluator. Given the following extracted audio features for a single speech sample, provide a concise natural language description of the sample's quality.
+    # Build the Cover list from whatever is in the row.
+    cover_items = []
+    for col, val in row.items():
+        if col == "overlap_segments":
+            continue  # rendered separately below
+        rendered = _render_claim(col, val)
+        if rendered:
+            cover_items.append(rendered)
 
-Cover these aspects in order:
-1. Recording quality (SNR, reverberation/SRMR)
-2. Voice characteristics (F0/pitch, HNR, jitter, shimmer)
-3. Fluency & timing (speaking rate, pause patterns, silence ratio)
-4. Speaker overlap (if overlap exists, state the time range and note that F0 and formant estimates are unreliable during overlap)
-5. Overall quality assessment
+    overlap_phrase = (
+        f"Overlap segments at {overlap_segments_str}"
+        if overlap_segments_str != "None"
+        else "No overlap detected"
+    )
 
-Extracted Features:
-- Duration: {row.get('duration_sec', 'N/A')} seconds
-- Sample Rate: {row.get('sample_rate_hz', 'N/A')} Hz
-- SNR: {row.get('snr_db', 'N/A')} dB
-- SRMR (reverberation): {row.get('srmr', 'N/A')} (higher = cleaner)
-- Silence Ratio: {row.get('silence_ratio', 'N/A')}
-- Overlap Ratio: {row.get('overlap_ratio', 'N/A')}
-- Overlap Segments: {overlap_segments_str}
-- F0 Mean: {row.get('f0_mean_hz', 'N/A')} Hz
-- F0 Std Dev: {row.get('f0_sd_hz', 'N/A')} Hz
-- F0 Range: {row.get('f0_range_hz', 'N/A')} Hz ({row.get('f0_range_st', 'N/A')} semitones)
-- Voiced Fraction: {row.get('f0_voiced_frac', 'N/A')}
-- HNR: {row.get('hnr_db', 'N/A')} dB
-- Shimmer: {row.get('shimmer_pct', 'N/A')}%
-- Jitter (local): {row.get('jitter_local_pct', 'N/A')}%
-- Jitter (RAP): {row.get('jitter_rap_pct', 'N/A')}%
-- Speaking Rate: {row.get('praat_speaking_rate_syl_sec', 'N/A')} syl/sec
-- Articulation Rate: {row.get('praat_articulation_rate_syl_sec', 'N/A')} syl/sec
-- Pause Count: {row.get('praat_pause_count', 'N/A')}
-- Pause Rate: {row.get('praat_pause_rate_per_min', 'N/A')} per min
-- Mean Pause Duration: {row.get('praat_mean_pause_dur_sec', 'N/A')} sec
-- Pause-to-Speech Ratio: {row.get('praat_pause_to_speech_ratio', 'N/A')}
+    prompt = f"""You are an expert speech audio quality evaluator. Write a description of this speech sample in prose sentences (no bullets, no colons as the value separator).
 
-Write a single concise paragraph (3-5 sentences). Be objective and use professional evaluation language."""
+HARD RULES (non-negotiable):
+- Every feature listed in "Features" below MUST appear in the description.
+- Phrase each feature as "<name> of <value> <unit>" OR "<name> is <value> <unit>" OR "<name> = <value> <unit>". Never use ":" as the separator between name and value. Never replace a number with an adjective alone.
+- Quote every value verbatim with its unit; do not round, do not paraphrase.
+- Keep abbreviations (F0, SD, RAP, SNR, HNR, SRMR, RT60, CPP, LTAS) exactly as written; do not invent expansions.
+- Also describe the speaker-overlap information below. If overlap is present, state that F0 and formant estimates are unreliable during those segments.
+- End with one sentence summarising the overall quality.
+- Length is unlimited; completeness is mandatory.
+
+Features: {', '.join(cover_items)}.
+
+Speaker overlap: {overlap_phrase}.
+"""
 
     payload = {
         "model": MODEL,
@@ -147,7 +208,7 @@ Write a single concise paragraph (3-5 sentences). Be objective and use professio
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
+        with urllib.request.urlopen(req, timeout=180) as response:
             result = json.loads(response.read().decode("utf-8"))
             text = result.get("response", "").strip()
             # Collapse to single line for CSV safety
