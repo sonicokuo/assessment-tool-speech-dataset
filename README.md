@@ -143,3 +143,87 @@ If this prints nothing, the PI needs to add you to the `cis260125p` allocation b
 | `v100-32` | 32 GB |
 | `l40s-48` | 48 GB |
 | `h100-80` | 80 GB |
+
+### Shared data layout
+
+Generated datasets and pipeline artifacts live under `/ocean/projects/cis260125p/shared/data/`:
+
+```
+/ocean/projects/cis260125p/shared/data/
+├── Libri2Mix/Libri2Mix/wav16k/min/{train-100,dev,test}/mix_clean/*.wav  # input audio
+├── wham_noise/                                                           # WHAM source noise
+├── features/{train-100,dev,test}.csv          # step 1 output
+├── verbalized/{train-100,dev,test}.csv        # step 2 output
+├── verbalized_all.csv                         # concatenated (for step 3)
+├── descriptions.json                          # step 3 output — consumed by training
+└── processed/{train,val,test}/*.pt            # step 4 output — consumed by training
+```
+
+Checkpoints land in `/ocean/projects/cis260125p/shared/checkpoints/`.
+
+### Pipeline commands (Bridges-2)
+
+Run these from the shared repo (`/ocean/projects/cis260125p/shared/assessment-tool-speech-dataset`) after activating the shared env.
+
+```bash
+export SHARED=/ocean/projects/cis260125p/shared
+mkdir -p $SHARED/data/features $SHARED/data/verbalized
+```
+
+**Step 1 — feature extraction (needs `HF_TOKEN` for Pyannote overlap):**
+
+```bash
+export HF_TOKEN=hf_xxxxxxxxxxxx    # your HF token
+for split in train-100 dev test; do
+  python src/feature_extractor.py \
+    --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/$split/mix_clean \
+    --output    $SHARED/data/features/${split}.csv
+done
+```
+
+**Step 2 — verbalization (needs Ollama running with `gemma4:e2b`):**
+
+```bash
+# One-time Ollama setup (user-local, no sudo):
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &
+ollama pull gemma4:e2b
+
+# Verbalize each split
+for split in train-100 dev test; do
+  python scripts/feature_verbalization.py \
+    --input  $SHARED/data/features/${split}.csv \
+    --output $SHARED/data/verbalized/${split}.csv
+done
+```
+
+**Step 3 — concatenate and build descriptions JSON:**
+
+```bash
+head -1     $SHARED/data/verbalized/train-100.csv  > $SHARED/data/verbalized_all.csv
+tail -n +2 -q $SHARED/data/verbalized/*.csv       >> $SHARED/data/verbalized_all.csv
+
+python scripts/csv_to_json.py \
+  --input  $SHARED/data/verbalized_all.csv \
+  --output $SHARED/data/descriptions.json
+```
+
+**Step 4 — preprocess audio to `.pt` (rename `dev` → `val`):**
+
+```bash
+python src/preprocess.py --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/train-100/mix_clean \
+                         --output_dir $SHARED/data/processed/train
+python src/preprocess.py --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/dev/mix_clean \
+                         --output_dir $SHARED/data/processed/val
+python src/preprocess.py --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/test/mix_clean \
+                         --output_dir $SHARED/data/processed/test
+```
+
+**Step 5 — train / evaluate with the committed PSC config:**
+
+```bash
+python src/train.py     --config configs/config.psc.yaml
+python src/inference.py --config configs/config.psc.yaml \
+                        --checkpoint $SHARED/checkpoints/best.pt \
+                        --test_dir   $SHARED/data/processed/test
+```
