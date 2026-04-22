@@ -568,7 +568,9 @@ if __name__ == '__main__':
     )
     if not audio_files:
         raise FileNotFoundError(f'No supported audio files found in: {AUDIO_DIR}')
-    print(f'Found {len(audio_files)} audio file(s) in {AUDIO_DIR!r}\n')
+    print(f'Found {len(audio_files)} audio file(s) in {AUDIO_DIR!r}')
+    audio_files = audio_files[:100]
+    print(f'Processing first {len(audio_files)} files only.\n')
 
     # Load overlap model
     overlap_handle = None
@@ -592,10 +594,19 @@ if __name__ == '__main__':
             r = records[-1]
             tqdm.write(
                 f'[{i}/{len(audio_files)}] {r.get("filename","?")} | '
-                f'dur={r.get("duration_sec","nan"):.2f}s  snr={r.get("snr_db","nan"):.1f}dB  '
-                f'silence={r.get("silence_ratio","nan"):.3f}  overlap={r.get("overlap_ratio","nan"):.3f}  '
-                f'srmr={r.get("srmr","nan")}  f0_mean={r.get("f0_mean_hz","nan")}Hz  '
-                f'hnr={r.get("hnr_db","nan")}dB'
+                f'dur={r.get("duration_sec","nan"):.2f}s  sr={r.get("sample_rate_hz","nan")}  '
+                f'snr={r.get("snr_db","nan"):.1f}dB  silence={r.get("silence_ratio","nan"):.3f}  '
+                f'overlap={r.get("overlap_ratio","nan"):.3f}  srmr={r.get("srmr","nan")}  '
+                f'f0_mean={r.get("f0_mean_hz","nan")}Hz  f0_sd={r.get("f0_sd_hz","nan")}  '
+                f'f0_min={r.get("f0_min_hz","nan")}  f0_max={r.get("f0_max_hz","nan")}  '
+                f'f0_range={r.get("f0_range_hz","nan")}Hz  f0_range_st={r.get("f0_range_st","nan")}  '
+                f'f0_voiced={r.get("f0_voiced_frac","nan"):.3f}  hnr={r.get("hnr_db","nan")}dB  '
+                f'shimmer={r.get("shimmer_pct","nan")}%  jitter_local={r.get("jitter_local_pct","nan")}%  '
+                f'jitter_rap={r.get("jitter_rap_pct","nan")}%  '
+                f'pause_cnt={r.get("praat_pause_count","nan")}  pause_rate={r.get("praat_pause_rate_per_min","nan")}  '
+                f'mean_pause={r.get("praat_mean_pause_dur_sec","nan")}s  total_pause={r.get("praat_total_pause_dur_sec","nan")}s  '
+                f'pause_ratio={r.get("praat_pause_to_speech_ratio","nan")}  '
+                f'speak_rate={r.get("praat_speaking_rate_syl_sec","nan")}  artic_rate={r.get("praat_articulation_rate_syl_sec","nan")}'
             )
 
     df         = pd.DataFrame(records)
