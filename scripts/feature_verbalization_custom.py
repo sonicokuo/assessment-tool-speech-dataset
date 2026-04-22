@@ -14,6 +14,7 @@ Usage:
     python feature_verbalization.py --input my.csv          # custom input
 """
 
+import os
 import csv
 import json
 import argparse
@@ -225,14 +226,11 @@ def main():
     parser.add_argument("--num_rows", type=int, default=0, help="Number of rows to run (0 = all)")
     args = parser.parse_args()
 
-    # Automatically adjust the output filename if the default is used and arguments are provided
-    if args.output == "verbalized_features_final_example.csv" and (args.start_row > 0 or args.num_rows > 0):
-        name_parts = ["verbalized_features_final_example"]
-        if args.start_row > 0:
-            name_parts.append(f"start_{args.start_row}")
-        if args.num_rows > 0:
-            name_parts.append(f"num_{args.num_rows}")
-        args.output = "_".join(name_parts) + ".csv"
+    # Automatically adjust the output filename to append start and end rows
+    if args.start_row > 0 or args.num_rows > 0:
+        base, ext = os.path.splitext(args.output)
+        end_str = str(args.start_row + args.num_rows) if args.num_rows > 0 else "all"
+        args.output = f"{base}_{args.start_row}_{end_str}{ext}"
 
     print(f"Feature Verbalization")
     print(f"  Model:  {MODEL} (temperature=0)")
