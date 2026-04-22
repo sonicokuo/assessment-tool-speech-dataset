@@ -61,31 +61,17 @@ print('Imports complete')
 # =============================================================================
 # 2. Configuration
 # =============================================================================
-# Directory containing audio files to process (mix_clean WAVs from Libri2Mix)
-AUDIO_DIR  = '/content/data/Libri2Mix/wav16k/min/test/mix_clean/'
-OUTPUT_CSV = 'features_mix2.csv'
-
-# Libri2Mix root — used only when OVERLAP == 'min_max_vad'
-# The mix_clean filename must also exist under s1/ and s2/ subdirectories
-LIBRI2MIX_ROOT = '/content/data/Libri2Mix/wav16k/min/test'
-
-# Hugging Face token — required only when OVERLAP == 'pyannote'
-HF_TOKEN = ''  # paste your token here
-
-# Overlap detection method:
-#   'min_max_vad' : Silero VAD on ground-truth s1/s2 stems (Libri2Mix structure)
-#   'pyannote'    : pyannote/segmentation-3.0 (needs HF_TOKEN)
-#   'none'        : skip overlap detection (overlap columns will be NaN)
-OVERLAP = 'min_max_vad'
+# AUDIO_DIR, LIBRI2MIX_ROOT, OUTPUT_CSV, OVERLAP, HF_TOKEN are set from CLI args
+# in the __main__ block below. Module-level placeholders so function bodies that
+# reference them can be parsed; actual values are filled in at runtime.
+AUDIO_DIR      = None
+LIBRI2MIX_ROOT = None
+OUTPUT_CSV     = None
+OVERLAP        = 'min_max_vad'
+HF_TOKEN       = ''
 
 # SRMR configuration
 SRMR_CONFIG = {'max_cf': 128, 'fast': True, 'norm': False}
-
-if HF_TOKEN:
-    os.environ['HF_TOKEN'] = HF_TOKEN
-    from huggingface_hub import login
-    login(token=HF_TOKEN)
-    print('Logged in to HuggingFace')
 
 # =============================================================================
 # 3. Feature Extraction Functions
@@ -545,6 +531,34 @@ def extract_features(wav_path: str, overlap_handle, srmr_model) -> dict:
 # 4. Main
 # =============================================================================
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Extract SP features from Libri2Mix mix_clean audio.')
+    parser.add_argument('--audio_dir',      required=True,
+                        help='Directory of mix_clean .wav files to process')
+    parser.add_argument('--libri2mix_root', required=True,
+                        help='Parent split dir that contains s1/ and s2/ subdirs (used for min_max_vad overlap)')
+    parser.add_argument('--output',         required=True,
+                        help='Output CSV path')
+    parser.add_argument('--overlap',        default='min_max_vad',
+                        choices=['min_max_vad', 'pyannote', 'none'],
+                        help='Overlap detection method')
+    parser.add_argument('--hf_token',       default='',
+                        help='HuggingFace token (only required for --overlap pyannote)')
+    args = parser.parse_args()
+
+    AUDIO_DIR      = args.audio_dir
+    LIBRI2MIX_ROOT = args.libri2mix_root
+    OUTPUT_CSV     = args.output
+    OVERLAP        = args.overlap
+    HF_TOKEN       = args.hf_token
+
+    if HF_TOKEN:
+        os.environ['HF_TOKEN'] = HF_TOKEN
+        from huggingface_hub import login
+        login(token=HF_TOKEN)
+        print('Logged in to HuggingFace')
+
     if not os.path.isdir(AUDIO_DIR):
         raise FileNotFoundError(f'Directory not found: {AUDIO_DIR}')
 
@@ -578,6 +592,7 @@ if __name__ == '__main__':
     extra_cols = [c for c in df.columns if c not in COLUMN_ORDER]
     df         = df[COLUMN_ORDER + extra_cols]
 
+    os.makedirs(os.path.dirname(os.path.abspath(OUTPUT_CSV)), exist_ok=True)
     df.to_csv(OUTPUT_CSV, index=False)
     print('\n' + '=' * 50)
     print(f'Done! Features saved to: {OUTPUT_CSV}')
