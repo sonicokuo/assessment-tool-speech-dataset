@@ -6,22 +6,15 @@ Overlap-aware speech quality assessment pipeline: extract audio features, verbal
 
 Requires **Python 3.10 or 3.11** and a CUDA-capable GPU (for mamba-ssm and training).
 
+Activate the shared env on PSC Bridges-2:
+
 ```bash
-# Create conda environment
-conda create -n project python=3.10
-conda activate project
-
-# Install PyTorch with CUDA (match your system's CUDA version)
-# Check with: nvcc --version
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126  # adjust cu126 to match
-
-# On HPC clusters, load CUDA toolkit before installing mamba-ssm
-module load cuda
-module load gcc/13.2.1  # needs GCC >= 9
-
-# Install dependencies
-pip install -r requirements.txt
+module load anaconda3
+conda activate /ocean/projects/cis260125p/shared/envs/project
+export PYTHONNOUSERSITE=1   # stop ~/.local from shadowing the shared env
 ```
+
+See [PSC Team Workflow](#psc-team-workflow) below for interact-node and allocation details.
 
 ### Optional Dependencies
 
@@ -103,15 +96,9 @@ interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis260125p
 #   --gres=gpu:l40s-48:1
 # If `-p GPU-shared` errors for H100, try `-p GPU` instead.
 
-# 2. Activate the shared env
-module load anaconda3
-conda deactivate
-conda activate /ocean/projects/cis260125p/shared/envs/project
+# 2. Activate the shared env — see Environment Setup at the top of this README.
 
-# 3. Stop your ~/.local site-packages from shadowing the shared env
-export PYTHONNOUSERSITE=1
-
-# 4. Sanity check
+# 3. Sanity check
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
