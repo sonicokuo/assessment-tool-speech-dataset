@@ -98,7 +98,11 @@ interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis260125p
 
 # 2. Activate the shared env — see Environment Setup at the top of this README.
 
-# 3. Sanity check
+# 3. Move into the shared repo
+cd /ocean/projects/cis260125p/shared/assessment-tool-speech-dataset
+git pull origin main   # grab latest code
+
+# 4. Sanity check
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
@@ -150,9 +154,10 @@ Checkpoints land in `/ocean/projects/cis260125p/shared/checkpoints/`.
 
 ### Pipeline commands (Bridges-2)
 
-Run these from the shared repo (`/ocean/projects/cis260125p/shared/assessment-tool-speech-dataset`) after activating the shared env.
+Activate the shared env first (see Environment Setup above), then:
 
 ```bash
+cd /ocean/projects/cis260125p/shared/assessment-tool-speech-dataset
 export SHARED=/ocean/projects/cis260125p/shared
 mkdir -p $SHARED/data/features $SHARED/data/verbalized
 ```
