@@ -30,7 +30,7 @@ def convert(input_path: str, output_path: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="verbalized_features_all.csv")
-    parser.add_argument("--output", default="data/descriptions.json")
+    parser.add_argument("--output", default="data/toy/descriptions.json")
     args = parser.parse_args()
 
     convert(args.input, args.output)

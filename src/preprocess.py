@@ -99,7 +99,7 @@ def preprocess(audio_dir: str, output_dir: str, sample_rate: int = 16000):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="./data/processed")
+    parser.add_argument("--output_dir", type=str, default="./data/toy/processed")
     args = parser.parse_args()
 
     preprocess(args.audio_dir, args.output_dir)
