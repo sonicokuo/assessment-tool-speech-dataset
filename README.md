@@ -23,30 +23,17 @@ See [PSC Team Workflow](#psc-team-workflow) below for interact-node and allocati
 
 ## Pipeline
 
+Five stages end-to-end. **See [Pipeline commands (Bridges-2)](#pipeline-commands-bridges-2) below for the exact commands with PSC paths.**
+
 ```
-Step 1: Extract features → CSV
-  python src/feature_extractor.py --audio_dir ./data/raw --output features.csv
-
-Step 2: Split audio by speaker (prevents data leakage)
-  python scripts/split_data.py --audio_dir ./data/raw --output_dir ./data/raw
-
-Step 3: Verbalize features → natural language descriptions (requires Ollama)
-  python scripts/feature_verbalization.py --input features.csv --output verbalized.csv
-
-Step 4: Convert to JSON training targets
-  python scripts/csv_to_json.py --input verbalized.csv --output data/descriptions.json
-
-Step 5: Preprocess audio → .pt files (WavLM + overlap)
-  python src/preprocess.py --audio_dir ./data/raw/train --output_dir ./data/processed/train
-  python src/preprocess.py --audio_dir ./data/raw/val   --output_dir ./data/processed/val
-  python src/preprocess.py --audio_dir ./data/raw/test  --output_dir ./data/processed/test
-
-Step 6: Train
-  python src/train.py --config configs/config.yaml
-
-Step 7: Evaluate
-  python src/inference.py --config configs/config.yaml --checkpoint ./checkpoints/best.pt --test_dir ./data/processed/test
+Step 1: Feature extraction         src/feature_extractor_mix.py   →  features/{split}.csv
+Step 2: Verbalize (Ollama)         scripts/feature_verbalization.py →  verbalized/{split}.csv
+Step 3: Concatenate + JSON         scripts/csv_to_json.py         →  descriptions.json
+Step 4: Preprocess audio (WavLM)   src/preprocess.py              →  processed/{train,val,test}/*.pt
+Step 5: Train / evaluate           src/train.py, src/inference.py
 ```
+
+Libri2Mix ships with speaker-disjoint `train-clean-100 / dev-clean / test-clean` splits, so `scripts/split_data.py` is **not** used in this workflow.
 
 ## Project Structure
 
@@ -177,11 +164,19 @@ done
 
 **Step 2 — verbalization (needs Ollama running with `gemma4:e2b`):**
 
+Ollama is already installed at `$SHARED/ollama/` and the model is cached in `$SHARED/ollama_models/`. Each new compute-node session needs to activate the server:
+
 ```bash
-# One-time Ollama setup (user-local, no sudo):
-curl -fsSL https://ollama.com/install.sh | sh
-ollama serve &
-ollama pull gemma4:e2b
+# Activate Ollama (every new interact node)
+export PATH=$SHARED/ollama/bin:$PATH
+export LD_LIBRARY_PATH=$SHARED/ollama/lib:$LD_LIBRARY_PATH
+export OLLAMA_MODELS=$SHARED/ollama_models
+
+# Start the server in the background if not already running
+if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+  nohup ollama serve > /tmp/ollama-$USER.log 2>&1 &
+  sleep 3
+fi
 
 # Verbalize each split
 for split in train-100 dev test; do
