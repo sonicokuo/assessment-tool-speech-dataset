@@ -162,16 +162,18 @@ export SHARED=/ocean/projects/cis260125p/shared
 mkdir -p $SHARED/data/features $SHARED/data/verbalized
 ```
 
-**Step 1 — feature extraction (needs `HF_TOKEN` for Pyannote overlap):**
+**Step 1 — feature extraction** (uses Silero VAD on the Libri2Mix `s1/`/`s2/` stems for overlap detection — no HF token needed):
 
 ```bash
-export HF_TOKEN=hf_xxxxxxxxxxxx    # your HF token
 for split in train-100 dev test; do
-  python src/feature_extractor.py \
-    --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/$split/mix_clean \
-    --output    $SHARED/data/features/${split}.csv
+  python src/feature_extractor_mix.py \
+    --audio_dir      $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/$split/mix_clean \
+    --libri2mix_root $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/$split \
+    --output         $SHARED/data/features/${split}.csv
 done
 ```
+
+> If you want Pyannote-based overlap instead (on the mix itself, no stems), pass `--overlap pyannote --hf_token $HF_TOKEN`. The default `min_max_vad` is more accurate for Libri2Mix because it uses the clean speaker sources.
 
 **Step 2 — verbalization (needs Ollama running with `gemma4:e2b`):**
 
