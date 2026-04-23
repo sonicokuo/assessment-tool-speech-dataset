@@ -100,19 +100,25 @@ def audit_single(vdir: Path, split: str) -> bool:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python scripts/audit_verbalized_batches.py <verbalized_dir>")
-        sys.exit(1)
+    import argparse
+    ap = argparse.ArgumentParser(description="Audit verbalized outputs for [ERROR] rows and gaps.")
+    ap.add_argument("verbalized_dir", help="Directory containing verbalized CSVs")
+    ap.add_argument("--split", choices=["dev", "test", "train-100", "all"], default="all",
+                    help="Audit only one split (default: all)")
+    args = ap.parse_args()
 
-    vdir = Path(sys.argv[1])
+    vdir = Path(args.verbalized_dir)
     if not vdir.is_dir():
         print(f"Not a directory: {vdir}")
         sys.exit(1)
 
     print(f"Auditing {vdir}\n")
-    audit_single(vdir, "dev")
-    audit_single(vdir, "test")
-    audit_train100(vdir)
+    if args.split in ("dev", "all"):
+        audit_single(vdir, "dev")
+    if args.split in ("test", "all"):
+        audit_single(vdir, "test")
+    if args.split in ("train-100", "all"):
+        audit_train100(vdir)
 
 
 if __name__ == "__main__":
