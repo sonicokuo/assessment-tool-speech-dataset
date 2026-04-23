@@ -34,9 +34,10 @@ class ClaimParser:
     PATTERNS = [
         # F0 with std dev (must be before base F0 to capture σ): "F0 = 187 Hz (σ = 34 Hz)"
         (r"F0\s*=\s*(\d+\.?\d*)\s*Hz\s*\(?σ\s*=\s*(\d+\.?\d*)\s*Hz", [("f0_mean", 1, "Hz"), ("f0_std", 2, "Hz")]),
-        # F0 / pitch (also matches "F0 mean of 96.96 Hz", "mean pitch of 150 Hz")
+        # F0 / pitch (also matches "F0 mean of 96.96 Hz", "mean pitch of 150 Hz",
+        # "fundamental frequency mean is 186.69 Hz")
         (
-            r"(?:F0\s*(?:mean\s*)?|(?:mean\s+)?pitch|fundamental frequency)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
+            r"(?:F0\s*(?:mean\s*)?|(?:mean\s+)?pitch(?:\s+mean)?|fundamental\s+frequency(?:\s+mean)?)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
             [("f0_mean", 1, "Hz")],
         ),
         # Formants: F1, F2, F3, F4
@@ -66,10 +67,10 @@ class ClaimParser:
             r"spectral (?:tilt|slope)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(-?\d+\.?\d*)\s*dB/oct(?:ave)?",
             [("spectral_tilt", 1, "dB/oct")],
         ),
-        # Jitter (matches "jitter (2.28%)" and "jitter (local 1.26%)")
-        (r"jitter\s*(?:=|≈|~|is|of|\()\s*(?:local\s+)?(?:approximately\s+)?(\d+\.?\d*)\s*%", [("jitter", 1, "%")]),
-        # Shimmer (matches "shimmer (10.22%)" and "shimmer (local 3.45%)")
-        (r"shimmer\s*(?:=|≈|~|is|of|\()\s*(?:local\s+)?(?:approximately\s+)?(\d+\.?\d*)\s*%", [("shimmer", 1, "%")]),
+        # Jitter — also matches "Jitter local is 2.4784 %" and "jitter local is 1.9686 percent"
+        (r"jitter\s*(?:\(?\s*(?:local|rap)\s*\)?\s*)?(?:=|≈|~|is|of|\()\s*(?:approximately\s+)?(\d+\.?\d*)\s*(?:%|percent)", [("jitter", 1, "%")]),
+        # Shimmer — also matches "Shimmer of 13.83 %" and "shimmer is 10.94 percent"
+        (r"shimmer\s*(?:\(?\s*local\s*\)?\s*)?(?:=|≈|~|is|of|\()\s*(?:approximately\s+)?(\d+\.?\d*)\s*(?:%|percent)", [("shimmer", 1, "%")]),
         # SRMR (reverberation metric, also matches "reverberation score (SRMR) of 9.65", "reverberation score of 10.22")
         (r"(?:SRMR|reverberation\s+score\s*(?:\(SRMR\))?)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)", [("srmr", 1, "")]),
         # VOT
