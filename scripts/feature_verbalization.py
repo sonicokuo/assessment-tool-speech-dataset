@@ -23,7 +23,7 @@ import math
 
 # ─── Ollama config ────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL      = "gemma4:latest"
+MODEL      = "gemma4:e2b"
 
 
 def fmt(val, suffix="", decimal=2):

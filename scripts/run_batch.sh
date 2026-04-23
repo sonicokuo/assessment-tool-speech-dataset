@@ -11,7 +11,6 @@ ROWS_PER_BATCH=10
 SPLIT="train-100"
 INPUT_CSV="$SHARED/data/features/${SPLIT}.csv"
 OUTPUT_CSV="$SHARED/data/verbalized/${SPLIT}_batches/${SPLIT}.csv"
-
 echo "Starting batched processing for ${SPLIT} from row ${START_ROW} to ${END_ROW}..."
 
 for ((row=START_ROW; row<END_ROW; row+=ROWS_PER_BATCH)); do
