@@ -26,10 +26,10 @@ See [PSC Team Workflow](#psc-team-workflow) below for interact-node and allocati
 Five stages end-to-end. **See [Pipeline commands (Bridges-2)](#pipeline-commands-bridges-2) below for the exact commands with PSC paths.**
 
 ```
-Step 1: Feature extraction         src/feature_extractor_mix.py   →  features/{split}.csv
+Step 1: Feature extraction         src/feature_extractor_mix.py     →  features/{split}.csv       (includes overlap_segments from VAD on s1/s2 stems)
 Step 2: Verbalize (Ollama)         scripts/feature_verbalization.py →  verbalized/{split}.csv
-Step 3: Concatenate + JSON         scripts/csv_to_json.py         →  descriptions.json
-Step 4: Preprocess audio (WavLM)   src/preprocess.py              →  processed/{train,val,test}/*.pt
+Step 3: Concatenate + JSON         scripts/merge_verbalized_to_json.py →  descriptions.json
+Step 4: Preprocess audio (WavLM)   src/preprocess.py                →  processed/{train,val,test}/*.pt
 Step 5: Train / evaluate           src/train.py, src/inference.py
 ```
 
@@ -39,23 +39,27 @@ Libri2Mix ships with speaker-disjoint `train-clean-100 / dev-clean / test-clean`
 
 ```
 src/
-  feature_extractor.py  - Audio feature extraction (SNR, overlap, F0, HNR, jitter, shimmer, pauses, speaking rate)
-  preprocess.py         - WavLM feature extraction + Pyannote overlap → .pt files
-  adapter.py            - Reliability-aware adapter with FiLM conditioning + ablation variants
-  dataset.py            - Shared dataset and collate utilities
-  train.py              - Training script (adapter + LoRA)
-  inference.py          - Generation + SFS evaluation
-  sfs.py                - Signal Faithfulness Score metric
+  feature_extractor.py      - Pyannote-based feature extractor (for cross-domain datasets without clean stems)
+  feature_extractor_mix.py  - Libri2Mix extractor; default overlap method is Silero VAD on s1/s2 stems (oracle labels)
+  preprocess.py             - WavLM features + 5-dim per-frame overlap context from the feature CSV → .pt files
+  adapter.py                - Reliability-aware adapter with FiLM conditioning + ablation variants
+  dataset.py                - Shared dataset and collate utilities
+  train.py                  - Training script (adapter + LoRA)
+  inference.py              - Generation + SFS evaluation
+  sfs.py                    - Signal Faithfulness Score metric (regex-based claim parser)
 scripts/
-  feature_verbalization.py - LLM-based feature verbalization (Ollama/gemma4)
-  csv_to_json.py           - Convert verbalized CSV to descriptions.json
-  split_data.py            - Speaker-disjoint train/val/test splits
+  feature_verbalization.py         - LLM-based feature verbalization (Ollama/gemma4)
+  audit_verbalized_batches.py      - Scans verbalized CSVs for [ERROR] rows, gaps, tail-missing ranges
+  merge_verbalized_to_json.py      - Concatenates verbalized CSVs across splits into descriptions.json
+  csv_to_json.py                   - Legacy single-CSV → JSON (kept for smoke tests)
+  split_data.py                    - Speaker-disjoint train/val/test splits (unused for Libri2Mix)
 configs/
-  config.yaml              - Training configuration
+  config.yaml               - Training configuration (toy/laptop defaults)
+  config.psc.yaml           - PSC Bridges-2 configuration (shared-storage paths + Qwen model)
 experiments/
-  Feature_Extractor_Final.ipynb - Original feature extraction notebook
+  Feature_Extractor_Final.ipynb    - Original feature extraction notebook
 tests/
-  test_sfs.py              - Tests for SFS claim parser and scorer
+  test_sfs.py               - Tests for SFS claim parser and scorer
 ```
 
 ## Testing
@@ -189,23 +193,36 @@ done
 **Step 3 — concatenate and build descriptions JSON:**
 
 ```bash
-head -1     $SHARED/data/verbalized/train-100.csv  > $SHARED/data/verbalized_all.csv
-tail -n +2 -q $SHARED/data/verbalized/*.csv       >> $SHARED/data/verbalized_all.csv
+# Optional audit first — lists [ERROR] rows, gaps, and tail-missing ranges
+python scripts/audit_verbalized_batches.py $SHARED/data/verbalized
 
-python scripts/csv_to_json.py \
-  --input  $SHARED/data/verbalized_all.csv \
-  --output $SHARED/data/descriptions.json
+# Consolidate all splits (incl. any leftover train-100_*_*.csv batches) into one JSON
+python scripts/merge_verbalized_to_json.py \
+  --verbalized_dir $SHARED/data/verbalized \
+  --output         $SHARED/data/descriptions.json
+#   --require_all   fail if any [ERROR] rows remain
 ```
 
-**Step 4 — preprocess audio to `.pt` (rename `dev` → `val`):**
+**Step 4 — preprocess audio to `.pt` (VAD overlap ground truth from feature CSV):**
+
+`preprocess.py` reads the `overlap_segments` column of each split's feature CSV (the oracle VAD labels from Step 1) and writes a per-clip `.pt` with `audio_features (T, 1024)` + `overlap_info (T, 5)`. The five per-frame overlap channels are: `is_overlap`, `segment_duration_s`, `frac_through_segment`, `clip_overlap_ratio`, `density_300ms`.
 
 ```bash
-python src/preprocess.py --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/train-100/mix_clean \
-                         --output_dir $SHARED/data/processed/train
-python src/preprocess.py --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/dev/mix_clean \
-                         --output_dir $SHARED/data/processed/val
-python src/preprocess.py --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/test/mix_clean \
-                         --output_dir $SHARED/data/processed/test
+# Output dir names follow train.py's convention (train / val / test); rename dev→val here.
+python src/preprocess.py \
+  --audio_dir    $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/train-100/mix_clean \
+  --features_csv $SHARED/data/features/train-100.csv \
+  --output_dir   $SHARED/data/processed/train
+
+python src/preprocess.py \
+  --audio_dir    $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/dev/mix_clean \
+  --features_csv $SHARED/data/features/dev.csv \
+  --output_dir   $SHARED/data/processed/val
+
+python src/preprocess.py \
+  --audio_dir    $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/test/mix_clean \
+  --features_csv $SHARED/data/features/test.csv \
+  --output_dir   $SHARED/data/processed/test
 ```
 
 **Step 5 — train / evaluate with the committed PSC config:**

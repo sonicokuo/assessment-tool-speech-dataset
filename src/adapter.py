@@ -9,7 +9,13 @@ from mamba_ssm import Mamba
 MODEL_DIM = 1024
 LM_DIM = 4096  # LM hidden dims
 AUDIO_DIM = 1024  # WavLM output dims
-OVERLAP_FEATURES = 2  # per frame: (is_overlap, overlap_ratio)
+# Per-frame overlap feature vector written by preprocess.py:
+#   col 0: is_overlap                binary; 1 if this frame is inside an overlap segment
+#   col 1: segment_duration_s        float;  duration (seconds) of the segment this frame belongs to, 0 outside overlap
+#   col 2: frac_through_segment      float;  0–1 position within current segment (0 at start, 1 at end), 0 outside
+#   col 3: clip_overlap_ratio        float;  clip-wide fraction of overlapped frames, broadcast to every frame
+#   col 4: density_300ms             float;  local overlap density smoothed over a ±150 ms window (0–1)
+OVERLAP_FEATURES = 5
 OVERLAP_DIM = 32  # output of OverlapEmbedding to learn representation
 
 
@@ -21,7 +27,7 @@ class OverlapEmbedding(nn.Module):
         self.embedding = nn.Sequential(nn.Linear(in_features, embed_dim), nn.GELU(), nn.Linear(embed_dim, embed_dim))
 
     def forward(self, overlap_info: torch.Tensor) -> torch.Tensor:
-        """(B, T, 2) -> (B, T, OVERLAP_DIM)"""
+        """(B, T, OVERLAP_FEATURES) -> (B, T, OVERLAP_DIM)"""
         return self.embedding(overlap_info)
 
 
