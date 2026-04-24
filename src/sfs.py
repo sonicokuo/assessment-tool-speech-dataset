@@ -75,9 +75,12 @@ class ClaimParser:
         (r"(?:SRMR|reverberation\s+score\s*(?:\(SRMR\))?)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)", [("srmr", 1, "")]),
         # VOT
         (r"VOT\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(-?\d+\.?\d*)\s*ms", [("vot", 1, "ms")]),
-        # Overlap temporal span: "overlap at 2.3-4.1s" or "overlapping speech from 2.3 to 4.1s"
+        # Overlap temporal span — loose enough to match the verbalizer's
+        # "Overlap segments are present at 0.5-3.1s" in addition to "overlap at 0.5-3.1s"
+        # and "overlapping speech from 0.5 to 3.1s". Only catches the FIRST range;
+        # extra comma-separated ranges are picked up by _parse_overlap_segments() below.
         (
-            r"overlap(?:ping)?\s*(?:speech\s+)?(?:at|from|during)\s*(\d+\.?\d*)\s*(?:s|sec)?\s*(?:-|to)\s*(\d+\.?\d*)\s*s",
+            r"overlap(?:ping)?(?:\s+segments?)?(?:\s+(?:are|is)\s+present)?\s*(?:at|from|during|:|,)?\s*(\d+\.?\d*)\s*(?:s|sec)?\s*(?:-|to)\s*(\d+\.?\d*)\s*s",
             [("overlap_start", 1, "s"), ("overlap_end", 2, "s")],
         ),
         # Sample rate
@@ -124,15 +127,63 @@ class ClaimParser:
                     except (ValueError, IndexError):
                         continue
 
-        # Deduplicate: keep first occurrence of each feature
+        # Pick up additional overlap segments beyond the first: the PATTERNS regex only
+        # captures one range per match, so multi-segment phrasings like
+        #   "Overlap segments are present at 0.5-3.1s, 3.2-4.5s, and 7.4-8.8s."
+        # lose the 2nd and 3rd ranges. Scan the overlap-tagged sentence and extract
+        # every "X-Ys" range inside it.
+        claims.extend(self._parse_extra_overlap_segments(text, already_found=claims))
+
+        # Deduplicate: keep first occurrence of each feature, EXCEPT overlap_start/end
+        # which are allowed to repeat (one pair per segment).
         seen = set()
         unique_claims = []
         for c in claims:
-            if c.feature not in seen:
+            if c.feature in ("overlap_start", "overlap_end"):
+                unique_claims.append(c)
+            elif c.feature not in seen:
                 seen.add(c.feature)
                 unique_claims.append(c)
 
         return unique_claims
+
+    # Capture from "overlap" until a proper sentence-ending period (period followed by
+    # whitespace or end of string) — avoids stopping at decimals inside numbers like "0.5".
+    _OVERLAP_SENT_RE = re.compile(r"overlap\b.*?(?:\.\s|\.$|$)", re.IGNORECASE | re.DOTALL)
+    _RANGE_RE = re.compile(r"(\d+\.?\d*)\s*-\s*(\d+\.?\d*)\s*s")
+
+    def _parse_extra_overlap_segments(self, text: str, already_found: list) -> list:
+        """Find every 'X-Ys' range inside any overlap-tagged sentence, minus the first one
+        (already captured by the main PATTERNS regex).
+
+        Returns a list of extra Claim objects (overlap_start + overlap_end per segment).
+        """
+        # Track the first (start, end) the main regex found so we don't double-count.
+        existing_pairs = set()
+        starts = [c.value for c in already_found if c.feature == "overlap_start"]
+        ends = [c.value for c in already_found if c.feature == "overlap_end"]
+        for s, e in zip(starts, ends):
+            existing_pairs.add((round(s, 3), round(e, 3)))
+
+        extra = []
+        for sent_match in self._OVERLAP_SENT_RE.finditer(text):
+            sentence = sent_match.group(0)
+            for range_match in self._RANGE_RE.finditer(sentence):
+                try:
+                    s_val = float(range_match.group(1))
+                    e_val = float(range_match.group(2))
+                except ValueError:
+                    continue
+                if e_val <= s_val:
+                    continue
+                key = (round(s_val, 3), round(e_val, 3))
+                if key in existing_pairs:
+                    continue
+                existing_pairs.add(key)
+                raw = range_match.group(0).strip()
+                extra.append(Claim(feature="overlap_start", value=s_val, unit="s", raw_text=raw))
+                extra.append(Claim(feature="overlap_end", value=e_val, unit="s", raw_text=raw))
+        return extra
 
 
 class SFSScorer:
@@ -210,40 +261,50 @@ class SFSScorer:
                     }
                 )
 
-        # Handle overlap IoU if both start and end are claimed
+        # Overlap: zip every claimed (start, end) pair, match each against the best-IoU GT
+        # segment; count correct when IoU >= threshold. Multiple predictions can match
+        # multiple GT segments (bipartite-greedy by best-IoU-first).
         claimed_starts = [c for c in claims if c.feature == "overlap_start"]
         claimed_ends = [c for c in claims if c.feature == "overlap_end"]
         gt_segments = ground_truth.get("overlap_segments", [])
 
         if claimed_starts and claimed_ends and gt_segments:
-            pred_start = claimed_starts[0].value
-            pred_end = claimed_ends[0].value
+            n_pairs = min(len(claimed_starts), len(claimed_ends))
+            pred_pairs = [(claimed_starts[i].value, claimed_ends[i].value) for i in range(n_pairs)]
 
-            # Match against best GT segment by IoU
-            best_iou = 0.0
-            best_gt = gt_segments[0]
-            for gt_start, gt_end in gt_segments:
-                inter_start = max(pred_start, gt_start)
-                inter_end = min(pred_end, gt_end)
-                intersection = max(0, inter_end - inter_start)
-                union = (pred_end - pred_start) + (gt_end - gt_start) - intersection
-                iou = intersection / union if union > 0 else 0.0
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt = (gt_start, gt_end)
+            # Greedy bipartite: for each predicted pair, pick the best unused GT segment.
+            unused_gt = list(range(len(gt_segments)))
+            for pred_start, pred_end in pred_pairs:
+                best_iou = 0.0
+                best_gt_idx = None
+                for gi in unused_gt:
+                    gt_start, gt_end = gt_segments[gi]
+                    inter_start = max(pred_start, gt_start)
+                    inter_end = min(pred_end, gt_end)
+                    intersection = max(0, inter_end - inter_start)
+                    union = (pred_end - pred_start) + (gt_end - gt_start) - intersection
+                    iou = intersection / union if union > 0 else 0.0
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_gt_idx = gi
 
-            correct = best_iou >= self.OVERLAP_IOU_THRESHOLD
+                if best_gt_idx is not None:
+                    gt_start, gt_end = gt_segments[best_gt_idx]
+                    unused_gt.remove(best_gt_idx)
+                else:
+                    gt_start, gt_end = (0.0, 0.0)  # no GT left — counted incorrect
 
-            results.append(
-                {
-                    "feature": "overlap_span",
-                    "claimed": f"{pred_start}-{pred_end}s",
-                    "actual": f"{best_gt[0]}-{best_gt[1]}s",
-                    "error": 1.0 - best_iou,
-                    "tolerance": f"IoU≥{self.OVERLAP_IOU_THRESHOLD}",
-                    "correct": correct,
-                }
-            )
+                correct = best_iou >= self.OVERLAP_IOU_THRESHOLD
+                results.append(
+                    {
+                        "feature": "overlap_span",
+                        "claimed": f"{pred_start}-{pred_end}s",
+                        "actual": f"{gt_start}-{gt_end}s",
+                        "error": 1.0 - best_iou,
+                        "tolerance": f"IoU≥{self.OVERLAP_IOU_THRESHOLD}",
+                        "correct": correct,
+                    }
+                )
 
         # Compute precision, recall, F1
         if results:
