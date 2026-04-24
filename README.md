@@ -229,20 +229,32 @@ python src/preprocess.py \
 
 #### wandb setup (one-time per teammate)
 
-Runs log to the team entity `speech_quality_adapter`, project `idl-ablation` → viewed at https://wandb.ai/speech_quality_adapter/idl-ablation.
+Team runs live at **https://wandb.ai/speech_quality_adapter/idl-ablation** (entity `speech_quality_adapter`, project `idl-ablation`).
 
 ```bash
 # 1. Log in (paste API key from https://wandb.ai/authorize)
 python -m wandb login
 python -m wandb status      # confirm "Currently logged in as: <you>"
 
-# 2. Route runs to the team entity (add to ~/.bashrc to persist across sessions)
+# 2. Route runs to the team entity — persist in ~/.bashrc so you never forget
 echo 'export WANDB_ENTITY=speech_quality_adapter' >> ~/.bashrc
 source ~/.bashrc
-echo $WANDB_ENTITY          # should print: speech_quality_adapter
+echo $WANDB_ENTITY          # must print: speech_quality_adapter
 ```
 
-Without `WANDB_ENTITY`, runs go to your personal wandb account instead of the team. `wandb_project` is already set to `idl-ablation` in `config.psc.yaml`; no override needed.
+> ⚠️ **If `WANDB_ENTITY` is not set**, `wandb.init()` defaults to your **personal account** and the run lands at `wandb.ai/<your-username>/idl-ablation` — not the team. This happens silently; the URL in the run's startup banner is the only signal. Always eyeball it after launch.
+
+Verify the routing is right after launching any run — the line the script prints:
+
+```
+wandb: 🚀 View run at https://wandb.ai/speech_quality_adapter/idl-ablation/runs/...
+                         ^^^^^^^^^^^^^^^^^^^^^^^
+                         must be the team, NOT your username
+```
+
+If it shows your username instead, Ctrl+C the run, `export WANDB_ENTITY=speech_quality_adapter`, and relaunch. (Wandb does not support moving runs between entities — delete the misrouted one from the UI after.)
+
+`wandb_project` is already set to `idl-ablation` in `config.psc.yaml`; no override needed.
 
 #### Sanity test (smoke run, ~3-5 min)
 
@@ -345,3 +357,35 @@ python src/train.py --config configs/config.psc.yaml \
 Naming convention: `<lm-slug>_<variant>` — makes checkpoints self-describing across a 3×3 LM × variant sweep.
 
 **Any config key** (`--batch_size`, `--epochs`, `--lr_adapter`, `--lora_rank`, …) can be overridden the same way — the override logic in `train.py` coerces bool/int/float values based on the YAML type. Strings pass through verbatim.
+
+#### Resuming a crashed or preempted run
+
+Every epoch writes `$SAVE_DIR/last.pt` (latest state) and updates `$SAVE_DIR/best.pt` (best-val-so-far). Resume by passing `--resume_from <path_to_last.pt>` — adapter + LoRA weights, optimizer state, scheduler state, epoch counter, best-val-loss, and the wandb run ID are all restored (so the same wandb run continues, not a new one).
+
+```bash
+# Person 1 — resume concat-only
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen2.5-7B \
+  --adapter_variant concat-only \
+  --save_dir        $SHARED/checkpoints/q25_7b_concat \
+  --wandb_run_name  q25_7b-concat-only \
+  --resume_from     $SHARED/checkpoints/q25_7b_concat/last.pt
+
+# Person 2 — resume qformer
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen2.5-7B \
+  --adapter_variant qformer \
+  --save_dir        $SHARED/checkpoints/q25_7b_qformer \
+  --wandb_run_name  q25_7b-qformer \
+  --resume_from     $SHARED/checkpoints/q25_7b_qformer/last.pt
+
+# Person 3 — resume film-attn
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen2.5-7B \
+  --adapter_variant film-attn \
+  --save_dir        $SHARED/checkpoints/q25_7b_film_attn \
+  --wandb_run_name  q25_7b-film-attn \
+  --resume_from     $SHARED/checkpoints/q25_7b_film_attn/last.pt
+```
+
+Typical reasons to resume: OOM mid-epoch, srun/sbatch time limit hit, node preemption, intentional restart with changed hyperparameters. To extend training beyond the original `epochs`, add `--epochs N` alongside `--resume_from`.
