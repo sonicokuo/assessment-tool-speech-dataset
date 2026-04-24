@@ -23,7 +23,7 @@ min_lr_ratio: 0.0
 
 # ── Training ──────────────────────────
 bf16: True
-batch_size: 16
+batch_size: 8
 gradient_accumulation_steps: 1 # change to 2 or larger if training unstable
 gradient_checkpointing: false
 epochs: 3 # change to 10-15 for after variant ablations
