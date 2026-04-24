@@ -208,14 +208,51 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     else:
         print("No features_path in config — falling back to parsing target text for SFS ground truth")
 
+    # Decide the index range to process. --start / --end default to the full set
+    # but can be narrowed for parallelization or range-resume.
+    start_idx = max(0, int(config.get("start", 0)))
+    end_idx = config.get("end")
+    end_idx = len(test_set) if end_idx is None else min(int(end_idx), len(test_set))
+    if end_idx <= start_idx:
+        raise ValueError(f"--end ({end_idx}) must be > --start ({start_idx})")
+    print(f"Range: clips [{start_idx}, {end_idx}) of {len(test_set)} total")
+
+    # Resume / parallel-safe behaviour: if inference_results.json already exists
+    # in save_dir, load it; any clip whose filename is already there is skipped.
+    # Fresh completed entries are appended and the file is flushed every 50 clips
+    # (atomic tmp-then-rename) so a crash only costs the last <50 clips.
+    os.makedirs(config["save_dir"], exist_ok=True)
+    output_path = os.path.join(config["save_dir"], "inference_results.json")
+    all_outputs: list = []
+    done_filenames: set = set()
+    if os.path.exists(output_path):
+        try:
+            with open(output_path) as f:
+                all_outputs = json.load(f)
+            done_filenames = {e["filename"] for e in all_outputs if "filename" in e}
+            print(f"[resume] Found {len(done_filenames)} already-scored clips in {output_path}")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"[resume] Could not parse existing {output_path} ({e}); starting fresh.")
+            all_outputs = []
+            done_filenames = set()
+
+    FLUSH_EVERY = 50
+
+    def flush_outputs() -> None:
+        tmp = output_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(all_outputs, f, indent=2)
+        os.replace(tmp, output_path)
+
     # Generate + evaluate
     claim_parser = ClaimParser()
     scorer = SFSScorer()
-    all_results = []
-    all_outputs = []
+    n_new = 0
 
-    for i in range(len(test_set)):
+    for i in range(start_idx, end_idx):
         sample = test_set[i]
+        if sample["filename"] in done_filenames:
+            continue
         stem = os.path.splitext(sample["filename"])[0]
 
         generated = generate(
@@ -238,10 +275,6 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             output_entry["target"] = sample["target_text"]
 
         # Build ground truth: prefer SP measurements, fall back to parsing target text
-        # NOTE: SP features JSON format depends on Person A. SFSScorer expects
-        # numeric features as {"f0_mean": 187.0, "snr": 28.0, ...} and overlap
-        # as {"overlap_segments": [(start, end), ...]}. If Person A uses a
-        # different key (e.g. "overlap_start"/"overlap_end"), update this section.
         ground_truth = {}
         if sp_features and stem in sp_features:
             ground_truth = sp_features[stem].copy()
@@ -249,25 +282,46 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             target_claims = claim_parser.parse(sample["target_text"])
             ground_truth = {c.feature: c.value for c in target_claims}
 
-        # Add overlap segments from Pyannote (always available from .pt files)
         if sample["overlap_segments"] and "overlap_segments" not in ground_truth:
             ground_truth["overlap_segments"] = sample["overlap_segments"]
 
-        # SFS scoring
+        # SFS scoring — save per_feature too so the aggregate can be rebuilt
+        # from the JSON on resume (avoids keeping all_results in memory).
         if ground_truth:
             claims = claim_parser.parse(generated)
             result = scorer.score(claims, ground_truth)
-            all_results.append(result)
 
             output_entry["sfs_precision"] = result["precision"]
             output_entry["sfs_recall"] = result["recall"]
             output_entry["sfs_f1"] = result["f1"]
             output_entry["claims"] = [(c.feature, c.value) for c in claims]
+            output_entry["per_feature"] = result["per_feature"]
 
         all_outputs.append(output_entry)
+        done_filenames.add(sample["filename"])
+        n_new += 1
 
+        if n_new % FLUSH_EVERY == 0:
+            flush_outputs()
         if (i + 1) % 10 == 0:
-            print(f"  {i+1}/{len(test_set)} done")
+            print(f"  {i+1}/{end_idx} done (range); {len(all_outputs)}/{len(test_set)} total on disk")
+
+    flush_outputs()
+
+    # Rebuild all_results from everything on disk so the aggregate covers previous
+    # runs too. Downstream code was originally in terms of all_results-of-dicts.
+    all_results = [
+        {
+            "precision": e.get("sfs_precision", 0.0),
+            "recall": e.get("sfs_recall", 0.0),
+            "f1": e.get("sfs_f1", 0.0),
+            "per_feature": e.get("per_feature", []),
+        }
+        for e in all_outputs if "sfs_f1" in e
+    ]
+    if len(all_outputs) < len(test_set):
+        print(f"\n[partial] {len(all_outputs)}/{len(test_set)} clips scored so far. "
+              f"Run again without --start/--end, or with the remaining range, to finish.")
 
     # Build a summary dict we'll both print and persist.
     summary: dict = {"test_dir": test_dir, "n_samples": len(all_outputs)}
@@ -329,11 +383,7 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         if gen_metrics["bertscore_f1"] is not None:
             print(f"  BERTScore-F1:  {gen_metrics['bertscore_f1']:.4f}")
 
-    # Save per-clip outputs AND aggregate summary.
-    os.makedirs(config["save_dir"], exist_ok=True)
-    output_path = os.path.join(config["save_dir"], "inference_results.json")
-    with open(output_path, "w") as f:
-        json.dump(all_outputs, f, indent=2)
+    # Per-clip outputs were flushed incrementally during the loop, so just the summary here.
     summary_path = os.path.join(config["save_dir"], "inference_summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -389,6 +439,11 @@ if __name__ == "__main__":
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--checkpoint_device", type=str, default="cuda", help="Device to load checkpoint (cpu for OOM on smaller GPUs)")
+    parser.add_argument("--start", type=int, default=0,
+                        help="First test-set index to process (inclusive). Default 0.")
+    parser.add_argument("--end", type=int, default=None,
+                        help="Stop index (exclusive). Default = end of test set. "
+                             "Combine with --start for range/parallel runs; reruns auto-skip already-scored clips.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -402,5 +457,7 @@ if __name__ == "__main__":
     if args.top_p is not None:
         config["top_p"] = args.top_p
     config["checkpoint_device"] = args.checkpoint_device
+    config["start"] = args.start
+    config["end"] = args.end
 
     evaluate(config, args.checkpoint, args.test_dir)
