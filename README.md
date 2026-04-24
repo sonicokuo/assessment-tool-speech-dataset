@@ -322,25 +322,74 @@ Inference evaluates the best checkpoint on the test set with **four complementar
 | low | high | Fluent hallucinations — model reproduces reference templates but gets numbers wrong. Train longer / improve conditioning. |
 | low | low | Generator broken — decoding degenerate, checkpoint regressed, or GT/pred misalignment bug. |
 
-#### Evaluation command
+#### Test / inference commands for the report
+
+Each teammate runs inference on **their own** trained checkpoint. The `save_dir` here must match the one passed at training time — `best.pt` inside that directory is what gets evaluated. Greedy decoding (`--top_k 1`) is used so the paper numbers are deterministic.
+
+**Three-run ablation (matches the training recipe):**
 
 ```bash
+# Person 1 — concat-only baseline
 python src/inference.py --config configs/config.psc.yaml \
-                        --checkpoint $SHARED/checkpoints/q3_8b_film_attn/best.pt \
-                        --test_dir   $SHARED/data/processed/test
+  --checkpoint $SHARED/checkpoints/q3_8b_concat/best.pt \
+  --test_dir   $SHARED/data/processed/test \
+  --top_k      1
+
+# Person 2 — Q-Former alternative
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_qformer/best.pt \
+  --test_dir   $SHARED/data/processed/test \
+  --top_k      1
+
+# Person 3 — FiLM + attention (proposed)
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn/best.pt \
+  --test_dir   $SHARED/data/processed/test \
+  --top_k      1
 ```
 
-Useful flags:
-- `--temperature 0.0` / `--top_k 1` / `--top_p 1.0` → greedy decoding for paper numbers (default is sampling).
-- `--checkpoint_device cpu` → load checkpoint via CPU before moving to GPU (for smaller GPUs).
-
-Per-ablation evaluation — pair each training `save_dir` with its checkpoint:
+**Extended ablation (matches the extended training block):**
 
 ```bash
-for variant in concat film_attn qformer; do
+# sigmoid-gate
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_sigmoid_gate/best.pt \
+  --test_dir   $SHARED/data/processed/test --top_k 1
+
+# film (FiLM only, no mixer)
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_film/best.pt \
+  --test_dir   $SHARED/data/processed/test --top_k 1
+
+# film-mamba (proposed variant with Mamba mixer)
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba/best.pt \
+  --test_dir   $SHARED/data/processed/test --top_k 1
+
+# film-attn-2L (deeper attn mixer)
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_2L/best.pt \
+  --test_dir   $SHARED/data/processed/test --top_k 1
+
+# film-mamba-2L (deeper Mamba mixer)
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba_2L/best.pt \
+  --test_dir   $SHARED/data/processed/test --top_k 1
+```
+
+**Useful decoding flags:**
+- `--top_k 1` → greedy (recommended for the paper table; deterministic).
+- `--temperature 0.7 --top_p 0.9` → diverse sampling (only for qualitative inspection).
+- `--checkpoint_device cpu` → load checkpoint via CPU before moving to GPU (for smaller GPUs).
+
+**Loop form** if one teammate runs all five at once:
+
+```bash
+for variant in concat qformer film_attn sigmoid_gate film film_mamba film_attn_2L film_mamba_2L; do
   python src/inference.py --config configs/config.psc.yaml \
     --checkpoint $SHARED/checkpoints/q3_8b_${variant}/best.pt \
-    --test_dir   $SHARED/data/processed/test
+    --test_dir   $SHARED/data/processed/test \
+    --top_k      1
 done
 ```
 
