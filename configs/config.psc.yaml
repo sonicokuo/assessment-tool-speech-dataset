@@ -52,7 +52,7 @@ top_p: 1.0        # 1.0 = disabled, < 1.0 = nucleus sampling
 save_dir: "/ocean/projects/cis260125p/shared/checkpoints"
 
 # ── Logging ──────────────────────────
-wandb_project: "speech-quality-adapter"
+wandb_project: "idl-ablation"
 wandb_run_name: null
 log_every: 10
 

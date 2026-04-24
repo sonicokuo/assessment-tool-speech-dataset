@@ -227,7 +227,57 @@ python src/preprocess.py \
 
 **Step 5 — train / evaluate with the committed PSC config:**
 
-Baseline (uses whatever `lm_name` and `adapter_variant` are in the YAML):
+#### wandb setup (one-time per teammate)
+
+Runs log to the team entity `speech_quality_adapter`, project `idl-ablation` → viewed at https://wandb.ai/speech_quality_adapter/idl-ablation.
+
+```bash
+# 1. Log in (paste API key from https://wandb.ai/authorize)
+python -m wandb login
+python -m wandb status      # confirm "Currently logged in as: <you>"
+
+# 2. Route runs to the team entity (add to ~/.bashrc to persist across sessions)
+echo 'export WANDB_ENTITY=speech_quality_adapter' >> ~/.bashrc
+source ~/.bashrc
+echo $WANDB_ENTITY          # should print: speech_quality_adapter
+```
+
+Without `WANDB_ENTITY`, runs go to your personal wandb account instead of the team. `wandb_project` is already set to `idl-ablation` in `config.psc.yaml`; no override needed.
+
+#### Sanity test (smoke run, ~3-5 min)
+
+Before committing H100 hours to the full 3-variant sweep, run a tiny end-to-end check. Confirms model loads, adapter builds, LoRA applies, train step runs, val + generation + SFS logs to wandb, checkpoint saves.
+
+```bash
+# Build a 20/10/10 .pt subset once
+mkdir -p $SHARED/data/processed_smoke/{train,val,test}
+cp $(ls $SHARED/data/processed/train/*.pt | head -20) $SHARED/data/processed_smoke/train/
+cp $(ls $SHARED/data/processed/val/*.pt   | head -10) $SHARED/data/processed_smoke/val/
+cp $(ls $SHARED/data/processed/test/*.pt  | head -10) $SHARED/data/processed_smoke/test/
+
+# Launch — a smoke wandb run named "sanity-check"
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name          Qwen/Qwen2.5-7B \
+  --adapter_variant  film-attn \
+  --data_dir         $SHARED/data/processed_smoke \
+  --batch_size       4 \
+  --epochs           1 \
+  --save_dir         $SHARED/checkpoints/sanity_check \
+  --wandb_run_name   sanity-check
+```
+
+Watch https://wandb.ai/speech_quality_adapter/idl-ablation — the `sanity-check` run should appear within ~30 sec and show:
+- `params/lm_total ≈ 7.6B`, `params/trainable_total ≈ 55M`, `params/trainable_pct_of_lm ≈ 0.7%` in the run overview.
+- `val_samples` table with 8 greedy-decoded samples + per-sample SFS after the val pass.
+- `val_sfs_f1`, `val_loss`, `train_loss_step` scalar panels populating.
+
+If the smoke run completes cleanly, delete the smoke artifacts and proceed to the real sweep:
+
+```bash
+rm -rf $SHARED/data/processed_smoke $SHARED/checkpoints/sanity_check
+```
+
+#### Baseline launch (uses whatever `lm_name` and `adapter_variant` are in the YAML)
 
 ```bash
 python src/train.py     --config configs/config.psc.yaml
