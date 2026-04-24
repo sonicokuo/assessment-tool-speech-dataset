@@ -27,6 +27,7 @@ from peft import LoraConfig, get_peft_model
 from adapter import build_adapter
 from dataset import PreprocessedDataset
 from sfs import ClaimParser, SFSScorer
+from text_metrics import compute_generation_metrics
 
 
 # ── Generation ──────────────────────────────────────────────
@@ -228,11 +229,19 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         if (i + 1) % 10 == 0:
             print(f"  {i+1}/{len(test_set)} done")
 
+    # Build a summary dict we'll both print and persist.
+    summary: dict = {"test_dir": test_dir, "n_samples": len(all_outputs)}
+
     # Print results
     if all_results:
         avg_p = sum(r["precision"] for r in all_results) / len(all_results)
         avg_r = sum(r["recall"] for r in all_results) / len(all_results)
         avg_f1 = sum(r["f1"] for r in all_results) / len(all_results)
+
+        summary["sfs_precision"] = avg_p
+        summary["sfs_recall"] = avg_r
+        summary["sfs_f1"] = avg_f1
+        summary["n_scored"] = len(all_results)
 
         print(f"\n{'='*50}")
         print(f"SFS Results on {test_dir}:")
@@ -252,17 +261,71 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
                 if feat["correct"]:
                     feature_correct[name] = feature_correct.get(name, 0) + 1
 
+        per_feature_acc = {}
         print(f"\nPer-feature accuracy:")
         for name in sorted(feature_total.keys()):
             correct = feature_correct.get(name, 0)
             total = feature_total[name]
+            per_feature_acc[name] = {"correct": correct, "total": total, "accuracy": correct / total}
             print(f"  {name:20s}: {correct}/{total} = {correct/total:.2f}")
+        summary["per_feature_accuracy"] = per_feature_acc
 
-    # Save outputs
-    output_path = os.path.join(config["save_dir"], "inference_results.json")
+    # ── Generation-quality metrics: BLEU-4 / ROUGE-L / BERTScore-F1 ──
+    # Complement to SFS (numerical faithfulness). Only run on pairs where both
+    # hyp and ref are present.
+    paired = [(e["generated"], e.get("target", "")) for e in all_outputs if e.get("target")]
+    if paired:
+        hyps, refs = zip(*paired)
+        gen_metrics = compute_generation_metrics(
+            list(hyps), list(refs),
+            use_bertscore=config.get("use_bertscore", True),
+        )
+        summary["gen_metrics"] = {**gen_metrics, "n_paired": len(paired)}
+        print(f"\nGeneration-quality metrics ({len(paired)} pairs):")
+        if gen_metrics["bleu"] is not None:
+            print(f"  BLEU-4:        {gen_metrics['bleu']:.2f}")
+        if gen_metrics["rouge_l"] is not None:
+            print(f"  ROUGE-L (F1):  {gen_metrics['rouge_l']:.4f}")
+        if gen_metrics["bertscore_f1"] is not None:
+            print(f"  BERTScore-F1:  {gen_metrics['bertscore_f1']:.4f}")
+
+    # Save per-clip outputs AND aggregate summary.
     os.makedirs(config["save_dir"], exist_ok=True)
+    output_path = os.path.join(config["save_dir"], "inference_results.json")
     with open(output_path, "w") as f:
         json.dump(all_outputs, f, indent=2)
+    summary_path = os.path.join(config["save_dir"], "inference_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nAggregate summary saved to {summary_path}")
+
+    # Log aggregates to wandb under a "test/*" namespace so the same run page shows
+    # both train/val curves and test-set numbers. Default on — set `wandb_log_test: false`
+    # in the config to disable. Falls back gracefully if wandb isn't available or not logged in.
+    if config.get("wandb_log_test", True):
+        try:
+            import wandb
+            wandb_run_id = None
+            if "wandb_run_id" in checkpoint:
+                wandb_run_id = checkpoint["wandb_run_id"]
+            wandb.init(
+                project=config.get("wandb_project", "idl-ablation"),
+                entity=config.get("wandb_entity"),
+                id=wandb_run_id,
+                resume="allow" if wandb_run_id else None,
+                name=config.get("wandb_run_name"),
+            )
+            log = {f"test/{k}": v for k, v in summary.items()
+                   if isinstance(v, (int, float)) and v is not None}
+            if "gen_metrics" in summary:
+                for k, v in summary["gen_metrics"].items():
+                    if isinstance(v, (int, float)) and v is not None:
+                        log[f"test/{k}"] = v
+            wandb.log(log)
+            print(f"Logged test metrics to wandb under test/* keys")
+            wandb.finish()
+        except Exception as e:
+            print(f"[wandb] test-time logging skipped: {e}")
     print(f"\nResults saved to {output_path}")
 
     # Print examples

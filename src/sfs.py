@@ -57,10 +57,73 @@ class ClaimParser:
             r"(?:Harmonics?-to-Noise\s+Ratio\s*(?:\(HNR\))?\s*|HNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*dB",
             [("hnr", 1, "dB")],
         ),
-        # Speaking rate (matches "5.875 syl/s", "4.934 syllables per second")
+        # Speaking rate — tightened to ONLY match "speaking rate", not bare "rate",
+        # to avoid false matches on "articulation rate" / "pause rate".
         (
-            r"(?:speaking rate|rate)\s*(?:=|≈|~|is|of|:)\s*(?:approximately\s+)?(\d+\.?\d*)\s*(?:syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?)",
+            r"speaking\s+rate\s*(?:=|≈|~|is|of|:)\s*(?:approximately\s+)?(\d+\.?\d*)\s*(?:syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?)",
             [("speaking_rate", 1, "syl/s")],
+        ),
+        # Articulation rate — distinct feature from speaking rate
+        # (articulation excludes pauses; speaking rate includes them).
+        (
+            r"articulation\s+rate\s*(?:=|≈|~|is|of|:)\s*(?:approximately\s+)?(\d+\.?\d*)\s*(?:syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?)",
+            [("articulation_rate", 1, "syl/s")],
+        ),
+        # Gemma also emits: "X syl/sec for the articulation rate" / "X syl/sec for the speaking rate"
+        # inside combined sentences like "Speaking and articulation rates are measured at ...".
+        (
+            r"(\d+\.?\d*)\s*syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?\s+for\s+the\s+articulation\s+rate",
+            [("articulation_rate", 1, "syl/s")],
+        ),
+        (
+            r"(\d+\.?\d*)\s*syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?\s+for\s+the\s+speaking\s+rate",
+            [("speaking_rate", 1, "syl/s")],
+        ),
+        # Duration — "The duration of the speech sample is X s" / "duration is X s"
+        (
+            r"duration(?:\s+of\s+the\s+(?:speech\s+)?sample)?\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*s(?!yl)",
+            [("duration_sec", 1, "s")],
+        ),
+        # Overlap ratio — "The overlap ratio is 0.7528" (unitless 0-1)
+        # Also handles "overlap ratio of the sample is 0.7528"
+        (
+            r"overlap\s+ratio(?:\s+of\s+the\s+sample)?\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)",
+            [("overlap_ratio", 1, "")],
+        ),
+        # Paraphrase: "high degree of overlap with a ratio of 0.8261",
+        # "overlap, with a ratio of 0.73".
+        (
+            r"overlap[\s,]+with\s+(?:a|an)\s+ratio\s+of\s+(?:approximately\s+)?(\d+\.?\d*)",
+            [("overlap_ratio", 1, "")],
+        ),
+        # F0 standard deviation — "F0 standard deviation SD is X Hz",
+        # "F0 SD is X Hz", and "F0 standard deviation (SD) is X Hz".
+        (
+            r"F0\s+(?:standard\s+deviation(?:\s*\(?\s*SD\s*\)?)?|SD)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
+            [("f0_sd", 1, "Hz")],
+        ),
+        # Fallback for split phrasings like "F0 mean is X Hz with a standard deviation SD of Y Hz"
+        # or "a standard deviation of Y Hz" — Hz-denominated SD in this corpus is always F0 SD.
+        (
+            r"standard\s+deviation(?:\s*\(?\s*SD\s*\)?)?\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
+            [("f0_sd", 1, "Hz")],
+        ),
+        # Pause count — "The pause count is X" (integer)
+        (
+            r"pause\s+count\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+)",
+            [("pause_count", 1, "")],
+        ),
+        # Paraphrase: "contains a total of 3 pauses", "sample contains 1 pause",
+        # "has 2 pauses", "there are 2 pauses in total". Requires a verb
+        # (contains/has/are/is) so we don't grab numbers from unrelated spans.
+        (
+            r"(?:contains?|has|have|with|there\s+(?:are|is))\s+(?:a\s+total\s+of\s+)?(\d+)\s+pauses?\b",
+            [("pause_count", 1, "")],
+        ),
+        # Pause rate per minute — "the pause rate is X per min(ute)"
+        (
+            r"pause\s+rate\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*per\s+min(?:ute)?",
+            [("pause_rate", 1, "per min")],
         ),
         # Spectral tilt
         (
@@ -80,7 +143,7 @@ class ClaimParser:
         # and "overlapping speech from 0.5 to 3.1s". Only catches the FIRST range;
         # extra comma-separated ranges are picked up by _parse_overlap_segments() below.
         (
-            r"overlap(?:ping)?(?:\s+segments?)?(?:\s+(?:are|is)\s+present)?\s*(?:at|from|during|:|,)?\s*(\d+\.?\d*)\s*(?:s|sec)?\s*(?:-|to)\s*(\d+\.?\d*)\s*s",
+            r"overlap(?:ping)?(?:\s+speech|\s+segments?)?(?:\s+(?:are|is)\s+present)?\s*(?:at|from|during|:|,)?\s*(\d+\.?\d*)\s*(?:s|sec)?\s*(?:-|to)\s*(\d+\.?\d*)\s*s",
             [("overlap_start", 1, "s"), ("overlap_end", 2, "s")],
         ),
         # Sample rate
@@ -203,6 +266,7 @@ class SFSScorer:
     TOLERANCES = {
         "f0_mean": 5.0,  # ±5 Hz
         "f0_std": 5.0,  # ±5 Hz
+        "f0_sd": 5.0,  # ±5 Hz (same as f0_std — verbalizer uses "SD")
         "f1_mean": 30.0,  # ±30 Hz
         "f2_mean": 30.0,  # ±30 Hz
         "f3_mean": 30.0,  # ±30 Hz
@@ -211,12 +275,17 @@ class SFSScorer:
         "rt60": 0.05,  # ±0.05 s
         "hnr": 2.0,  # ±2 dB
         "speaking_rate": 0.5,  # ±0.5 syl/s
+        "articulation_rate": 0.5,  # ±0.5 syl/s
         "spectral_tilt": 1.5,  # ±1.5 dB/oct
         "jitter": 0.3,  # ±0.3%
         "shimmer": 0.5,  # ±0.5%
         "vot": 8.0,  # ±8 ms
         "srmr": 0.5,  # ±0.5
         "sample_rate": 0.0,  # exact match (it's an integer)
+        "duration_sec": 0.1,  # ±0.1 s (verbalizer rounds to 3 decimals, tolerance absorbs that)
+        "overlap_ratio": 0.05,  # ±0.05 (unitless 0-1)
+        "pause_count": 0.0,  # exact match (integer)
+        "pause_rate": 2.0,  # ±2 per min
     }
 
     # Overlap uses IoU instead of absolute tolerance

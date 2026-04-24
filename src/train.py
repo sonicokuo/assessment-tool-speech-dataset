@@ -24,6 +24,7 @@ from tqdm.auto import tqdm
 from adapter import build_adapter
 from sfs import ClaimParser, SFSScorer
 from dataset import PreprocessedDataset, collate_fn
+from text_metrics import compute_generation_metrics
 
 
 # ── Loss ──────────────────────────────────────────────
@@ -419,17 +420,31 @@ def train(config: dict) -> None:
             avg_sfs_r = sum(sfs_recs) / max(1, len(sfs_recs))
             avg_sfs_f1 = sum(sfs_f1s) / max(1, len(sfs_f1s))
 
-            wandb.log(
-                {
-                    "val_loss": avg_val_loss,
-                    "train_loss_epoch": avg_train_loss,
-                    "epoch": epoch + 1,
-                    "val_samples": table,
-                    "val_sfs_precision": avg_sfs_p,
-                    "val_sfs_recall": avg_sfs_r,
-                    "val_sfs_f1": avg_sfs_f1,
-                }
+            # Generation-quality metrics on the same 8 val samples. BLEU/ROUGE are near-free;
+            # BERTScore is opt-in (use_bertscore: true in config) since it loads a ~1 GB model.
+            hyps = [r[3] for r in sample_rows]   # generated
+            refs = [r[2] for r in sample_rows]   # target
+            gen_metrics = compute_generation_metrics(
+                hyps, refs,
+                use_bertscore=config.get("use_bertscore", False),
             )
+
+            log_dict = {
+                "val_loss": avg_val_loss,
+                "train_loss_epoch": avg_train_loss,
+                "epoch": epoch + 1,
+                "val_samples": table,
+                "val_sfs_precision": avg_sfs_p,
+                "val_sfs_recall": avg_sfs_r,
+                "val_sfs_f1": avg_sfs_f1,
+            }
+            if gen_metrics["bleu"] is not None:
+                log_dict["val_bleu"] = gen_metrics["bleu"]
+            if gen_metrics["rouge_l"] is not None:
+                log_dict["val_rouge_l"] = gen_metrics["rouge_l"]
+            if gen_metrics["bertscore_f1"] is not None:
+                log_dict["val_bertscore_f1"] = gen_metrics["bertscore_f1"]
+            wandb.log(log_dict)
 
         # ── Print epoch summary ──
         print("\tTrain Loss {:.04f}".format(avg_train_loss))

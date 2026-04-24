@@ -47,6 +47,7 @@ src/
   train.py                  - Training script (adapter + LoRA)
   inference.py              - Generation + SFS evaluation
   sfs.py                    - Signal Faithfulness Score metric (regex-based claim parser)
+  text_metrics.py           - BLEU-4 / ROUGE-L / BERTScore-F1 helpers (complement SFS)
 scripts/
   feature_verbalization.py         - LLM-based feature verbalization (Ollama/gemma4)
   audit_verbalized_batches.py      - Scans verbalized CSVs for [ERROR] rows, gaps, tail-missing ranges
@@ -60,14 +61,17 @@ experiments/
   Feature_Extractor_Final.ipynb    - Original feature extraction notebook
 tests/
   test_sfs.py               - Tests for SFS claim parser and scorer
+  test_text_metrics.py      - Tests for BLEU / ROUGE-L / BERTScore wrapper
 ```
 
 ## Testing
 
 ```bash
-pip install pytest
+pip install pytest sacrebleu rouge-score bert-score
 python -m pytest tests/ -v
 ```
+
+`sacrebleu`, `rouge-score`, and `bert-score` are only needed for the BLEU / ROUGE-L / BERTScore metrics reported alongside SFS at inference and val-generation time (see [Evaluation & metrics](#evaluation--metrics) below). If any are missing, the relevant metric is silently skipped.
 
 ## PSC Team Workflow
 
@@ -297,6 +301,68 @@ python src/inference.py --config configs/config.psc.yaml \
                         --checkpoint $SHARED/checkpoints/best.pt \
                         --test_dir   $SHARED/data/processed/test
 ```
+
+### Evaluation & metrics
+
+Inference evaluates the best checkpoint on the test set with **four complementary metrics**:
+
+| Metric | What it measures | When to trust it |
+|---|---|---|
+| **SFS-F1** (primary) | Numerical faithfulness — regex-extracts claims like `"SNR of 15.63 dB"` from the generated text and checks each against the ground-truth measurement within per-feature tolerances. Covers 13 features (SNR, HNR, F0 mean/SD, jitter, shimmer, SRMR, duration, overlap ratio, overlap spans (IoU≥0.8), speaking/articulation rate, pause count/rate, sample rate). | This is the metric the paper is about. If SFS-F1 is high, the model actually "reads" the audio rather than hallucinating numbers. `SFS-precision` = fraction of claims correct; `SFS-recall` = fraction of ground-truth features mentioned. |
+| **BLEU-4** | Surface n-gram precision vs the reference description. Rewards exact wording and n-gram overlap. | Sanity check for fluency and template conformance. Low BLEU + high SFS usually means the model uses different phrasing but stays factual (often good). Low BLEU + low SFS means broken output. |
+| **ROUGE-L (F1)** | Longest common subsequence between hyp and ref. More robust than BLEU to reordering. | Complements BLEU for summarization-like overlap; interpret as "how much of the reference structure survived." |
+| **BERTScore-F1** | Embedding-similarity (RoBERTa-large) averaged token-by-token. Captures semantic equivalence even when wording differs. | The right metric for catching paraphrases. High BERTScore + low BLEU = paraphrased but faithful. Low BERTScore = the model is saying something unrelated to the reference. |
+
+**Interpretation grid** (useful when writing the results discussion):
+
+| SFS-F1 | BLEU/ROUGE | Diagnosis |
+|---|---|---|
+| high | high | Fluent *and* factual — ideal. |
+| high | low | Factual but uses unusual phrasing. Acceptable; no fix needed. |
+| low | high | Fluent hallucinations — model reproduces reference templates but gets numbers wrong. Train longer / improve conditioning. |
+| low | low | Generator broken — decoding degenerate, checkpoint regressed, or GT/pred misalignment bug. |
+
+#### Evaluation command
+
+```bash
+python src/inference.py --config configs/config.psc.yaml \
+                        --checkpoint $SHARED/checkpoints/q3_8b_film_attn/best.pt \
+                        --test_dir   $SHARED/data/processed/test
+```
+
+Useful flags:
+- `--temperature 0.0` / `--top_k 1` / `--top_p 1.0` → greedy decoding for paper numbers (default is sampling).
+- `--checkpoint_device cpu` → load checkpoint via CPU before moving to GPU (for smaller GPUs).
+
+Per-ablation evaluation — pair each training `save_dir` with its checkpoint:
+
+```bash
+for variant in concat film_attn qformer; do
+  python src/inference.py --config configs/config.psc.yaml \
+    --checkpoint $SHARED/checkpoints/q3_8b_${variant}/best.pt \
+    --test_dir   $SHARED/data/processed/test
+done
+```
+
+#### Where results land
+
+Under `$SAVE_DIR` (same path you passed at training time):
+
+- **`inference_results.json`** — per-clip records: `filename`, `generated`, `target`, extracted `claims`, `sfs_precision/recall/f1`.
+- **`inference_summary.json`** — aggregate numbers for the paper table: `sfs_precision`, `sfs_recall`, `sfs_f1`, `per_feature_accuracy`, and `gen_metrics: {bleu, rouge_l, bertscore_f1}`.
+
+On wandb (default-on; disable with `wandb_log_test: false` in the config): the same run page that has the training curves gets new test-set scalars under `test/*`:
+
+- `test/sfs_precision`, `test/sfs_recall`, `test/sfs_f1`
+- `test/bleu`, `test/rouge_l`, `test/bertscore_f1`
+
+Because `best.pt` stores the original `wandb_run_id`, inference resumes the same wandb run instead of creating a new one — so train, val, and test metrics sit side-by-side on one page.
+
+#### Training-time monitoring
+
+The same metrics are logged every epoch on the 8-sample val slice (`src/train.py`). BLEU and ROUGE-L are always-on (near-free on 8 samples); BERTScore is opt-in via `use_bertscore: true` in the config (it downloads a ~1 GB RoBERTa-large model on first use). Scalars: `val_sfs_precision/recall/f1`, `val_bleu`, `val_rouge_l`, `val_bertscore_f1`. Per-epoch JSON dumps of the 8 samples also land at `$SAVE_DIR/val_samples/epoch_NNN.json` for offline inspection.
+
+> Training checkpoint selection is driven by **val_loss only** — BLEU/ROUGE/BERTScore are reported for diagnostics, not for `best.pt` selection. Saving-best on a similarity metric would push the model toward reference-copying and *lower* SFS.
 
 ### Swapping models and adapter variants via CLI
 
