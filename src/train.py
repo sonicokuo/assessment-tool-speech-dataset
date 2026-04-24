@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from tqdm.auto import tqdm
 
 from adapter import build_adapter
+from sfs import ClaimParser, SFSScorer
 from dataset import PreprocessedDataset, collate_fn
 
 
@@ -107,6 +108,26 @@ def train(config: dict) -> None:
     # Adapter
     lm_hidden_size = llm.config.hidden_size
     adapter = build_adapter(config["adapter_variant"], lm_dim=lm_hidden_size).to(device).to(torch.bfloat16)
+
+    # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
+    # after wandb.init() below. Helps compare adapter vs LoRA footprint across runs in one glance.
+    lm_total = sum(p.numel() for p in llm.parameters())
+    lora_trainable = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+    adapter_trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
+    trainable_total = lora_trainable + adapter_trainable
+    param_summary = {
+        "params/lm_total": lm_total,
+        "params/lora_trainable": lora_trainable,
+        "params/adapter_trainable": adapter_trainable,
+        "params/trainable_total": trainable_total,
+        "params/trainable_pct_of_lm": 100.0 * trainable_total / lm_total,
+    }
+    print(
+        f"Parameters  —  LM total: {lm_total/1e9:.2f}B  |  LoRA trainable: {lora_trainable/1e6:.1f}M  "
+        f"|  adapter trainable: {adapter_trainable/1e6:.1f}M  "
+        f"|  grand total trainable: {trainable_total/1e6:.1f}M "
+        f"({param_summary['params/trainable_pct_of_lm']:.3f}% of LM)"
+    )
 
     # Prompt
     prompt_ids = tokenizer(config["prompt"], return_tensors="pt").input_ids.to(device)
@@ -218,6 +239,10 @@ def train(config: dict) -> None:
         )
     wandb_run_id = wandb.run.id
 
+    # Push param counts into the wandb run summary so the run overview shows them without scrolling logs.
+    for k, v in param_summary.items():
+        wandb.run.summary[k] = v
+
     # Training loop
     os.makedirs(config["save_dir"], exist_ok=True)
 
@@ -310,11 +335,99 @@ def train(config: dict) -> None:
 
             batch_bar.close()
             avg_val_loss = val_loss / n_val
+
+            # ── Qualitative: generate text on a fixed slice of val, SFS-score, log to wandb ──
+            # Catches degenerate outputs ("AND THE THE THE...") immediately and tracks SFS F1
+            # epoch-by-epoch so you can see the faithfulness curve without waiting for inference.py.
+            claim_parser = ClaimParser()
+            sfs_scorer = SFSScorer()
+
+            sample_rows = []
+            sfs_f1s, sfs_precs, sfs_recs = [], [], []
+            n_samples = min(8, len(val_set))
+            with torch.no_grad():
+                for i in range(n_samples):
+                    sample = val_set[i]
+                    af = sample["audio_features"].unsqueeze(0).to(device).to(torch.bfloat16)
+                    oi = sample["overlap_info"].unsqueeze(0).to(device).to(torch.bfloat16)
+                    prefix = adapter(af, oi)
+
+                    prompt_emb = embed_layer(prompt_ids)
+                    inputs_embeds = torch.cat([prefix, prompt_emb], dim=1)
+                    attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+
+                    gen_ids = llm.generate(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        max_new_tokens=128,
+                        do_sample=False,                           # greedy for reproducibility
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                    gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+
+                    # SFS vs target text (parse both; use target claims as ground truth).
+                    # Same approach inference.py uses when features_path isn't provided.
+                    target_text = sample.get("target_text", "") or ""
+                    target_claims = claim_parser.parse(target_text)
+                    ground_truth = {c.feature: c.value for c in target_claims}
+                    if sample.get("overlap_segments"):
+                        ground_truth["overlap_segments"] = sample["overlap_segments"]
+                    pred_claims = claim_parser.parse(gen_text)
+
+                    if ground_truth:
+                        sfs_result = sfs_scorer.score(pred_claims, ground_truth)
+                        p, r, f1 = sfs_result["precision"], sfs_result["recall"], sfs_result["f1"]
+                    else:
+                        p = r = f1 = 0.0
+                    sfs_precs.append(p); sfs_recs.append(r); sfs_f1s.append(f1)
+
+                    sample_rows.append(
+                        (epoch + 1, sample.get("filename", "?"),
+                         target_text[:400], gen_text[:400],
+                         round(p, 3), round(r, 3), round(f1, 3))
+                    )
+
+            # wandb.Table renders as a browseable table in the UI per epoch.
+            table = wandb.Table(columns=["epoch", "filename", "target", "generated",
+                                         "sfs_precision", "sfs_recall", "sfs_f1"])
+            for row in sample_rows:
+                table.add_data(*row)
+
+            # Dump JSON to disk for offline inspection (same shape as IDL HW4's text_val_epoch_*.json).
+            samples_dir = os.path.join(config["save_dir"], "val_samples")
+            os.makedirs(samples_dir, exist_ok=True)
+            samples_json_path = os.path.join(samples_dir, f"epoch_{epoch + 1:03d}.json")
+            with open(samples_json_path, "w") as f:
+                import json as _json
+                _json.dump(
+                    [
+                        {
+                            "filename": r[1],
+                            "target": r[2],
+                            "generated": r[3],
+                            "sfs_precision": r[4],
+                            "sfs_recall": r[5],
+                            "sfs_f1": r[6],
+                        }
+                        for r in sample_rows
+                    ],
+                    f, indent=2, ensure_ascii=False,
+                )
+
+            # Epoch-average SFS scalars — plottable as curves across epochs.
+            avg_sfs_p = sum(sfs_precs) / max(1, len(sfs_precs))
+            avg_sfs_r = sum(sfs_recs) / max(1, len(sfs_recs))
+            avg_sfs_f1 = sum(sfs_f1s) / max(1, len(sfs_f1s))
+
             wandb.log(
                 {
                     "val_loss": avg_val_loss,
                     "train_loss_epoch": avg_train_loss,
                     "epoch": epoch + 1,
+                    "val_samples": table,
+                    "val_sfs_precision": avg_sfs_p,
+                    "val_sfs_recall": avg_sfs_r,
+                    "val_sfs_f1": avg_sfs_f1,
                 }
             )
 

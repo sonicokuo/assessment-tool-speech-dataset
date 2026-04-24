@@ -227,9 +227,71 @@ python src/preprocess.py \
 
 **Step 5 — train / evaluate with the committed PSC config:**
 
+Baseline (uses whatever `lm_name` and `adapter_variant` are in the YAML):
+
 ```bash
 python src/train.py     --config configs/config.psc.yaml
 python src/inference.py --config configs/config.psc.yaml \
                         --checkpoint $SHARED/checkpoints/best.pt \
                         --test_dir   $SHARED/data/processed/test
 ```
+
+### Swapping models and adapter variants via CLI
+
+`train.py` accepts any `--key value` override for config entries — **no YAML edits needed per run**. The two most-swapped keys:
+
+- `--lm_name <HF_model_id>` — swap the causal LM backbone
+- `--adapter_variant <name>` — swap the audio→LM adapter architecture
+- `--save_dir <path>`, `--wandb_run_name <label>` — isolate per-run checkpoints + logs
+
+#### Available LMs (cached in `/ocean/projects/cis260125p/shared/hf_cache`)
+
+| `--lm_name` | Size (bf16) | Notes |
+|---|---|---|
+| `Qwen/Qwen2.5-7B` | ~15 GB | Dense; safest fit on a single H100-80. Default for IDL report runs. |
+| `Qwen/Qwen3.5-9B` | ~18 GB | Dense, Qwen3.5 family; matches `configs/config.yaml`'s original default. |
+| `Qwen/Qwen3.6-35B-A3B` | ~70 GB | Sparse MoE. **Needs 4-bit quantization** (bitsandbytes) — straight bf16 will OOM even on H100-80. |
+
+Swapping to a model not in that list will trigger a one-time HuggingFace download to the shared cache.
+
+#### Available `--adapter_variant` values
+
+Built in `src/adapter.py::build_adapter`:
+
+- `concat-only` — baseline: concat audio + overlap features, no conditioning.
+- `sigmoid-gate` — sigmoid-gated overlap-aware mixing.
+- `film` — FiLM conditioning, no sequential context mixer.
+- `film-attn` / `film-attn-2L` — FiLM + self-attention context (1 or 2 layers).
+- `film-mamba` / `film-mamba-2L` — FiLM + Mamba SSM context (1 or 2 layers). **Default in `build_adapter`.**
+- `qformer` — Q-Former style cross-attention (alternative architecture).
+
+#### Three-run ablation recipe for the IDL report
+
+Each teammate runs one line on their own H100 — separate `save_dir` keeps checkpoints from clobbering each other:
+
+```bash
+# Person 1 — concat-only baseline
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen2.5-7B \
+  --adapter_variant concat-only \
+  --save_dir        $SHARED/checkpoints/q25_7b_concat \
+  --wandb_run_name  q25_7b-concat-only
+
+# Person 2 — Q-Former alternative
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen2.5-7B \
+  --adapter_variant qformer \
+  --save_dir        $SHARED/checkpoints/q25_7b_qformer \
+  --wandb_run_name  q25_7b-qformer
+
+# Person 3 — FiLM + attention (proposed)
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen2.5-7B \
+  --adapter_variant film-attn \
+  --save_dir        $SHARED/checkpoints/q25_7b_film_attn \
+  --wandb_run_name  q25_7b-film-attn
+```
+
+Naming convention: `<lm-slug>_<variant>` — makes checkpoints self-describing across a 3×3 LM × variant sweep.
+
+**Any config key** (`--batch_size`, `--epochs`, `--lr_adapter`, `--lora_rank`, …) can be overridden the same way — the override logic in `train.py` coerces bool/int/float values based on the YAML type. Strings pass through verbatim.
