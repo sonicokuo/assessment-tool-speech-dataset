@@ -145,6 +145,11 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     # don't need --lm_name / --adapter_variant on the CLI.
     config = _sync_config_with_checkpoint(config, checkpoint_path)
 
+    # Write inference outputs next to the checkpoint, so each ablation's results
+    # sit beside its own best.pt instead of all clobbering one YAML-level save_dir.
+    config["save_dir"] = os.path.dirname(os.path.abspath(checkpoint_path))
+    print(f"[config] save_dir → {config['save_dir']} (inference outputs will land here)")
+
     # Load tokenizer + LLM + LoRA
     tokenizer = AutoTokenizer.from_pretrained(config["lm_name"])
     if tokenizer.pad_token is None:
