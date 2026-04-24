@@ -547,6 +547,45 @@ python src/inference.py --config configs/config.psc.yaml \
 - `--temperature 0.7 --top_p 0.9` → diverse sampling (only for qualitative inspection).
 - `--checkpoint_device cpu` → load checkpoint via CPU before moving to GPU (for smaller GPUs).
 
+#### Running by range + resuming crashes
+
+Full test set is **3000 clips** → ~60-90 min on Qwen3-8B. You can slice that up with `--start N --end M` (half-open: includes `N`, excludes `M`) and rerun safely — the script auto-resumes.
+
+**Quick reference — find your case, copy the flags:**
+
+| You want to… | Flags |
+|---|---|
+| Process the whole test set (default) | *(no flags)* |
+| Process the first 500 clips | `--start 0 --end 500` |
+| Process clips 500–999 (500 total) | `--start 500 --end 1000` |
+| Resume a crashed full-set run | *(no flags — same command again)* |
+| Finish the remainder after doing 0-500 | `--start 500 --end 3000` |
+| Quick 50-clip smoke check | `--start 0 --end 50` |
+
+**Full copy-paste example:**
+
+```bash
+# First chunk — clips 0..499
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn/best.pt \
+  --test_dir   $SHARED/data/processed/test \
+  --top_k 1 --start 0 --end 500
+
+# Later — clips 500..2999 (auto-skips the 500 already done)
+python src/inference.py --config configs/config.psc.yaml \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn/best.pt \
+  --test_dir   $SHARED/data/processed/test \
+  --top_k 1 --start 500 --end 3000
+```
+
+**What to expect in the console:**
+
+- **At startup** (on a rerun): `[resume] Found N already-scored clips in .../inference_results.json` — confirms the auto-skip is active.
+- **During the loop**: `X/end done (range); Y/3000 total on disk` every 10 clips. `inference_results.json` is flushed every **50 clips** via atomic `tmp → rename`, so a crash costs at most 50 clips of work.
+- **At the end**: if the run didn't cover the full test set, you'll see `[partial] N/3000 clips scored so far …`. The aggregate in `inference_summary.json` and on wandb is computed over whatever is on disk at that moment — final numbers are only trustworthy once `N == 3000`.
+
+> **Don't run two range jobs on the same checkpoint simultaneously.** Both would flush to the same `inference_results.json` and race — the later flush overwrites in-flight work from the other. Range-parallel across *different* ablation checkpoints (different `save_dir`s) is fine. Within one checkpoint, go sequential.
+
 **Loop form** if one teammate runs all eight at once:
 
 ```bash
@@ -560,10 +599,10 @@ done
 
 ### Where results land
 
-Under `$SAVE_DIR` (same path you passed at training time):
+Inference outputs are written **next to the checkpoint** (i.e. `dirname(--checkpoint)`), not to the YAML's `save_dir` — so each ablation's results sit beside its own `best.pt`:
 
-- **`inference_results.json`** — per-clip records: `filename`, `generated`, `target`, extracted `claims`, `sfs_precision/recall/f1`.
-- **`inference_summary.json`** — aggregate numbers for the paper table: `sfs_precision`, `sfs_recall`, `sfs_f1`, `per_feature_accuracy`, and `gen_metrics: {bleu, rouge_l, bertscore_f1}`.
+- **`inference_results.json`** — per-clip records (flushed every 50 clips during the loop): `filename`, `generated`, `target`, extracted `claims`, `sfs_precision/recall/f1`, and `per_feature` breakdown.
+- **`inference_summary.json`** — aggregate numbers for the paper table: `sfs_precision`, `sfs_recall`, `sfs_f1`, `per_feature_accuracy`, and `gen_metrics: {bleu, rouge_l, bertscore_f1}`. Written at the end of each invocation over whatever is currently on disk.
 
 On wandb (default-on; disable with `wandb_log_test: false` in the config): the same run page that has the training curves gets new test-set scalars under `test/*`:
 
