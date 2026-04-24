@@ -269,7 +269,7 @@ cp $(ls $SHARED/data/processed/test/*.pt  | head -10) $SHARED/data/processed_smo
 
 # Launch — a smoke wandb run named "sanity-check"
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name          Qwen/Qwen2.5-7B \
+  --lm_name          Qwen/Qwen3-8B \
   --adapter_variant  film-attn \
   --data_dir         $SHARED/data/processed_smoke \
   --batch_size       4 \
@@ -279,7 +279,7 @@ python src/train.py --config configs/config.psc.yaml \
 ```
 
 Watch https://wandb.ai/speech_quality_adapter/idl-ablation — the `sanity-check` run should appear within ~30 sec and show:
-- `params/lm_total ≈ 7.6B`, `params/trainable_total ≈ 55M`, `params/trainable_pct_of_lm ≈ 0.7%` in the run overview.
+- `params/lm_total ≈ 8-9B`, `params/trainable_total ≈ 90-100M` (adapter + LoRA), `params/trainable_pct_of_lm ≈ 1-1.2%` in the run overview.
 - `val_samples` table with 8 greedy-decoded samples + per-sample SFS after the val pass.
 - `val_sfs_f1`, `val_loss`, `train_loss_step` scalar panels populating.
 
@@ -310,8 +310,9 @@ python src/inference.py --config configs/config.psc.yaml \
 
 | `--lm_name` | Size (bf16) | Notes |
 |---|---|---|
-| `Qwen/Qwen2.5-7B` | ~15 GB | Dense; safest fit on a single H100-80. Default for IDL report runs. |
-| `Qwen/Qwen3.5-9B` | ~18 GB | Dense, Qwen3.5 family; matches `configs/config.yaml`'s original default. |
+| `Qwen/Qwen2.5-7B` | ~15 GB | Dense, 28 layers. Lightest; fits bs=8 on H100-80 without gradient checkpointing. |
+| `Qwen/Qwen3-8B` | ~16 GB | Dense, Qwen3 family. **Default for IDL report runs.** Fits bs=6 on H100-80 (bs=8 OOMs without gradient checkpointing). |
+| `Qwen/Qwen3.5-9B` | ~18 GB | Dense, Qwen3.5 family. Needs `bs=4 + grad_accum=2` and/or `--gradient_checkpointing true`. |
 | `Qwen/Qwen3.6-35B-A3B` | ~70 GB | Sparse MoE. **Needs 4-bit quantization** (bitsandbytes) — straight bf16 will OOM even on H100-80. |
 
 Swapping to a model not in that list will trigger a one-time HuggingFace download to the shared cache.
@@ -334,25 +335,30 @@ Each teammate runs one line on their own H100 — separate `save_dir` keeps chec
 ```bash
 # Person 1 — concat-only baseline
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen2.5-7B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant concat-only \
-  --save_dir        $SHARED/checkpoints/q25_7b_concat \
-  --wandb_run_name  q25_7b-concat-only
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_concat \
+  --wandb_run_name  q3_8b-concat-only
 
 # Person 2 — Q-Former alternative
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen2.5-7B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant qformer \
-  --save_dir        $SHARED/checkpoints/q25_7b_qformer \
-  --wandb_run_name  q25_7b-qformer
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
+  --wandb_run_name  q3_8b-qformer
 
 # Person 3 — FiLM + attention (proposed)
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen2.5-7B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film-attn \
-  --save_dir        $SHARED/checkpoints/q25_7b_film_attn \
-  --wandb_run_name  q25_7b-film-attn
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
+  --wandb_run_name  q3_8b-film-attn
 ```
+
+> Qwen3-8B OOMs at bs=8 on H100-80; bs=6 is the tested-safe setting. If you prefer the default bs=8 from the config, swap to Qwen2.5-7B or add `--gradient_checkpointing true`.
 
 Naming convention: `<lm-slug>_<variant>` — makes checkpoints self-describing across a 3×3 LM × variant sweep.
 
@@ -365,27 +371,30 @@ Every epoch writes `$SAVE_DIR/last.pt` (latest state) and updates `$SAVE_DIR/bes
 ```bash
 # Person 1 — resume concat-only
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen2.5-7B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant concat-only \
-  --save_dir        $SHARED/checkpoints/q25_7b_concat \
-  --wandb_run_name  q25_7b-concat-only \
-  --resume_from     $SHARED/checkpoints/q25_7b_concat/last.pt
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_concat \
+  --wandb_run_name  q3_8b-concat-only \
+  --resume_from     $SHARED/checkpoints/q3_8b_concat/last.pt
 
 # Person 2 — resume qformer
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen2.5-7B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant qformer \
-  --save_dir        $SHARED/checkpoints/q25_7b_qformer \
-  --wandb_run_name  q25_7b-qformer \
-  --resume_from     $SHARED/checkpoints/q25_7b_qformer/last.pt
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
+  --wandb_run_name  q3_8b-qformer \
+  --resume_from     $SHARED/checkpoints/q3_8b_qformer/last.pt
 
 # Person 3 — resume film-attn
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen2.5-7B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film-attn \
-  --save_dir        $SHARED/checkpoints/q25_7b_film_attn \
-  --wandb_run_name  q25_7b-film-attn \
-  --resume_from     $SHARED/checkpoints/q25_7b_film_attn/last.pt
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
+  --wandb_run_name  q3_8b-film-attn \
+  --resume_from     $SHARED/checkpoints/q3_8b_film_attn/last.pt
 ```
 
 Typical reasons to resume: OOM mid-epoch, srun/sbatch time limit hit, node preemption, intentional restart with changed hyperparameters. To extend training beyond the original `epochs`, add `--epochs N` alongside `--resume_from`.
