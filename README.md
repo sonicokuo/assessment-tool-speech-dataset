@@ -23,14 +23,15 @@ See [PSC Team Workflow](#psc-team-workflow) below for interact-node and allocati
 
 ## Pipeline
 
-Five stages end-to-end. **See [Pipeline commands (Bridges-2)](#pipeline-commands-bridges-2) below for the exact commands with PSC paths.**
+Six stages end-to-end — four data-prep stages, then training and evaluation. See [Data pipeline (Bridges-2)](#data-pipeline-bridges-2), [Training](#training), and [Evaluation](#evaluation) below for exact commands.
 
 ```
-Step 1: Feature extraction         src/feature_extractor_mix.py     →  features/{split}.csv       (includes overlap_segments from VAD on s1/s2 stems)
-Step 2: Verbalize (Ollama)         scripts/feature_verbalization.py →  verbalized/{split}.csv
+Step 1: Feature extraction         src/feature_extractor_mix.py        →  features/{split}.csv       (includes overlap_segments from VAD on s1/s2 stems)
+Step 2: Verbalize (Ollama)         scripts/feature_verbalization.py    →  verbalized/{split}.csv
 Step 3: Concatenate + JSON         scripts/merge_verbalized_to_json.py →  descriptions.json
-Step 4: Preprocess audio (WavLM)   src/preprocess.py                →  processed/{train,val,test}/*.pt
-Step 5: Train / evaluate           src/train.py, src/inference.py
+Step 4: Preprocess audio (WavLM)   src/preprocess.py                   →  processed/{train,val,test}/*.pt
+Step 5: Train                      src/train.py                        →  checkpoints/{best,last}.pt  + wandb
+Step 6: Evaluate                   src/inference.py                    →  inference_{results,summary}.json + wandb test/*
 ```
 
 Libri2Mix ships with speaker-disjoint `train-clean-100 / dev-clean / test-clean` splits, so `scripts/split_data.py` is **not** used in this workflow.
@@ -71,7 +72,7 @@ pip install pytest sacrebleu rouge-score bert-score
 python -m pytest tests/ -v
 ```
 
-`sacrebleu`, `rouge-score`, and `bert-score` are only needed for the BLEU / ROUGE-L / BERTScore metrics reported alongside SFS at inference and val-generation time (see [Evaluation & metrics](#evaluation--metrics) below). If any are missing, the relevant metric is silently skipped.
+`sacrebleu`, `rouge-score`, and `bert-score` are only needed for the BLEU / ROUGE-L / BERTScore metrics reported alongside SFS at inference and val-generation time (see [Evaluation](#evaluation) below). If any are missing, the relevant metric is silently skipped.
 
 ## PSC Team Workflow
 
@@ -147,9 +148,9 @@ Generated datasets and pipeline artifacts live under `/ocean/projects/cis260125p
 
 Checkpoints land in `/ocean/projects/cis260125p/shared/checkpoints/`.
 
-### Pipeline commands (Bridges-2)
+## Data pipeline (Bridges-2)
 
-Activate the shared env first (see Environment Setup above), then:
+Activate the shared env first (see [Environment Setup](#environment-setup) above), then:
 
 ```bash
 cd /ocean/projects/cis260125p/shared/assessment-tool-speech-dataset
@@ -157,7 +158,9 @@ export SHARED=/ocean/projects/cis260125p/shared
 mkdir -p $SHARED/data/features $SHARED/data/verbalized
 ```
 
-**Step 1 — feature extraction** (uses Silero VAD on the Libri2Mix `s1/`/`s2/` stems for overlap detection — no HF token needed):
+### Step 1 — feature extraction
+
+Uses Silero VAD on the Libri2Mix `s1/`/`s2/` stems for overlap detection — no HF token needed.
 
 ```bash
 for split in train-100 dev test; do
@@ -170,9 +173,9 @@ done
 
 > If you want Pyannote-based overlap instead (on the mix itself, no stems), pass `--overlap pyannote --hf_token $HF_TOKEN`. The default `min_max_vad` is more accurate for Libri2Mix because it uses the clean speaker sources.
 
-**Step 2 — verbalization (needs Ollama running with `gemma4:e2b`):**
+### Step 2 — verbalization
 
-Ollama is already installed at `$SHARED/ollama/` and the model is cached in `$SHARED/ollama_models/`. Each new compute-node session needs to activate the server:
+Needs Ollama running with `gemma4:e2b`. Ollama is already installed at `$SHARED/ollama/` and the model is cached in `$SHARED/ollama_models/`. Each new compute-node session needs to activate the server:
 
 ```bash
 # Activate Ollama (every new interact node)
@@ -194,7 +197,7 @@ for split in train-100 dev test; do
 done
 ```
 
-**Step 3 — concatenate and build descriptions JSON:**
+### Step 3 — concatenate and build descriptions JSON
 
 ```bash
 # Optional audit first — lists [ERROR] rows, gaps, and tail-missing ranges
@@ -207,7 +210,7 @@ python scripts/merge_verbalized_to_json.py \
 #   --require_all   fail if any [ERROR] rows remain
 ```
 
-**Step 4 — preprocess audio to `.pt` (VAD overlap ground truth from feature CSV):**
+### Step 4 — preprocess audio to `.pt`
 
 `preprocess.py` reads the `overlap_segments` column of each split's feature CSV (the oracle VAD labels from Step 1) and writes a per-clip `.pt` with `audio_features (T, 1024)` + `overlap_info (T, 5)`. The five per-frame overlap channels are: `is_overlap`, `segment_duration_s`, `frac_through_segment`, `clip_overlap_ratio`, `density_300ms`.
 
@@ -229,9 +232,17 @@ python src/preprocess.py \
   --output_dir   $SHARED/data/processed/test
 ```
 
-**Step 5 — train / evaluate with the committed PSC config:**
+## Training
 
-#### wandb setup (one-time per teammate)
+`train.py` accepts any `--key value` override for config entries — **no YAML edits needed per run**. The most-swapped keys:
+
+- `--lm_name <HF_model_id>` — swap the causal LM backbone
+- `--adapter_variant <name>` — swap the audio→LM adapter architecture
+- `--save_dir <path>`, `--wandb_run_name <label>` — isolate per-run checkpoints + logs
+
+**Any config key** (`--batch_size`, `--epochs`, `--lr_adapter`, `--lora_rank`, …) can be overridden the same way — the override logic in `train.py` coerces bool/int/float values based on the YAML type. Strings pass through verbatim.
+
+### wandb setup (one-time per teammate)
 
 Team runs live at **https://wandb.ai/speech_quality_adapter/idl-ablation** (entity `speech_quality_adapter`, project `idl-ablation`).
 
@@ -260,7 +271,7 @@ If it shows your username instead, Ctrl+C the run, `export WANDB_ENTITY=speech_q
 
 `wandb_project` is already set to `idl-ablation` in `config.psc.yaml`; no override needed.
 
-#### Sanity test (smoke run, ~3-5 min)
+### Sanity test (smoke run, ~3-5 min)
 
 Before committing H100 hours to the full 3-variant sweep, run a tiny end-to-end check. Confirms model loads, adapter builds, LoRA applies, train step runs, val + generation + SFS logs to wandb, checkpoint saves.
 
@@ -293,18 +304,168 @@ If the smoke run completes cleanly, delete the smoke artifacts and proceed to th
 rm -rf $SHARED/data/processed_smoke $SHARED/checkpoints/sanity_check
 ```
 
-#### Baseline launch (uses whatever `lm_name` and `adapter_variant` are in the YAML)
+### Available LMs (cached in `/ocean/projects/cis260125p/shared/hf_cache`)
+
+| `--lm_name` | Size (bf16) | Notes |
+|---|---|---|
+| `Qwen/Qwen2.5-7B` | ~15 GB | Dense, 28 layers. Lightest; fits bs=8 on H100-80 without gradient checkpointing. |
+| `Qwen/Qwen3-8B` | ~16 GB | Dense, Qwen3 family. **Default for IDL report runs.** Fits bs=6 on H100-80 (bs=8 OOMs without gradient checkpointing). |
+| `Qwen/Qwen3.5-9B` | ~18 GB | Dense, Qwen3.5 family. Needs `bs=4 + grad_accum=2` and/or `--gradient_checkpointing true`. |
+| `Qwen/Qwen3.6-35B-A3B` | ~70 GB | Sparse MoE. **Needs 4-bit quantization** (bitsandbytes) — straight bf16 will OOM even on H100-80. |
+
+Swapping to a model not in that list will trigger a one-time HuggingFace download to the shared cache.
+
+### Available `--adapter_variant` values
+
+Built in `src/adapter.py::build_adapter`:
+
+- `concat-only` — baseline: concat audio + overlap features, no conditioning.
+- `sigmoid-gate` — sigmoid-gated overlap-aware mixing.
+- `film` — FiLM conditioning, no sequential context mixer.
+- `film-attn` / `film-attn-2L` — FiLM + self-attention context (1 or 2 layers).
+- `film-mamba` / `film-mamba-2L` — FiLM + Mamba SSM context (1 or 2 layers). **Default in `build_adapter`.**
+- `qformer` — Q-Former style cross-attention (alternative architecture).
+
+### Baseline launch (uses YAML defaults)
+
+Uses whatever `lm_name` and `adapter_variant` are in `configs/config.psc.yaml`:
 
 ```bash
-python src/train.py     --config configs/config.psc.yaml
-python src/inference.py --config configs/config.psc.yaml \
-                        --checkpoint $SHARED/checkpoints/best.pt \
-                        --test_dir   $SHARED/data/processed/test
+python src/train.py --config configs/config.psc.yaml
 ```
 
-### Evaluation & metrics
+### Three-run ablation recipe for the IDL report
 
-Inference evaluates the best checkpoint on the test set with **four complementary metrics**:
+Each teammate runs one line on their own H100 — separate `save_dir` keeps checkpoints from clobbering each other:
+
+```bash
+# Person 1 — concat-only baseline
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant concat-only \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_concat \
+  --wandb_run_name  q3_8b-concat-only
+
+# Person 2 — Q-Former alternative
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant qformer \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
+  --wandb_run_name  q3_8b-qformer
+
+# Person 3 — FiLM + attention (proposed)
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-attn \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
+  --wandb_run_name  q3_8b-film-attn
+```
+
+> Qwen3-8B OOMs at bs=8 on H100-80; bs=6 is the tested-safe setting. If you prefer the default bs=8 from the config, swap to Qwen2.5-7B or add `--gradient_checkpointing true`.
+
+Naming convention: `<lm-slug>_<variant>` — makes checkpoints self-describing across a 3×3 LM × variant sweep.
+
+### Extended ablation — the remaining adapter variants
+
+The three-run recipe above covers the minimum story (baseline / popular alt / FiLM). If you have H100-hours to spare, run the remaining variants from `build_adapter` for a stronger paper table. All use the same LM, bs, and training budget so the comparison stays apples-to-apples.
+
+```bash
+# sigmoid-gate — a lighter overlap-aware mixing alternative to FiLM
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant sigmoid-gate \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_sigmoid_gate \
+  --wandb_run_name  q3_8b-sigmoid-gate
+
+# film — FiLM conditioning only, no sequential context mixer
+# Isolates the contribution of the temporal mixer (attn vs mamba vs nothing).
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film \
+  --wandb_run_name  q3_8b-film
+
+# film-mamba — FiLM + Mamba SSM context (1 layer) — the default in build_adapter
+# The "proposed" variant for the paper's main claim. Worth running if mamba-ssm installs cleanly.
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-mamba \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba \
+  --wandb_run_name  q3_8b-film-mamba
+
+# film-attn-2L — FiLM + self-attention context (2 layers)
+# Tests whether deeper context helps over 1-layer film-attn.
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-attn-2L \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn_2L \
+  --wandb_run_name  q3_8b-film-attn-2L
+
+# film-mamba-2L — FiLM + Mamba (2 layers)
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-mamba-2L \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba_2L \
+  --wandb_run_name  q3_8b-film-mamba-2L
+```
+
+Suggested filtering by story:
+- **Ablate the temporal mixer** (FiLM fixed, swap mixer): `film`, `film-attn`, `film-mamba` — argues for Mamba over attention.
+- **Ablate the conditioning mechanism** (mixer fixed, swap conditioning): `concat-only`, `sigmoid-gate`, `film-attn` — argues for FiLM over naive concat/gate.
+- **Depth ablation**: `film-attn` vs `film-attn-2L`, `film-mamba` vs `film-mamba-2L` — argues 1 layer is enough / 2 layers help.
+
+Pick whichever sub-table strengthens your paper's thesis; you don't need to publish all 8 variants.
+
+### Resuming a crashed or preempted run
+
+Every epoch writes `$SAVE_DIR/last.pt` (latest state) and updates `$SAVE_DIR/best.pt` (best-val-so-far). Resume by passing `--resume_from <path_to_last.pt>` — adapter + LoRA weights, optimizer state, scheduler state, epoch counter, best-val-loss, and the wandb run ID are all restored (so the same wandb run continues, not a new one).
+
+```bash
+# Person 1 — resume concat-only
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant concat-only \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_concat \
+  --wandb_run_name  q3_8b-concat-only \
+  --resume_from     $SHARED/checkpoints/q3_8b_concat/last.pt
+
+# Person 2 — resume qformer
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant qformer \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
+  --wandb_run_name  q3_8b-qformer \
+  --resume_from     $SHARED/checkpoints/q3_8b_qformer/last.pt
+
+# Person 3 — resume film-attn
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-attn \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
+  --wandb_run_name  q3_8b-film-attn \
+  --resume_from     $SHARED/checkpoints/q3_8b_film_attn/last.pt
+```
+
+Extended-ablation resumes follow the same pattern — add `--resume_from $SHARED/checkpoints/<save_dir>/last.pt` to the matching launch line.
+
+Typical reasons to resume: OOM mid-epoch, srun/sbatch time limit hit, node preemption, intentional restart with changed hyperparameters. To extend training beyond the original `epochs`, add `--epochs N` alongside `--resume_from`.
+
+## Evaluation
+
+Inference evaluates the best checkpoint on the test set with **four complementary metrics**.
+
+### What the metrics measure
 
 | Metric | What it measures | When to trust it |
 |---|---|---|
@@ -313,7 +474,9 @@ Inference evaluates the best checkpoint on the test set with **four complementar
 | **ROUGE-L (F1)** | Longest common subsequence between hyp and ref. More robust than BLEU to reordering. | Complements BLEU for summarization-like overlap; interpret as "how much of the reference structure survived." |
 | **BERTScore-F1** | Embedding-similarity (RoBERTa-large) averaged token-by-token. Captures semantic equivalence even when wording differs. | The right metric for catching paraphrases. High BERTScore + low BLEU = paraphrased but faithful. Low BERTScore = the model is saying something unrelated to the reference. |
 
-**Interpretation grid** (useful when writing the results discussion):
+### Interpretation grid
+
+Useful when writing the results discussion:
 
 | SFS-F1 | BLEU/ROUGE | Diagnosis |
 |---|---|---|
@@ -322,7 +485,7 @@ Inference evaluates the best checkpoint on the test set with **four complementar
 | low | high | Fluent hallucinations — model reproduces reference templates but gets numbers wrong. Train longer / improve conditioning. |
 | low | low | Generator broken — decoding degenerate, checkpoint regressed, or GT/pred misalignment bug. |
 
-#### Test / inference commands for the report
+### Test / inference commands for the report
 
 Each teammate runs inference on **their own** trained checkpoint. The `save_dir` here must match the one passed at training time — `best.pt` inside that directory is what gets evaluated. Greedy decoding (`--top_k 1`) is used so the paper numbers are deterministic.
 
@@ -382,7 +545,7 @@ python src/inference.py --config configs/config.psc.yaml \
 - `--temperature 0.7 --top_p 0.9` → diverse sampling (only for qualitative inspection).
 - `--checkpoint_device cpu` → load checkpoint via CPU before moving to GPU (for smaller GPUs).
 
-**Loop form** if one teammate runs all five at once:
+**Loop form** if one teammate runs all eight at once:
 
 ```bash
 for variant in concat qformer film_attn sigmoid_gate film film_mamba film_attn_2L film_mamba_2L; do
@@ -393,7 +556,7 @@ for variant in concat qformer film_attn sigmoid_gate film film_mamba film_attn_2
 done
 ```
 
-#### Where results land
+### Where results land
 
 Under `$SAVE_DIR` (same path you passed at training time):
 
@@ -407,167 +570,8 @@ On wandb (default-on; disable with `wandb_log_test: false` in the config): the s
 
 Because `best.pt` stores the original `wandb_run_id`, inference resumes the same wandb run instead of creating a new one — so train, val, and test metrics sit side-by-side on one page.
 
-#### Training-time monitoring
+### Training-time monitoring
 
 The same metrics are logged every epoch on the 8-sample val slice (`src/train.py`). BLEU and ROUGE-L are always-on (near-free on 8 samples); BERTScore is opt-in via `use_bertscore: true` in the config (it downloads a ~1 GB RoBERTa-large model on first use). Scalars: `val_sfs_precision/recall/f1`, `val_bleu`, `val_rouge_l`, `val_bertscore_f1`. Per-epoch JSON dumps of the 8 samples also land at `$SAVE_DIR/val_samples/epoch_NNN.json` for offline inspection.
 
 > Training checkpoint selection is driven by **val_loss only** — BLEU/ROUGE/BERTScore are reported for diagnostics, not for `best.pt` selection. Saving-best on a similarity metric would push the model toward reference-copying and *lower* SFS.
-
-### Swapping models and adapter variants via CLI
-
-`train.py` accepts any `--key value` override for config entries — **no YAML edits needed per run**. The two most-swapped keys:
-
-- `--lm_name <HF_model_id>` — swap the causal LM backbone
-- `--adapter_variant <name>` — swap the audio→LM adapter architecture
-- `--save_dir <path>`, `--wandb_run_name <label>` — isolate per-run checkpoints + logs
-
-#### Available LMs (cached in `/ocean/projects/cis260125p/shared/hf_cache`)
-
-| `--lm_name` | Size (bf16) | Notes |
-|---|---|---|
-| `Qwen/Qwen2.5-7B` | ~15 GB | Dense, 28 layers. Lightest; fits bs=8 on H100-80 without gradient checkpointing. |
-| `Qwen/Qwen3-8B` | ~16 GB | Dense, Qwen3 family. **Default for IDL report runs.** Fits bs=6 on H100-80 (bs=8 OOMs without gradient checkpointing). |
-| `Qwen/Qwen3.5-9B` | ~18 GB | Dense, Qwen3.5 family. Needs `bs=4 + grad_accum=2` and/or `--gradient_checkpointing true`. |
-| `Qwen/Qwen3.6-35B-A3B` | ~70 GB | Sparse MoE. **Needs 4-bit quantization** (bitsandbytes) — straight bf16 will OOM even on H100-80. |
-
-Swapping to a model not in that list will trigger a one-time HuggingFace download to the shared cache.
-
-#### Available `--adapter_variant` values
-
-Built in `src/adapter.py::build_adapter`:
-
-- `concat-only` — baseline: concat audio + overlap features, no conditioning.
-- `sigmoid-gate` — sigmoid-gated overlap-aware mixing.
-- `film` — FiLM conditioning, no sequential context mixer.
-- `film-attn` / `film-attn-2L` — FiLM + self-attention context (1 or 2 layers).
-- `film-mamba` / `film-mamba-2L` — FiLM + Mamba SSM context (1 or 2 layers). **Default in `build_adapter`.**
-- `qformer` — Q-Former style cross-attention (alternative architecture).
-
-#### Three-run ablation recipe for the IDL report
-
-Each teammate runs one line on their own H100 — separate `save_dir` keeps checkpoints from clobbering each other:
-
-```bash
-# Person 1 — concat-only baseline
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant concat-only \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_concat \
-  --wandb_run_name  q3_8b-concat-only
-
-# Person 2 — Q-Former alternative
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant qformer \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
-  --wandb_run_name  q3_8b-qformer
-
-# Person 3 — FiLM + attention (proposed)
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant film-attn \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
-  --wandb_run_name  q3_8b-film-attn
-```
-
-> Qwen3-8B OOMs at bs=8 on H100-80; bs=6 is the tested-safe setting. If you prefer the default bs=8 from the config, swap to Qwen2.5-7B or add `--gradient_checkpointing true`.
-
-Naming convention: `<lm-slug>_<variant>` — makes checkpoints self-describing across a 3×3 LM × variant sweep.
-
-**Any config key** (`--batch_size`, `--epochs`, `--lr_adapter`, `--lora_rank`, …) can be overridden the same way — the override logic in `train.py` coerces bool/int/float values based on the YAML type. Strings pass through verbatim.
-
-#### Resuming a crashed or preempted run
-
-Every epoch writes `$SAVE_DIR/last.pt` (latest state) and updates `$SAVE_DIR/best.pt` (best-val-so-far). Resume by passing `--resume_from <path_to_last.pt>` — adapter + LoRA weights, optimizer state, scheduler state, epoch counter, best-val-loss, and the wandb run ID are all restored (so the same wandb run continues, not a new one).
-
-```bash
-# Person 1 — resume concat-only
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant concat-only \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_concat \
-  --wandb_run_name  q3_8b-concat-only \
-  --resume_from     $SHARED/checkpoints/q3_8b_concat/last.pt
-
-# Person 2 — resume qformer
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant qformer \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
-  --wandb_run_name  q3_8b-qformer \
-  --resume_from     $SHARED/checkpoints/q3_8b_qformer/last.pt
-
-# Person 3 — resume film-attn
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant film-attn \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
-  --wandb_run_name  q3_8b-film-attn \
-  --resume_from     $SHARED/checkpoints/q3_8b_film_attn/last.pt
-```
-
-Typical reasons to resume: OOM mid-epoch, srun/sbatch time limit hit, node preemption, intentional restart with changed hyperparameters. To extend training beyond the original `epochs`, add `--epochs N` alongside `--resume_from`.
-
-#### Extended ablation — the remaining adapter variants
-
-The three-run recipe above covers the minimum story (baseline / popular alt / FiLM). If you have H100-hours to spare, run the remaining variants from `build_adapter` for a stronger paper table. All use the same LM, bs, and training budget so the comparison stays apples-to-apples.
-
-```bash
-# sigmoid-gate — a lighter overlap-aware mixing alternative to FiLM
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant sigmoid-gate \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_sigmoid_gate \
-  --wandb_run_name  q3_8b-sigmoid-gate
-
-# film — FiLM conditioning only, no sequential context mixer
-# Isolates the contribution of the temporal mixer (attn vs mamba vs nothing).
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant film \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_film \
-  --wandb_run_name  q3_8b-film
-
-# film-mamba — FiLM + Mamba SSM context (1 layer) — the default in build_adapter
-# The "proposed" variant for the paper's main claim. Worth running if mamba-ssm installs cleanly.
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant film-mamba \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba \
-  --wandb_run_name  q3_8b-film-mamba
-
-# film-attn-2L — FiLM + self-attention context (2 layers)
-# Tests whether deeper context helps over 1-layer film-attn.
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant film-attn-2L \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_film_attn_2L \
-  --wandb_run_name  q3_8b-film-attn-2L
-
-# film-mamba-2L — FiLM + Mamba (2 layers)
-python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3-8B \
-  --adapter_variant film-mamba-2L \
-  --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba_2L \
-  --wandb_run_name  q3_8b-film-mamba-2L
-```
-
-Resume commands follow the same pattern — just add `--resume_from $SHARED/checkpoints/<save_dir>/last.pt` to the matching launch line.
-
-Suggested filtering by story:
-- **Ablate the temporal mixer** (FiLM fixed, swap mixer): `film`, `film-attn`, `film-mamba` — argues for Mamba over attention.
-- **Ablate the conditioning mechanism** (mixer fixed, swap conditioning): `concat-only`, `sigmoid-gate`, `film-attn` — argues for FiLM over naive concat/gate.
-- **Depth ablation**: `film-attn` vs `film-attn-2L`, `film-mamba` vs `film-mamba-2L` — argues 1 layer is enough / 2 layers help.
-
-Pick whichever sub-table strengthens your paper's thesis; you don't need to publish all 8 variants.
