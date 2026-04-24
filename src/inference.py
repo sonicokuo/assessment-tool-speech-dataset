@@ -107,8 +107,43 @@ def generate(
 
 
 # ── Evaluation ──────────────────────────────────────────────
+# Keys that must match the training run — read from the checkpoint's embedded
+# config rather than the YAML so you can evaluate any run without --key flags.
+_STRUCTURAL_KEYS = (
+    "lm_name",
+    "adapter_variant",
+    "lora_rank",
+    "lora_alpha",
+    "lora_targets",
+    "lora_dropout",
+)
+
+
+def _sync_config_with_checkpoint(config: dict, checkpoint_path: str) -> dict:
+    """Override structural keys in config with whatever the checkpoint was trained with.
+
+    train.py pickles the full config into every checkpoint. For eval that config is
+    the source of truth — the YAML might list a different default LM than the run
+    being evaluated.
+    """
+    ck = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
+    ck_cfg = ck.get("config", {})
+    for k in _STRUCTURAL_KEYS:
+        if k in ck_cfg and ck_cfg[k] != config.get(k):
+            print(f"[config] {k}: {config.get(k)!r} → {ck_cfg[k]!r} (from checkpoint)")
+            config[k] = ck_cfg[k]
+    # Carry wandb_run_id so we can re-attach to the same run at test-log time.
+    if "wandb_run_id" in ck:
+        config.setdefault("_ckpt_wandb_run_id", ck["wandb_run_id"])
+    return config
+
+
 def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Pull lm_name / adapter_variant / lora_* from the checkpoint itself so we
+    # don't need --lm_name / --adapter_variant on the CLI.
+    config = _sync_config_with_checkpoint(config, checkpoint_path)
 
     # Load tokenizer + LLM + LoRA
     tokenizer = AutoTokenizer.from_pretrained(config["lm_name"])

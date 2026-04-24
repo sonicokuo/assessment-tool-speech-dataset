@@ -489,6 +489,8 @@ Useful when writing the results discussion:
 
 Each teammate runs inference on **their own** trained checkpoint. The `save_dir` here must match the one passed at training time — `best.pt` inside that directory is what gets evaluated. Greedy decoding (`--top_k 1`) is used so the paper numbers are deterministic.
 
+> **No `--lm_name` / `--adapter_variant` needed.** `inference.py` reads the training config embedded in the checkpoint and auto-sets `lm_name`, `adapter_variant`, and the LoRA hyperparameters. You'll see a `[config] <key>: old → new (from checkpoint)` line per substitution in the console at startup.
+
 **Three-run ablation (matches the training recipe):**
 
 ```bash
