@@ -398,3 +398,61 @@ python src/train.py --config configs/config.psc.yaml \
 ```
 
 Typical reasons to resume: OOM mid-epoch, srun/sbatch time limit hit, node preemption, intentional restart with changed hyperparameters. To extend training beyond the original `epochs`, add `--epochs N` alongside `--resume_from`.
+
+#### Extended ablation — the remaining adapter variants
+
+The three-run recipe above covers the minimum story (baseline / popular alt / FiLM). If you have H100-hours to spare, run the remaining variants from `build_adapter` for a stronger paper table. All use the same LM, bs, and training budget so the comparison stays apples-to-apples.
+
+```bash
+# sigmoid-gate — a lighter overlap-aware mixing alternative to FiLM
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant sigmoid-gate \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_sigmoid_gate \
+  --wandb_run_name  q3_8b-sigmoid-gate
+
+# film — FiLM conditioning only, no sequential context mixer
+# Isolates the contribution of the temporal mixer (attn vs mamba vs nothing).
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film \
+  --wandb_run_name  q3_8b-film
+
+# film-mamba — FiLM + Mamba SSM context (1 layer) — the default in build_adapter
+# The "proposed" variant for the paper's main claim. Worth running if mamba-ssm installs cleanly.
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-mamba \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba \
+  --wandb_run_name  q3_8b-film-mamba
+
+# film-attn-2L — FiLM + self-attention context (2 layers)
+# Tests whether deeper context helps over 1-layer film-attn.
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-attn-2L \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn_2L \
+  --wandb_run_name  q3_8b-film-attn-2L
+
+# film-mamba-2L — FiLM + Mamba (2 layers)
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name         Qwen/Qwen3-8B \
+  --adapter_variant film-mamba-2L \
+  --batch_size      6 \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba_2L \
+  --wandb_run_name  q3_8b-film-mamba-2L
+```
+
+Resume commands follow the same pattern — just add `--resume_from $SHARED/checkpoints/<save_dir>/last.pt` to the matching launch line.
+
+Suggested filtering by story:
+- **Ablate the temporal mixer** (FiLM fixed, swap mixer): `film`, `film-attn`, `film-mamba` — argues for Mamba over attention.
+- **Ablate the conditioning mechanism** (mixer fixed, swap conditioning): `concat-only`, `sigmoid-gate`, `film-attn` — argues for FiLM over naive concat/gate.
+- **Depth ablation**: `film-attn` vs `film-attn-2L`, `film-mamba` vs `film-mamba-2L` — argues 1 layer is enough / 2 layers help.
+
+Pick whichever sub-table strengthens your paper's thesis; you don't need to publish all 8 variants.
