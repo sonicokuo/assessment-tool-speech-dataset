@@ -138,8 +138,19 @@ def _sync_config_with_checkpoint(config: dict, checkpoint_path: str) -> dict:
     return config
 
 
+def _pick_device() -> torch.device:
+    """Prefer CUDA, then Apple-Silicon MPS, then CPU. MPS lets a Mac run Qwen-class
+    models at ~5-10× CPU speed for this kind of single-stream decode."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _pick_device()
+    print(f"[device] {device}")
 
     # Pull lm_name / adapter_variant / lora_* from the checkpoint itself so we
     # don't need --lm_name / --adapter_variant on the CLI.
@@ -444,6 +455,10 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=int, default=None,
                         help="Stop index (exclusive). Default = end of test set. "
                              "Combine with --start for range/parallel runs; reruns auto-skip already-scored clips.")
+    parser.add_argument("--max_new_tokens", type=int, default=None,
+                        help="Override max_target_length for generation. "
+                             "Training default was 256 — long descriptions get truncated mid-sentence. "
+                             "Try 512 to see if the model extrapolates coherently past the training cap.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -459,5 +474,7 @@ if __name__ == "__main__":
     config["checkpoint_device"] = args.checkpoint_device
     config["start"] = args.start
     config["end"] = args.end
+    if args.max_new_tokens is not None:
+        config["max_target_length"] = args.max_new_tokens
 
     evaluate(config, args.checkpoint, args.test_dir)
