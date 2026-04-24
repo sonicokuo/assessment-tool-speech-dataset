@@ -359,8 +359,8 @@ def train(config: dict) -> None:
                     gen_ids = llm.generate(
                         inputs_embeds=inputs_embeds,
                         attention_mask=attention_mask,
-                        max_new_tokens=128,
-                        do_sample=False,                           # greedy for reproducibility
+                        max_new_tokens=config.get("max_target_length", 256),  # matches training target length
+                        do_sample=False,                                       # greedy for reproducibility
                         pad_token_id=tokenizer.pad_token_id,
                     )
                     gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
