@@ -57,7 +57,17 @@ def _load() -> dict:
         lm_name, torch_dtype=torch.bfloat16, device_map="auto",
     )
     llm.eval()
-    print(f"[load] {lm_name} ready.")
+
+    # device_map="auto" can silently place the model on CPU when GPU memory is tight
+    # (e.g. another REPL is holding the H100, GPU-shared partition contention). Trust
+    # the model's actual location to avoid CUDA-vs-CPU tensor mismatch on generate().
+    actual_device = next(llm.parameters()).device
+    if actual_device != device:
+        print(f"[load] WARN: requested {device} but model went to {actual_device}; "
+              f"using {actual_device} for prompts.")
+        device = actual_device
+
+    print(f"[load] {lm_name} ready on {device}.")
     print(f"[prompt] {config['prompt']!r}")
     print(f"[ready] try raw_gen() or raw_gen(prefix='custom context')")
 
@@ -83,15 +93,21 @@ def raw_gen(
     input_ids = _S["tokenizer"](full_prompt, return_tensors="pt").input_ids.to(_S["device"])
     n_prompt = input_ids.shape[1]
 
-    out = _S["llm"].generate(
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        do_sample=(top_k != 1 or temperature != 1.0 or top_p != 1.0),
-        top_k=top_k if top_k > 0 else 50,
-        top_p=top_p,
-        temperature=temperature,
-        pad_token_id=_S["tokenizer"].pad_token_id,
-    )
+    do_sample = (top_k != 1 or temperature != 1.0 or top_p != 1.0)
+    gen_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),   # silence pad/eos warning
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "pad_token_id": _S["tokenizer"].pad_token_id,
+    }
+    if do_sample:   # only pass sampling flags when sampling — otherwise HF warns
+        gen_kwargs.update({
+            "top_k": top_k if top_k > 0 else 50,
+            "top_p": top_p,
+            "temperature": temperature,
+        })
+    out = _S["llm"].generate(**gen_kwargs)
     gen_ids = out[0, n_prompt:]
     text = _S["tokenizer"].decode(gen_ids, skip_special_tokens=True)
 
