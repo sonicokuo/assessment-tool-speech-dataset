@@ -70,6 +70,14 @@ def _load() -> dict:
         ),
     )
 
+    # device_map="auto" may place the LLM on CPU if GPU memory is tight (e.g. another
+    # demo session is hogging the H100). Trust the model's actual location, not _pick_device().
+    actual_device = next(llm.parameters()).device
+    if actual_device != device:
+        print(f"[load] WARN: requested {device} but model went to {actual_device}; "
+              f"using {actual_device} for prompts/adapter to avoid mismatch.")
+        device = actual_device
+
     print(f"[load] checkpoint {args.checkpoint}")
     ck = torch.load(args.checkpoint, weights_only=False, map_location="cpu")
     adapter = build_adapter(config["adapter_variant"], lm_dim=llm.config.hidden_size).to(device).to(torch.bfloat16)
@@ -81,7 +89,14 @@ def _load() -> dict:
     test_set = PreprocessedDataset(args.test_dir, config.get("descriptions_path"))
     prompt_ids = tokenizer(config["prompt"], return_tensors="pt").input_ids.to(device)
     print(f"[load] {len(test_set)} test clips at {args.test_dir}")
-    print(f"[ready] type gen(0), compare(3), info(7), help(gen) …")
+    print(f"[ready] commands available:")
+    print(f"  gen(idx, max_new_tokens=512)              — trained model on test clip idx")
+    print(f"  compare(idx)                              — trained generation vs target + SFS")
+    print(f"  info(idx)                                 — clip metadata, no generation")
+    print(f"  raw_gen(max_new_tokens=256)               — raw Qwen (LoRA off, no audio)")
+    print(f"  compare_raw_vs_trained(idx)               — side-by-side raw vs trained + SFS")
+    print(f"  gen_from_wav('/path/to.wav', overlap_segs=[(0.5,2.3),...])")
+    print(f"                                            — raw audio in (no .pt cache)")
 
     return {
         "adapter": adapter, "llm": llm, "tokenizer": tokenizer,
@@ -167,16 +182,22 @@ def raw_gen(max_new_tokens: int = 256, temperature: float = 1.0,
     tok = _S["tokenizer"]
     prompt_ids = _S["prompt_ids"]
     n_prompt = prompt_ids.shape[1]
+    do_sample = (top_k != 1 or temperature != 1.0 or top_p != 1.0)
+    gen_kwargs = {
+        "input_ids": prompt_ids,
+        "attention_mask": torch.ones_like(prompt_ids),   # silence the pad/eos warning
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "pad_token_id": tok.pad_token_id,
+    }
+    if do_sample:   # only pass sampling flags when sampling — otherwise HF warns
+        gen_kwargs.update({
+            "top_k": top_k if top_k > 0 else 50,
+            "top_p": top_p,
+            "temperature": temperature,
+        })
     with llm.disable_adapter():
-        out = llm.generate(
-            input_ids=prompt_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=(top_k != 1 or temperature != 1.0 or top_p != 1.0),
-            top_k=top_k if top_k > 0 else 50,
-            top_p=top_p,
-            temperature=temperature,
-            pad_token_id=tok.pad_token_id,
-        )
+        out = llm.generate(**gen_kwargs)
     text = tok.decode(out[0, n_prompt:], skip_special_tokens=True)
     print(f"\n── RAW {_S['config']['lm_name']} (LoRA off, no audio) ──")
     print(text)
