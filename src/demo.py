@@ -153,6 +153,88 @@ def info(idx: int) -> None:
         print(f"target ({len(t.split())} words): {t[:300]}{'...' if len(t)>300 else ''}")
 
 
+# ── Raw-LM comparison (LoRA disabled, no adapter prefix) ────────
+@torch.no_grad()
+def raw_gen(max_new_tokens: int = 256, temperature: float = 1.0,
+            top_k: int = 1, top_p: float = 1.0) -> str:
+    """Generate from the bare prompt with LoRA disabled and no audio prefix.
+
+    Same Qwen weights as the trained model, just with the fine-tuning turned off
+    and no adapter contribution — useful as the apples-to-apples 'what would the
+    raw LM produce on this prompt?' baseline.
+    """
+    llm = _S["llm"]
+    tok = _S["tokenizer"]
+    prompt_ids = _S["prompt_ids"]
+    n_prompt = prompt_ids.shape[1]
+    with llm.disable_adapter():
+        out = llm.generate(
+            input_ids=prompt_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=(top_k != 1 or temperature != 1.0 or top_p != 1.0),
+            top_k=top_k if top_k > 0 else 50,
+            top_p=top_p,
+            temperature=temperature,
+            pad_token_id=tok.pad_token_id,
+        )
+    text = tok.decode(out[0, n_prompt:], skip_special_tokens=True)
+    print(f"\n── RAW {_S['config']['lm_name']} (LoRA off, no audio) ──")
+    print(text)
+    print(f"\n[meta] {len(text.split())} words, ends in period: {text.rstrip().endswith('.')}")
+    return text
+
+
+def compare_raw_vs_trained(idx: int, max_new_tokens: int = 256,
+                            top_k: int = 1) -> dict:
+    """Run the same prompt through the raw LM and the trained (adapter+LoRA) model.
+
+    Prints both generations side-by-side plus SFS for the trained one (raw never
+    sees the audio so its SFS is meaningless — included anyway for context).
+    """
+    sample = _S["test_set"][idx]
+    target = sample.get("target_text", "") or ""
+
+    # Trained: adapter + LoRA + audio prefix
+    trained = generate(
+        _S["adapter"], _S["llm"], _S["tokenizer"],
+        sample["audio_features"], sample["overlap_info"],
+        _S["prompt_ids"], _S["device"],
+        max_new_tokens=max_new_tokens, temperature=1.0, top_k=top_k, top_p=1.0,
+    )
+
+    # Raw: same LM weights but LoRA disabled, no adapter prefix
+    llm = _S["llm"]
+    tok = _S["tokenizer"]
+    n_prompt = _S["prompt_ids"].shape[1]
+    with llm.disable_adapter():
+        out = llm.generate(
+            input_ids=_S["prompt_ids"],
+            max_new_tokens=max_new_tokens, do_sample=False, top_k=top_k,
+            pad_token_id=tok.pad_token_id,
+        )
+    raw = tok.decode(out[0, n_prompt:], skip_special_tokens=True)
+
+    print(f"\n── clip {idx}: {sample['filename']} ──")
+    print(f"\n[TARGET]\n{target}")
+    print(f"\n[TRAINED — adapter + LoRA, audio in]\n{trained}")
+    print(f"\n[RAW — LoRA off, no audio]\n{raw}")
+
+    # SFS for both (raw is degenerate by construction; included for the comparison)
+    if target:
+        gt_claims = _S["parser"].parse(target)
+        gt = {c.feature: c.value for c in gt_claims}
+        if sample.get("overlap_segments"):
+            gt["overlap_segments"] = sample["overlap_segments"]
+
+        trained_score = _S["scorer"].score(_S["parser"].parse(trained), gt)
+        raw_score = _S["scorer"].score(_S["parser"].parse(raw), gt)
+        print(f"\n[SFS]")
+        print(f"  trained: P={trained_score['precision']:.2f} R={trained_score['recall']:.2f} F1={trained_score['f1']:.2f}")
+        print(f"  raw    : P={raw_score['precision']:.2f} R={raw_score['recall']:.2f} F1={raw_score['f1']:.2f}")
+        return {"trained": trained_score, "raw": raw_score, "delta_f1": trained_score['f1'] - raw_score['f1']}
+    return {}
+
+
 # ── Raw-wav-in path ────────────────────────────────────────────
 # Lazy-loaded WavLM (separate model from the LM); first call to gen_from_wav()
 # pays a one-time ~30 sec load + a small download if not cached.
