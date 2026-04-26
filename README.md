@@ -510,6 +510,16 @@ grep "^lambda_" configs/config.psc.yaml
 
 ### Three-run ablation recipe for the IDL report
 
+> ⚠ **Legacy (Phase-1) commands kept for historical reference.** These use the original
+> `q3_8b_<variant>` save_dirs (no `_v2` suffix) and were used to produce the v1 result
+> tables (concat=0.55, qformer=0.47, film_attn=0.55) that motivated the Phase-2 retrain.
+> If you're starting a fresh sweep today, **use the [Phase-2 training recipe](#phase-2-training-recipe-b-full--pyannote-inputs-default-as-of-2026-04-26) above instead** — it stacks the
+> 5 interventions (FiLM init, B-full, Pyannote inputs, dual-prompt, MSE normalization)
+> and uses `_v2` save_dirs. The commands below remain available if you ever need to
+> reproduce the legacy single-task training (e.g., for a paper ablation comparing
+> "vanilla SFT" to the Phase-2 recipe — set `lambda_nums: 0.0, lambda_mse: 0.0` to
+> collapse to prose-only).
+
 Each teammate runs one line on their own H100 — separate `save_dir` keeps checkpoints from clobbering each other:
 
 ```bash
@@ -543,6 +553,10 @@ python src/train.py --config configs/config.psc.yaml \
 Naming convention: `<lm-slug>_<variant>` — makes checkpoints self-describing across a 3×3 LM × variant sweep.
 
 ### Extended ablation — the remaining adapter variants
+
+> ⚠ **Phase-1 commands.** Same caveat as the three-run recipe above: these write to legacy
+> save_dir paths without `_v2`. If you're using the Phase-2 recipe, just rename `save_dir`
+> and `wandb_run_name` to add a `_v2` (or `_v3`) suffix.
 
 The three-run recipe above covers the minimum story (baseline / popular alt / FiLM). If you have H100-hours to spare, run the remaining variants from `build_adapter` for a stronger paper table. All use the same LM, bs, and training budget so the comparison stays apples-to-apples.
 
