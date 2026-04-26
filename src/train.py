@@ -80,6 +80,7 @@ def compute_loss(
     target_nums: list[str] | None = None,
     gt_scalars: torch.Tensor | None = None,
     gt_mask: torch.Tensor | None = None,
+    prompt_nums_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """B-full multi-task forward + auxiliary regression head.
 
@@ -137,9 +138,13 @@ def compute_loss(
             # Bare-numbers targets are short (~80 tokens); cap separately to avoid the
             # prose-target's 384+ length budget.
             nums_max_len = config.get("max_nums_length", 96)
+            # Use a dedicated prompt for the numbers-target forward when one is configured.
+            # If prompt_nums_ids is None we fall back to prompt_ids (legacy single-prompt setup,
+            # which causes both completions to live under the same prompt key).
+            nums_prompt = prompt_nums_ids if prompt_nums_ids is not None else prompt_ids
             lm_loss_nums = _ce_against_target(
                 llm, embed_layer, tokenizer,
-                prefix_subset, prompt_ids, nums_subset,
+                prefix_subset, nums_prompt, nums_subset,
                 max_length=nums_max_len,
                 device=device,
             )
@@ -235,7 +240,23 @@ def train(config: dict) -> None:
     )
 
     # Prompt
-    prompt_ids = tokenizer(config["prompt"], return_tensors="pt").input_ids.to(device)
+    # Prompt for the prose target / inference. Falls back to legacy `prompt` field if
+    # `prompt_prose` isn't set.
+    prose_prompt_str = config.get("prompt_prose") or config["prompt"]
+    prompt_ids = tokenizer(prose_prompt_str, return_tensors="pt").input_ids.to(device)
+    print(f"[prompt-prose] {prose_prompt_str!r}")
+
+    # Optional separate prompt for B-full's numbers target. When set, the LM learns
+    # bare-numbers as a completion of THIS prompt only — at inference (prose prompt
+    # only) the LM produces prose-only output. Without this, both completions share
+    # one prompt key and inference outputs a numbers-then-prose mix.
+    prompt_nums_ids = None
+    if config.get("prompt_nums"):
+        prompt_nums_ids = tokenizer(config["prompt_nums"], return_tensors="pt").input_ids.to(device)
+        print(f"[prompt-nums]  {config['prompt_nums']!r}")
+    else:
+        print(f"[prompt-nums]  not set — bare-numbers target will use the prose prompt "
+              f"(legacy single-prompt B-full; inference will mix formats).")
 
     # Dataset + Dataloader
     data_dir = config["data_dir"]
@@ -393,6 +414,7 @@ def train(config: dict) -> None:
                 target_nums=batch.get("target_nums"),
                 gt_scalars=batch.get("gt_scalars"),
                 gt_mask=batch.get("gt_mask"),
+                prompt_nums_ids=prompt_nums_ids,
             )
             loss = loss / accum_steps
             loss.backward()

@@ -204,7 +204,11 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     print(f"Loaded checkpoint: epoch {checkpoint['epoch']}, val_loss={checkpoint['best_val_loss']:.4f}")
 
     # Prompt
-    prompt_ids = tokenizer(config["prompt"], return_tensors="pt").input_ids.to(device)
+    # Inference always uses the prose prompt. prompt_prose is the canonical key going
+    # forward; fall back to legacy `prompt` if not set (e.g., old YAMLs).
+    inference_prompt = config.get("prompt_prose") or config["prompt"]
+    prompt_ids = tokenizer(inference_prompt, return_tensors="pt").input_ids.to(device)
+    print(f"[prompt-prose] {inference_prompt!r}")
 
     # Dataset
     test_set = PreprocessedDataset(test_dir, config.get("descriptions_path"))

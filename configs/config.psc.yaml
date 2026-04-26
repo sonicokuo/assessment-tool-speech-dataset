@@ -57,7 +57,15 @@ lambda_mse:   0.3   # auxiliary regression head MSE — direct adapter→numeric
 
 # ── Evaluation ──────────────────────────
 eval_every_epoch: 1
+# Prose prompt — the one inference always uses. Same string the legacy training used.
 prompt: "Describe the quality of this recording."
+prompt_prose: "Describe the quality of this recording."
+# B-full's bare-numbers target gets its OWN prompt during training. The LM learns
+# "after prompt_nums, emit snr=...; after prompt_prose, emit prose." At inference we
+# only feed prompt_prose, so the LM produces prose only — no bare-numbers prefix
+# eating the token budget. (When this key is absent, both forwards share the prose
+# prompt and inference mixes the two formats.)
+prompt_nums:  "List the numerical features of this recording:"
 val_sfs_n: 32  # bumped from 8 — 8 was too noisy to read F1 trends across epochs
 
 # ── Generation ──────────────────────────

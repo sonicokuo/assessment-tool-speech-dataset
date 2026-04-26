@@ -87,7 +87,9 @@ def _load() -> dict:
     print(f"[load] adapter+LoRA loaded; epoch={ck.get('epoch')}, val_loss={ck.get('best_val_loss', 0):.4f}")
 
     test_set = PreprocessedDataset(args.test_dir, config.get("descriptions_path"))
-    prompt_ids = tokenizer(config["prompt"], return_tensors="pt").input_ids.to(device)
+    # Demo always uses the prose prompt for generation (same as inference).
+    demo_prompt = config.get("prompt_prose") or config["prompt"]
+    prompt_ids = tokenizer(demo_prompt, return_tensors="pt").input_ids.to(device)
     print(f"[load] {len(test_set)} test clips at {args.test_dir}")
     print(f"[ready] commands available:")
     print(f"  gen(idx, max_new_tokens=512)              — trained model on test clip idx")
