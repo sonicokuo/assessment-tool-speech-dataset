@@ -51,9 +51,15 @@ pin_memory: true
 # ── B-full multi-task loss weights ──────────────────────────
 # loss = lambda_prose * lm_ce_prose + lambda_nums * lm_ce_nums + lambda_mse * masked_mse
 # Setting lambda_nums = lambda_mse = 0 collapses to legacy prose-only training.
-lambda_prose: 0.3   # natural-language description CE — preserves prose generation ability
-lambda_nums:  1.0   # bare-numbers target CE — concentrates digit-emission supervision
-lambda_mse:   0.3   # auxiliary regression head MSE — direct adapter→numerical mapping
+#
+# Forward B (prose) is the inference path — its target is what SFS evaluates. So it
+# gets the dominant weight. Forward A (bare-numbers) is auxiliary scaffolding that
+# helps shape the adapter; lambda_nums=0.3 keeps it useful without starving the prose.
+# MSE is normalized per-feature in src/feature_set.py::FEATURE_SCALES so all 13
+# features contribute equally regardless of magnitude.
+lambda_prose: 1.0   # natural-language description CE — primary task (inference path)
+lambda_nums:  0.3   # bare-numbers target CE — auxiliary scaffolding for adapter
+lambda_mse:   0.3   # auxiliary regression head MSE — normalized; direct adapter→scalar mapping
 
 # ── Evaluation ──────────────────────────
 eval_every_epoch: 1

@@ -47,6 +47,31 @@ SUPERVISED_FEATURES: list[tuple[str, str, str]] = [
 
 N_FEATURES: int = len(SUPERVISED_FEATURES)  # 13
 
+
+# Per-feature scales used to NORMALIZE the auxiliary-head MSE.
+# Without normalization, the F0 features (typical magnitude ~150 Hz) dominate the
+# squared-error sum 1000x over features like overlap_ratio (~0.5). The adapter then
+# optimizes almost exclusively for F0 prediction, starving the prose pathway.
+# Each scale is roughly the typical absolute value of that feature on real Libri2Mix
+# clips; dividing (pred - gt) by the scale gives a unit-free relative-error term.
+# Order MUST match SUPERVISED_FEATURES.
+FEATURE_SCALES: tuple[float, ...] = (
+    5.0,    # snr  (dB, typical ~15)
+    5.0,    # hnr  (dB, typical ~10)
+    50.0,   # f0_mean  (Hz, typical ~150)
+    20.0,   # f0_sd  (Hz, typical ~40)
+    1.0,    # jitter  (%, typical ~2)
+    5.0,    # shimmer  (%, typical ~12)
+    2.0,    # srmr  (typical ~5)
+    0.3,    # overlap_ratio  (typical ~0.5)
+    2.0,    # speaking_rate  (syl/sec, typical ~6)
+    2.0,    # articulation_rate  (syl/sec, typical ~7)
+    3.0,    # pause_count  (count, typical ~3)
+    5.0,    # pause_rate  (per min, typical ~10)
+    5.0,    # duration  (sec, typical ~10)
+)
+assert len(FEATURE_SCALES) == N_FEATURES, "FEATURE_SCALES length must match SUPERVISED_FEATURES"
+
 # Features that are *integers in nature* — pause_count is the obvious case.
 # Used by build_nums_target to cast before formatting.
 _INT_FEATURES = {"pause_count"}

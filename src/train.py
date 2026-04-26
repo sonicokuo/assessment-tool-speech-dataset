@@ -25,6 +25,7 @@ from adapter import build_adapter
 from sfs import ClaimParser, SFSScorer
 from dataset import PreprocessedDataset, collate_fn
 from text_metrics import compute_generation_metrics
+from feature_set import FEATURE_SCALES
 
 
 # ── Loss ──────────────────────────────────────────────
@@ -163,9 +164,12 @@ def compute_loss(
     if has_mse:
         gt_scalars_d = gt_scalars.to(device).to(scalar_pred.dtype)
         gt_mask_d = gt_mask.to(device).to(scalar_pred.dtype)
-        # Per-feature squared error, then mask out missing measurements before averaging.
-        per_feat_se = (scalar_pred - gt_scalars_d) ** 2          # (B, n_feat)
-        masked = per_feat_se * gt_mask_d                          # (B, n_feat)
+        # Normalize per-feature squared error by typical magnitude so all 13 features
+        # contribute roughly equally. Without this, F0 (~150 Hz) dominates the sum
+        # 1000x over overlap_ratio (~0.5) and the adapter optimizes only for F0.
+        scales = torch.tensor(FEATURE_SCALES, device=device, dtype=scalar_pred.dtype)
+        per_feat_se = ((scalar_pred - gt_scalars_d) / scales) ** 2   # (B, n_feat) — unit-free
+        masked = per_feat_se * gt_mask_d                              # (B, n_feat)
         denom = gt_mask_d.sum().clamp(min=1.0)
         mse_loss = masked.sum() / denom
         metrics["loss_mse"] = float(mse_loss.detach().item())
