@@ -334,7 +334,7 @@ Uses whatever `lm_name` and `adapter_variant` are in `configs/config.psc.yaml`:
 python src/train.py --config configs/config.psc.yaml
 ```
 
-### Phase-2 training recipe (B-full + Pyannote inputs, default as of 2026-04-25)
+### Phase-2 training recipe (B-full + Pyannote inputs, default as of 2026-04-26)
 
 The current `configs/config.psc.yaml` defaults run **multi-task B-full** training: each batch
 computes a prose CE loss, a bare-numbers CE loss, and an auxiliary-regression MSE loss, blended
@@ -342,7 +342,8 @@ as `loss = lambda_prose * lm_ce_prose + lambda_nums * lm_ce_nums + lambda_mse * 
 The audio→numerical-feature mapping gets a direct, undiluted gradient via the aux head (bypassing
 the LM and the digit-subword tokenizer).
 
-Three orthogonal interventions stack in this single retraining sweep:
+Five orthogonal interventions stack in this single retraining sweep:
+
 1. **FiLM init fix** (`src/adapter.py:80`) — `gamma.weight` init changed from `zeros_` to `normal_(0, 0.01)`
    so overlap signal has nonzero gradient through FiLM at step 0. (Was making FiLM-* variants
    blind to overlap at init while concat-only saw it directly.)
@@ -352,31 +353,160 @@ Three orthogonal interventions stack in this single retraining sweep:
 3. **Pyannote-on-mix overlap inputs** — `overlap_info` channels come from Pyannote (4 channels:
    `is_overlap`, `segment_duration_s`, `frac_through_segment`, `density_300ms`). The `clip_overlap_ratio`
    channel was removed because it's an SFS-evaluated feature; feeding it as model input was data leakage.
+4. **Dual prompts for the two B-full forwards** — Forward A uses `prompt_nums` ("List the numerical
+   features of this recording:"); Forward B and inference use `prompt_prose` ("Describe the quality
+   of this recording."). This decouples the two output formats: the LM learns "after prompt_nums →
+   bare-numbers; after prompt_prose → prose," and inference (which only feeds prompt_prose) produces
+   pure prose with no bare-numbers prefix eating the token budget.
+5. **Per-feature MSE normalization + rebalanced loss weights** — the aux-head MSE was previously
+   dominated by F0 features (~150 Hz typical, ~5600 squared error) over overlap_ratio (~0.5, ~0.06).
+   `src/feature_set.py::FEATURE_SCALES` now divides each `(pred-gt)²` by typical magnitude, making
+   all 13 features contribute equally. Default weights flipped to `lambda_prose=1.0, lambda_nums=0.3,
+   lambda_mse=0.3` so the prose pathway (the inference path) gets primary weight and the auxiliary
+   signals don't starve it.
 
-**One-time preprocessing on PSC** (~3-5 hours; needs `HF_TOKEN` for gated Pyannote repos):
+**One-time preprocessing on PSC** (~3-5 hours; needs `HF_TOKEN` for gated `pyannote/segmentation-3.0`):
 
 ```bash
+# Get your HF token from https://hf.co/settings/tokens, then accept terms on
+# https://hf.co/pyannote/segmentation-3.0 (one-time per HF account).
 export HF_TOKEN=hf_...
-bash scripts/run_pyannote_preprocessing.sh
+
+# Quick auth check before committing to the long run
+python -c "
+import os
+from pyannote.audio import Model
+m = Model.from_pretrained('pyannote/segmentation-3.0', token=os.environ['HF_TOKEN'])
+print('Pyannote auth OK; model:', type(m).__name__)
+"
+
+# Launch in background so SSH disconnects don't kill it
+nohup bash scripts/run_pyannote_preprocessing.sh > /tmp/pyannote-prep-$USER.log 2>&1 &
+tail -f /tmp/pyannote-prep-$USER.log
 ```
 
 Outputs land at `$SHARED/data/features_pyannote/` and `$SHARED/data/processed_pyannote/`. The
 original `features/` and `processed/` directories are not touched, so legacy training paths still
-work if you point the YAML back at them.
-
-**Retrain a variant** (use a fresh `save_dir` to keep legacy 5-channel runs separate):
+work if you point the YAML back at them. Confirm 4-channel overlap_info on one clip:
 
 ```bash
-python src/train.py --config configs/config.psc.yaml \
-  --adapter_variant film-mamba \
-  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba_v2 \
-  --wandb_run_name  q3_8b-film-mamba-v2
+python -c "
+import torch, os
+sample = torch.load('$SHARED/data/processed_pyannote/train/' + 
+                    sorted(os.listdir('$SHARED/data/processed_pyannote/train'))[0],
+                    weights_only=False)
+print('overlap_info shape:', sample['overlap_info'].shape, '← must be (T, 4)')
+"
 ```
 
-Diagnostic wandb scalars per epoch: `train_loss_lm_prose`, `train_loss_lm_nums`, `train_loss_mse`,
-plus their `val_*` counterparts. If `val_loss_mse` drops fast but `val_sfs_f1` stays flat → the
-adapter encodes numbers but the LM isn't reading the prefix; investigate prompt format / LoRA target
-modules. If both stay flat → optimizer/data issue.
+**Confirm token-length cap is right for your corpus** (the full corpus has p99=471, max=533):
+
+```bash
+python scratch/analyze_token_lengths.py \
+  --descriptions $SHARED/data/descriptions.json \
+  --tokenizer    Qwen/Qwen3-8B
+```
+
+If `scratch/analyze_token_lengths.py` doesn't exist on PSC, recreate it from the project (gitignored
+on local but the heredoc in conversation history rebuilds it; or just trust the default
+`max_target_length: 512` which covers 99.96% of clips).
+
+**Smoke test** before committing H100-hours to the full retrain — confirms the new pipeline runs
+end-to-end and all three loss curves drop:
+
+```bash
+mkdir -p $SHARED/data/processed_pyannote_smoke/{train,val,test}
+cp $(ls $SHARED/data/processed_pyannote/train/*.pt | head -20) $SHARED/data/processed_pyannote_smoke/train/
+cp $(ls $SHARED/data/processed_pyannote/val/*.pt   | head -10) $SHARED/data/processed_pyannote_smoke/val/
+cp $(ls $SHARED/data/processed_pyannote/test/*.pt  | head -10) $SHARED/data/processed_pyannote_smoke/test/
+
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name          Qwen/Qwen3-8B \
+  --adapter_variant  film-mamba \
+  --data_dir         $SHARED/data/processed_pyannote_smoke \
+  --batch_size       4 \
+  --epochs           1 \
+  --save_dir         $SHARED/checkpoints/sanity_bfull \
+  --wandb_run_name   sanity-bfull
+```
+
+Watch wandb at https://wandb.ai/speech_quality_adapter/idl-ablation/runs/sanity-bfull for:
+- Startup banner: `[prompt-prose]` and `[prompt-nums]` lines confirm the dual-prompt path is wired.
+- All three `train_loss_lm_prose`, `train_loss_lm_nums`, `train_loss_mse` drop within 5 batches.
+- `val_samples` table at the end shows generated text starting with "The..." (pure prose, no
+  `snr=...` prefix). If you see bare-numbers in the output, the dual-prompt patch didn't load.
+
+Cleanup smoke artifacts when satisfied:
+
+```bash
+rm -rf $SHARED/data/processed_pyannote_smoke $SHARED/checkpoints/sanity_bfull
+```
+
+**Real retraining sweep** — three teammates, three variants in parallel, one H100 each. Use a
+fresh `_v2` (or `_v3` etc.) suffix on `save_dir` to keep these runs separate from any legacy
+5-channel runs already on disk.
+
+```bash
+# Person 1 — concat-only (post-FiLM-fix baseline)
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name Qwen/Qwen3-8B --adapter_variant concat-only --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_concat_v2 --wandb_run_name q3_8b-concat-only-v2
+
+# Person 2 — qformer
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name Qwen/Qwen3-8B --adapter_variant qformer --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_qformer_v2 --wandb_run_name q3_8b-qformer-v2
+
+# Person 3 — film-attn (the proposed variant; with all five fixes stacked)
+python src/train.py --config configs/config.psc.yaml \
+  --lm_name Qwen/Qwen3-8B --adapter_variant film-attn --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v2 --wandb_run_name q3_8b-film-attn-v2
+```
+
+If a teammate hits CUDA OOM in the first batch (more likely now with `max_target_length=512` and
+B-full's two forwards), drop to `--batch_size 4 --gradient_accumulation_steps 2` (effective batch
+size 8) or add `--gradient_checkpointing true`.
+
+To detach training from the SSH session:
+
+```bash
+nohup python src/train.py --config configs/config.psc.yaml \
+  --lm_name Qwen/Qwen3-8B --adapter_variant film-attn --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v2 --wandb_run_name q3_8b-film-attn-v2 \
+  > /tmp/train-film_attn-$USER.log 2>&1 &
+echo "started PID=$!"
+```
+
+**Diagnostic wandb scalars to watch per epoch**:
+- `train_loss_lm_prose` — primary task; should drop steadily.
+- `train_loss_lm_nums` — auxiliary; should also drop, slower.
+- `train_loss_mse` — auxiliary, normalized; lands in O(0.1–1.0) range. If it's >100, the MSE
+  normalization didn't load (check `FEATURE_SCALES` is in `src/feature_set.py`).
+- `val_sfs_precision` — primary headline metric, climbs across epochs.
+- `val_sfs_recall` — should stay near 1.0 once prose template is fit (saturates fast).
+- `val_rouge_l` — sanity check: prose generation matches the gemma4 template structure.
+- `val_sfs_f1` — overall.
+
+**Decision tree if curves look weird**:
+- All three losses flat / SFS-F1 stuck below 0.10 → optimizer/data issue. Inspect the run's
+  startup banner; verify `features CSV (train) → 13900 clip rows` printed (B-full needs the CSV).
+- `train_loss_mse` huge (>100) → MSE not normalized; check `FEATURE_SCALES` is being imported.
+- `val_sfs_recall` and `val_rouge_l` DROPPING while `val_sfs_precision` rises → prose pathway
+  starved. Bump `lambda_mse: 0.3 → 0.7` and `lambda_nums: 0.3 → 0.5`, kill, relaunch with `_v3`
+  suffix. (See "Stage 2 escalation" below.)
+- Bare-numbers prefix appearing in `val_samples` table → dual-prompt patch didn't activate;
+  check `[prompt-nums]` line is in the startup banner.
+
+**Stage 2 escalation** if the metrics-vs-structure balance feels off (precision stalls, recall
+saturated and uninformative): the safest knob to bump is `lambda_mse` because its gradient flows
+only through the linear regression head and the adapter — it cannot degrade prose generation.
+
+```bash
+sed -i 's/^lambda_nums:  0\.3/lambda_nums:  0.5/' configs/config.psc.yaml
+sed -i 's/^lambda_mse:   0\.3/lambda_mse:   0.7/' configs/config.psc.yaml
+grep "^lambda_" configs/config.psc.yaml
+# kill the running v2 sweep, relaunch with _v3 save_dir
+```
 
 ### Three-run ablation recipe for the IDL report
 
