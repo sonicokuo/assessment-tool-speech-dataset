@@ -69,7 +69,9 @@ def generate(
     audio_features = audio_features.unsqueeze(0).to(device).to(torch.bfloat16)
     overlap_info = overlap_info.unsqueeze(0).to(device).to(torch.bfloat16)
 
-    prefix_embeds = adapter(audio_features, overlap_info)
+    # AdapterWithAuxHead returns (prefix, scalar_pred); legacy adapters return prefix only.
+    out = adapter(audio_features, overlap_info)
+    prefix_embeds = out[0] if isinstance(out, tuple) else out
 
     embed_layer = llm.get_input_embeddings()
     prompt_embeds = embed_layer(prompt_ids)

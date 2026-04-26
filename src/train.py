@@ -28,6 +28,44 @@ from text_metrics import compute_generation_metrics
 
 
 # ── Loss ──────────────────────────────────────────────
+def _ce_against_target(
+    llm: nn.Module,
+    embed_layer: nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    prefix_embeds: torch.Tensor,
+    prompt_ids: torch.Tensor,
+    target_text: list[str],
+    max_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Run one LM forward (prefix + prompt + target) and return CE loss on the target tokens.
+
+    Tokens of the prefix and prompt are masked out via -100 labels so the loss reflects
+    only the autoregressive prediction of the target tokens.
+    """
+    target_ids = tokenizer(
+        text=target_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    ).input_ids.to(device)
+
+    prompt_embeds = embed_layer(prompt_ids.expand(prefix_embeds.shape[0], -1))
+    target_embeds = embed_layer(target_ids)
+    inputs_embeds = torch.cat([prefix_embeds, prompt_embeds, target_embeds], dim=1)
+
+    N = prefix_embeds.shape[1]
+    P = prompt_embeds.shape[1]
+    ignore_labels = torch.full((prefix_embeds.shape[0], N + P), -100, device=device)
+    target_labels = target_ids.clone()
+    target_labels[target_labels == tokenizer.pad_token_id] = -100
+    labels = torch.cat([ignore_labels, target_labels], dim=1)
+
+    outputs = llm(inputs_embeds=inputs_embeds, labels=labels)
+    return outputs.loss
+
+
 def compute_loss(
     adapter: nn.Module,
     llm: nn.Module,
@@ -39,37 +77,103 @@ def compute_loss(
     prompt_ids: torch.Tensor,
     device: torch.device,
     config: dict,
-) -> torch.Tensor:
-    """Forward pass with pre-computed features."""
+    target_nums: list[str] | None = None,
+    gt_scalars: torch.Tensor | None = None,
+    gt_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """B-full multi-task forward + auxiliary regression head.
+
+    Computes:
+      - lm_loss_prose: CE loss on the natural-language description (prose target).
+      - lm_loss_nums:  CE loss on the bare-numbers target (forward A).
+      - mse_loss:      MSE on the aux head's scalar predictions, masked by gt_mask.
+
+    Total = lambda_prose * lm_loss_prose + lambda_nums * lm_loss_nums + lambda_mse * mse_loss.
+
+    Args:
+        target_nums: per-clip bare-numbers target strings. If None, the nums forward is skipped
+                     (legacy single-target training).
+        gt_scalars:  (B, n_features) tensor of GT scalars from feature_set.extract_scalars.
+                     If None, MSE term is skipped.
+        gt_mask:     (B, n_features) bool tensor — True where the scalar was actually measured.
+
+    Returns:
+        (total_loss, metrics_dict). metrics_dict has keys 'loss_lm_prose', 'loss_lm_nums',
+        'loss_mse', and 'loss_total' for wandb logging.
+    """
     audio_features = audio_features.to(device).to(torch.bfloat16)
     overlap_info = overlap_info.to(device).to(torch.bfloat16)
 
-    prefix_embeds = adapter(audio_features, overlap_info)
+    # AdapterWithAuxHead returns (prefix, scalar_pred); legacy adapters return prefix only.
+    out = adapter(audio_features, overlap_info)
+    if isinstance(out, tuple):
+        prefix_embeds, scalar_pred = out
+    else:
+        prefix_embeds, scalar_pred = out, None
 
-    target_ids = tokenizer(
-        text=target_text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
+    metrics: dict[str, float] = {}
+
+    # Prose CE loss (always computed)
+    lm_loss_prose = _ce_against_target(
+        llm, embed_layer, tokenizer,
+        prefix_embeds, prompt_ids, target_text,
         max_length=config["max_target_length"],
-    ).input_ids.to(device)
+        device=device,
+    )
+    metrics["loss_lm_prose"] = float(lm_loss_prose.detach().item())
 
-    prompt_embeds = embed_layer(prompt_ids.expand(prefix_embeds.shape[0], -1))
-    target_embeds = embed_layer(target_ids)
+    # Numbers CE loss (B-full forward A, optional)
+    lm_loss_nums = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    has_nums = (target_nums is not None
+                and any(t for t in target_nums)
+                and float(config.get("lambda_nums", 0.0)) > 0.0)
+    if has_nums:
+        # Filter out clips with empty nums target (no CSV row available)
+        valid_idx = [i for i, t in enumerate(target_nums) if t]
+        if valid_idx:
+            valid_idx_t = torch.tensor(valid_idx, device=device, dtype=torch.long)
+            prefix_subset = prefix_embeds.index_select(0, valid_idx_t)
+            nums_subset = [target_nums[i] for i in valid_idx]
+            # Bare-numbers targets are short (~80 tokens); cap separately to avoid the
+            # prose-target's 384+ length budget.
+            nums_max_len = config.get("max_nums_length", 96)
+            lm_loss_nums = _ce_against_target(
+                llm, embed_layer, tokenizer,
+                prefix_subset, prompt_ids, nums_subset,
+                max_length=nums_max_len,
+                device=device,
+            )
+        metrics["loss_lm_nums"] = float(lm_loss_nums.detach().item())
+    else:
+        metrics["loss_lm_nums"] = 0.0
 
-    inputs_embeds = torch.cat([prefix_embeds, prompt_embeds, target_embeds], dim=1)
+    # Aux regression head MSE (optional, requires scalar_pred + GT)
+    mse_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    has_mse = (
+        scalar_pred is not None
+        and gt_scalars is not None
+        and gt_mask is not None
+        and float(config.get("lambda_mse", 0.0)) > 0.0
+    )
+    if has_mse:
+        gt_scalars_d = gt_scalars.to(device).to(scalar_pred.dtype)
+        gt_mask_d = gt_mask.to(device).to(scalar_pred.dtype)
+        # Per-feature squared error, then mask out missing measurements before averaging.
+        per_feat_se = (scalar_pred - gt_scalars_d) ** 2          # (B, n_feat)
+        masked = per_feat_se * gt_mask_d                          # (B, n_feat)
+        denom = gt_mask_d.sum().clamp(min=1.0)
+        mse_loss = masked.sum() / denom
+        metrics["loss_mse"] = float(mse_loss.detach().item())
+    else:
+        metrics["loss_mse"] = 0.0
 
-    N = prefix_embeds.shape[1]
-    P = prompt_embeds.shape[1]
+    lambda_prose = float(config.get("lambda_prose", 1.0))
+    lambda_nums = float(config.get("lambda_nums", 0.0))
+    lambda_mse = float(config.get("lambda_mse", 0.0))
 
-    # -100 is the default ignore index for cross-entropy in PyTorch
-    ignore_labels = torch.full((prefix_embeds.shape[0], N + P), -100, device=device)
-    target_labels = target_ids.clone()
-    target_labels[target_labels == tokenizer.pad_token_id] = -100
-    labels = torch.cat([ignore_labels, target_labels], dim=1)
-
-    outputs = llm(inputs_embeds=inputs_embeds, labels=labels)
-    return outputs.loss
+    total = lambda_prose * lm_loss_prose + lambda_nums * lm_loss_nums + lambda_mse * mse_loss
+    metrics["loss_total"] = float(total.detach().item())
+    return total, metrics
 
 
 # ── Training ──────────────────────────────────────────────
@@ -149,10 +253,24 @@ def train(config: dict) -> None:
     if not os.path.isdir(test_dir):
         print("Warning: no test/ directory found. Run inference.py separately for test evaluation.")
 
-    train_set = PreprocessedDataset(train_dir, config["descriptions_path"])
-    val_set = PreprocessedDataset(val_dir, config["descriptions_path"])
+    # B-full needs a features CSV per split for the bare-numbers target + aux-head GT.
+    # config["features_csv"] is a {split: path} dict OR a single path used for all splits.
+    features_csv = config.get("features_csv")
+    if isinstance(features_csv, dict):
+        train_csv = features_csv.get("train") or features_csv.get("train-100")
+        val_csv = features_csv.get("val") or features_csv.get("dev")
+    else:
+        train_csv = val_csv = features_csv
+
+    train_set = PreprocessedDataset(train_dir, config["descriptions_path"], features_csv=train_csv)
+    val_set = PreprocessedDataset(val_dir, config["descriptions_path"], features_csv=val_csv)
     assert train_set.descriptions is not None, f"Descriptions not found: {config['descriptions_path']}"
     print(f"Loaded: train={len(train_set)}, val={len(val_set)}")
+    if train_csv:
+        n_with_csv = len(train_set.feature_csv_map)
+        print(f"  features CSV (train): {train_csv} → {n_with_csv} clip rows")
+    else:
+        print("  features CSV: not provided — B-full forward A and aux-head MSE will be skipped.")
 
     train_loader = DataLoader(
         train_set,
@@ -261,7 +379,7 @@ def train(config: dict) -> None:
         batch_bar = tqdm(total=len(train_loader), dynamic_ncols=True, leave=False, position=0, desc='Train')
 
         for batch_idx, batch in enumerate(train_loader):
-            loss = compute_loss(
+            loss, loss_metrics = compute_loss(
                 adapter,
                 llm,
                 embed_layer,
@@ -272,6 +390,9 @@ def train(config: dict) -> None:
                 prompt_ids,
                 device,
                 config,
+                target_nums=batch.get("target_nums"),
+                gt_scalars=batch.get("gt_scalars"),
+                gt_mask=batch.get("gt_mask"),
             )
             loss = loss / accum_steps
             loss.backward()
@@ -290,6 +411,9 @@ def train(config: dict) -> None:
                 wandb.log(
                     {
                         "train_loss": loss.item() * accum_steps,
+                        "train_loss_lm_prose": loss_metrics["loss_lm_prose"],
+                        "train_loss_lm_nums": loss_metrics["loss_lm_nums"],
+                        "train_loss_mse": loss_metrics["loss_mse"],
                         "lr": scheduler.get_last_lr()[0],
                         "step": n_steps + epoch * len(train_loader),
                     }
@@ -313,9 +437,10 @@ def train(config: dict) -> None:
 
             batch_bar = tqdm(total=len(val_loader), dynamic_ncols=True, leave=False, position=0, desc='Val')
 
+            val_metrics_sum = {"loss_lm_prose": 0.0, "loss_lm_nums": 0.0, "loss_mse": 0.0}
             with torch.no_grad():
                 for batch in val_loader:
-                    loss = compute_loss(
+                    loss, loss_metrics = compute_loss(
                         adapter,
                         llm,
                         embed_layer,
@@ -326,8 +451,13 @@ def train(config: dict) -> None:
                         prompt_ids,
                         device,
                         config,
+                        target_nums=batch.get("target_nums"),
+                        gt_scalars=batch.get("gt_scalars"),
+                        gt_mask=batch.get("gt_mask"),
                     )
                     val_loss += loss.item()
+                    for k in val_metrics_sum:
+                        val_metrics_sum[k] += loss_metrics[k]
                     n_val += 1
 
                     batch_bar.set_postfix(
@@ -345,13 +475,18 @@ def train(config: dict) -> None:
 
             sample_rows = []
             sfs_f1s, sfs_precs, sfs_recs = [], [], []
-            n_samples = min(8, len(val_set))
+            # val_sfs_n controls the val-time generation sample count. Default 32 (was 8) —
+            # 8 was too noisy to read F1 trends across epochs; 32 cuts noise floor in half
+            # for ~2 minutes additional generation time per epoch.
+            n_samples = min(config.get("val_sfs_n", 32), len(val_set))
             with torch.no_grad():
                 for i in range(n_samples):
                     sample = val_set[i]
                     af = sample["audio_features"].unsqueeze(0).to(device).to(torch.bfloat16)
                     oi = sample["overlap_info"].unsqueeze(0).to(device).to(torch.bfloat16)
-                    prefix = adapter(af, oi)
+                    # Adapter may return (prefix, scalar_pred) when wrapped with aux head.
+                    out = adapter(af, oi)
+                    prefix = out[0] if isinstance(out, tuple) else out
 
                     prompt_emb = embed_layer(prompt_ids)
                     inputs_embeds = torch.cat([prefix, prompt_emb], dim=1)
@@ -429,8 +564,18 @@ def train(config: dict) -> None:
                 use_bertscore=config.get("use_bertscore", False),
             )
 
+            # Per-epoch averages of B-full's three loss terms — diagnostic curves so you
+            # can see whether the prose CE, the nums CE, and the aux-head MSE are each
+            # converging as expected.
+            avg_val_lm_prose = val_metrics_sum["loss_lm_prose"] / max(1, n_val)
+            avg_val_lm_nums = val_metrics_sum["loss_lm_nums"] / max(1, n_val)
+            avg_val_mse = val_metrics_sum["loss_mse"] / max(1, n_val)
+
             log_dict = {
                 "val_loss": avg_val_loss,
+                "val_loss_lm_prose": avg_val_lm_prose,
+                "val_loss_lm_nums": avg_val_lm_nums,
+                "val_loss_mse": avg_val_mse,
                 "train_loss_epoch": avg_train_loss,
                 "epoch": epoch + 1,
                 "val_samples": table,

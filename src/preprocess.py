@@ -2,16 +2,19 @@
 
 Per clip, writes a .pt with:
   - audio_features     (T, 1024)  from WavLM-Large
-  - overlap_info       (T, 5)     derived from ground-truth VAD segments in the feature CSV
+  - overlap_info       (T, 4)     derived from ground-truth VAD segments in the feature CSV
   - overlap_segments   list[(start_s, end_s)]
   - filename           str
 
-The 5 overlap channels match src/adapter.py::OVERLAP_FEATURES:
+The 4 overlap channels match src/adapter.py::OVERLAP_FEATURES:
   col 0: is_overlap              (binary)
   col 1: segment_duration_s      (duration of the segment this frame belongs to, 0 outside)
   col 2: frac_through_segment    (0–1 position within segment, 0 outside)
-  col 3: clip_overlap_ratio      (clip-wide overlap fraction, broadcast to every frame)
-  col 4: density_300ms           (local overlap density, ±150 ms window, 0–1)
+  col 3: density_300ms           (local overlap density, ±150 ms window, 0–1)
+
+The clip_overlap_ratio scalar (previously col 3 of a 5-channel layout) was REMOVED
+because it's also an SFS-evaluated feature; feeding it as model input was data leakage.
+The model now has to *infer* overlap_ratio from audio + the temporal channels above.
 
 Overlap ground truth comes from feature_extractor_mix.py (--overlap min_max_vad run on
 the clean s1/s2 stems of Libri2Mix). The CSV's `overlap_segments` column stores segments
@@ -69,23 +72,23 @@ def build_overlap_info(
     T: int,
     sample_rate: int = 16000,
 ) -> tuple[torch.Tensor, list]:
-    """Convert CSV overlap segments into a (T, 5) overlap feature tensor.
+    """Convert CSV overlap segments into a (T, 4) overlap feature tensor.
 
     Args:
         segs_str:        e.g. "3616-31712;39456-67552" (sample indices) or "" for no overlap.
-        clip_overlap_ratio: clip-wide scalar to fill col 3.
+        clip_overlap_ratio: ignored (used to be col 3 of a 5-channel layout; removed because
+                             feeding the SFS-evaluated clip_overlap_ratio as input was data leakage).
+                             Argument kept for signature compatibility with prior callers.
         T:               number of WavLM frames for this clip.
         sample_rate:     audio sample rate (16000 Hz for Libri2Mix).
 
     Returns:
-        overlap_info  tensor of shape (T, 5)
+        overlap_info  tensor of shape (T, 4)
         segments_sec  list of (start_sec, end_sec) tuples for metadata / logging.
     """
-    overlap_info = torch.zeros(T, 5)
+    del clip_overlap_ratio  # explicitly unused
+    overlap_info = torch.zeros(T, 4)
     segments_sec = []
-
-    # col 3: clip-wide ratio broadcast to every frame, always present (zero if no overlap).
-    overlap_info[:, 3] = float(clip_overlap_ratio)
 
     if not segs_str:
         return overlap_info, segments_sec
@@ -117,13 +120,13 @@ def build_overlap_info(
 
         segments_sec.append((s_samp / sample_rate, e_samp / sample_rate))
 
-    # col 4: local density = 31-frame symmetric box-filter over col 0.
+    # col 3: local density = 31-frame symmetric box-filter over col 0.
     # avg_pool1d requires (1, 1, T); pad reflect to keep length T.
     k = DENSITY_WINDOW_FRAMES
     pad = k // 2
     col0 = overlap_info[:, 0].view(1, 1, -1)
     smoothed = F.avg_pool1d(F.pad(col0, (pad, pad), mode="replicate"), kernel_size=k, stride=1)
-    overlap_info[:, 4] = smoothed.view(-1)
+    overlap_info[:, 3] = smoothed.view(-1)
 
     return overlap_info, segments_sec
 

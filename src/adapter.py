@@ -13,10 +13,14 @@ AUDIO_DIM = 1024  # WavLM output dims
 #   col 0: is_overlap                binary; 1 if this frame is inside an overlap segment
 #   col 1: segment_duration_s        float;  duration (seconds) of the segment this frame belongs to, 0 outside overlap
 #   col 2: frac_through_segment      float;  0–1 position within current segment (0 at start, 1 at end), 0 outside
-#   col 3: clip_overlap_ratio        float;  clip-wide fraction of overlapped frames, broadcast to every frame
-#   col 4: density_300ms             float;  local overlap density smoothed over a ±150 ms window (0–1)
-OVERLAP_FEATURES = 5
+#   col 3: density_300ms             float;  local overlap density smoothed over a ±150 ms window (0–1)
+# NOTE: clip_overlap_ratio (the clip-wide GT scalar) was previously col 3 of a 5-channel layout.
+# It was removed because it's also an SFS-evaluated feature; feeding it as input is data leakage —
+# the model could trivially copy a side channel to its output and inflate overlap_ratio accuracy.
+# Old checkpoints (5-channel) are incompatible with this 4-channel layout; retrain after upgrading.
+OVERLAP_FEATURES = 4
 OVERLAP_DIM = 32  # output of OverlapEmbedding to learn representation
+N_AUX_FEATURES = 13  # matches src/feature_set.py::N_FEATURES; aux regression head output size
 
 
 # ── Components ──────────────────────────────────────────────
@@ -77,7 +81,12 @@ class FiLMConditioning(nn.Module):
         self.gamma = nn.Linear(overlap_dim, lm_dim)
         self.beta = nn.Linear(overlap_dim, lm_dim)
 
-        nn.init.zeros_(self.gamma.weight)
+        # Residual init at expectation: gamma ≈ 1, beta ≈ 0 → FiLM(x, *) ≈ x at step 0.
+        # Gamma weight uses small-random init (was zeros_) so the gradient of FiLM output
+        # w.r.t. overlap_embed is NONZERO at step 0; otherwise FiLM-* variants are blind to
+        # overlap signal until gamma.weight drifts off zero through random gradient noise.
+        # See tests/test_film_init_diagnostic.py for the bug demonstration.
+        nn.init.normal_(self.gamma.weight, mean=0.0, std=0.01)
         nn.init.ones_(self.gamma.bias)
         nn.init.zeros_(self.beta.weight)
         nn.init.zeros_(self.beta.bias)
@@ -361,12 +370,62 @@ class QFormerAdapter(nn.Module):
         return x
 
 
-# Factory function: build any variant by name
-def build_adapter(variant: str = "film-mamba", **kwargs) -> nn.Module:
-    """Build an adapter variant by name. Use this for wandb sweeps.
+# ── Auxiliary regression head ──────────────────────────────────────
+class AdapterWithAuxHead(nn.Module):
+    """Wraps any inner adapter and adds an auxiliary regression head.
 
-    All variants have the same interface:
-        forward(audio_features: (B,T,1024), overlap_info: (B,T,2)) → (B,N,lm_dim)
+    The aux head mean-pools the prefix tokens and projects to N_AUX_FEATURES scalars.
+    Used by B-full multi-task training to give the adapter a direct, undiluted MSE
+    gradient on the audio→numerical-feature mapping — bypassing the LM and the noisy
+    digit-subword cross-entropy path.
+
+    Forward returns (prefix, scalar_pred). At inference, scalar_pred is unused; the
+    prefix goes into the LM as before.
+    """
+
+    def __init__(
+        self,
+        inner: nn.Module,
+        lm_dim: int = LM_DIM,
+        n_features: int = N_AUX_FEATURES,
+    ):
+        super().__init__()
+        self.inner = inner
+        self.regress_head = nn.Linear(lm_dim, n_features)
+
+    def forward(
+        self,
+        audio_features: torch.Tensor,
+        overlap_info: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix = self.inner(audio_features, overlap_info)   # (B, N, lm_dim)
+        pooled = prefix.mean(dim=1)                         # (B, lm_dim)
+        scalar_pred = self.regress_head(pooled)             # (B, n_features)
+        return prefix, scalar_pred
+
+
+# Factory function: build any variant by name
+def build_adapter(
+    variant: str = "film-mamba",
+    with_aux_head: bool = True,
+    n_aux_features: int = N_AUX_FEATURES,
+    **kwargs,
+) -> nn.Module:
+    """Build an adapter variant by name, optionally wrapped with an aux regression head.
+
+    Args:
+        variant: one of concat-only / sigmoid-gate / film / film-attn / film-attn-2L /
+                 film-mamba / film-mamba-2L / qformer.
+        with_aux_head: if True (default), wraps the variant with AdapterWithAuxHead so
+                       forward returns (prefix, scalar_pred). Set False to retain the
+                       legacy single-tensor return signature (e.g. for old checkpoints).
+        n_aux_features: number of scalar features the aux head regresses to (default 13,
+                       matching src/feature_set.py::N_FEATURES).
+
+    Returns:
+        nn.Module whose forward(audio, overlap) returns:
+          - if with_aux_head=True:  (prefix: (B,N,lm_dim), scalar_pred: (B, n_aux_features))
+          - if with_aux_head=False: prefix only (legacy)
     """
     variants = {
         "concat-only": lambda **kw: ConcatOnlyAdapter(**kw),
@@ -382,4 +441,8 @@ def build_adapter(variant: str = "film-mamba", **kwargs) -> nn.Module:
     if variant not in variants:
         raise ValueError(f"Unknown variant '{variant}'. Choose from: {list(variants.keys())}")
 
-    return variants[variant](**kwargs)
+    inner = variants[variant](**kwargs)
+    lm_dim = kwargs.get("lm_dim", LM_DIM)
+    if with_aux_head:
+        return AdapterWithAuxHead(inner, lm_dim=lm_dim, n_features=n_aux_features)
+    return inner
