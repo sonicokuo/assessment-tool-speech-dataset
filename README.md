@@ -334,6 +334,50 @@ Uses whatever `lm_name` and `adapter_variant` are in `configs/config.psc.yaml`:
 python src/train.py --config configs/config.psc.yaml
 ```
 
+### Phase-2 training recipe (B-full + Pyannote inputs, default as of 2026-04-25)
+
+The current `configs/config.psc.yaml` defaults run **multi-task B-full** training: each batch
+computes a prose CE loss, a bare-numbers CE loss, and an auxiliary-regression MSE loss, blended
+as `loss = lambda_prose * lm_ce_prose + lambda_nums * lm_ce_nums + lambda_mse * masked_mse`.
+The audio→numerical-feature mapping gets a direct, undiluted gradient via the aux head (bypassing
+the LM and the digit-subword tokenizer).
+
+Three orthogonal interventions stack in this single retraining sweep:
+1. **FiLM init fix** (`src/adapter.py:80`) — `gamma.weight` init changed from `zeros_` to `normal_(0, 0.01)`
+   so overlap signal has nonzero gradient through FiLM at step 0. (Was making FiLM-* variants
+   blind to overlap at init while concat-only saw it directly.)
+2. **B-full multi-task supervision** — see `compute_loss` in `src/train.py`. Two LM forwards per
+   batch share the same audio prefix; the bare-numbers target's CE is ~75% digit tokens vs the prose
+   target's ~12%, concentrating numerical-grounding gradient on the same output channel SFS evaluates.
+3. **Pyannote-on-mix overlap inputs** — `overlap_info` channels come from Pyannote (4 channels:
+   `is_overlap`, `segment_duration_s`, `frac_through_segment`, `density_300ms`). The `clip_overlap_ratio`
+   channel was removed because it's an SFS-evaluated feature; feeding it as model input was data leakage.
+
+**One-time preprocessing on PSC** (~3-5 hours; needs `HF_TOKEN` for gated Pyannote repos):
+
+```bash
+export HF_TOKEN=hf_...
+bash scripts/run_pyannote_preprocessing.sh
+```
+
+Outputs land at `$SHARED/data/features_pyannote/` and `$SHARED/data/processed_pyannote/`. The
+original `features/` and `processed/` directories are not touched, so legacy training paths still
+work if you point the YAML back at them.
+
+**Retrain a variant** (use a fresh `save_dir` to keep legacy 5-channel runs separate):
+
+```bash
+python src/train.py --config configs/config.psc.yaml \
+  --adapter_variant film-mamba \
+  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba_v2 \
+  --wandb_run_name  q3_8b-film-mamba-v2
+```
+
+Diagnostic wandb scalars per epoch: `train_loss_lm_prose`, `train_loss_lm_nums`, `train_loss_mse`,
+plus their `val_*` counterparts. If `val_loss_mse` drops fast but `val_sfs_f1` stays flat → the
+adapter encodes numbers but the LM isn't reading the prefix; investigate prompt format / LoRA target
+modules. If both stay flat → optimizer/data issue.
+
 ### Three-run ablation recipe for the IDL report
 
 Each teammate runs one line on their own H100 — separate `save_dir` keeps checkpoints from clobbering each other:
