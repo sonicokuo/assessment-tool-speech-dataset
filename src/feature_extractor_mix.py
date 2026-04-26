@@ -137,7 +137,12 @@ def load_overlap_pipeline():
     try:
         from pyannote.audio import Model, Inference
         hf_token = os.environ.get('HF_TOKEN', None)
-        model     = Model.from_pretrained('pyannote/segmentation-3.0', use_auth_token=hf_token)
+        # pyannote.audio 4.x renamed use_auth_token -> token. Try the new kwarg first; fall
+        # back to the old one for 3.x compatibility.
+        try:
+            model = Model.from_pretrained('pyannote/segmentation-3.0', token=hf_token)
+        except TypeError:
+            model = Model.from_pretrained('pyannote/segmentation-3.0', use_auth_token=hf_token)
         model     = model.to(device)
         inference = Inference(model, step=2.5)
         print('Pyannote pipeline loaded')
