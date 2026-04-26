@@ -1,5 +1,5 @@
 # ── Model ──────────────────────────
-lm_name: "Qwen/Qwen3.6-35B-A3B" # swappeable to other models
+lm_name: "Qwen/Qwen3.5-9B" # swappeable to other models; see README LM table
 adapter_variant: "film-mamba"
 lora_rank: 16 # can go up after variant ablations; use use_rslora=True when expanding capacity
 lora_alpha: 32 # can go up after variant ablations; use use_rslora=True when expanding capacity
