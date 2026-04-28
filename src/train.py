@@ -350,8 +350,11 @@ def train(config: dict) -> None:
     )
 
     # Resume from checkpoint
+    # Best-checkpoint metric: val_sfs_f1 (higher is better). val_loss is dominated by
+    # prose CE at its entropy floor and BLEU/ROUGE plateau ~3-8 epochs before SFS_F1
+    # — using val_loss for early stopping cuts off digit grounding prematurely.
     start_epoch = 0
-    best_val_loss = float("inf")
+    best_val_sfs_f1 = float("-inf")
     wandb_run_id = None
 
     if config.get("resume_from"):
@@ -362,9 +365,11 @@ def train(config: dict) -> None:
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
-        best_val_loss = checkpoint["best_val_loss"]
+        # Backwards-compat: old checkpoints stored "best_val_loss"; new ones store "best_val_sfs_f1".
+        if "best_val_sfs_f1" in checkpoint:
+            best_val_sfs_f1 = checkpoint["best_val_sfs_f1"]
         wandb_run_id = checkpoint.get("wandb_run_id")
-        print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+        print(f"Resumed from epoch {start_epoch}, best_val_sfs_f1={best_val_sfs_f1:.4f}")
 
     # Wandb
     run_name = config.get("wandb_run_name") or f"{config['adapter_variant']}-seed{config['seed']}"
@@ -455,6 +460,7 @@ def train(config: dict) -> None:
 
         # ── Validate ──
         avg_val_loss = None
+        avg_sfs_f1 = None  # in scope for best-checkpoint check below; None on non-eval epochs
         if (epoch + 1) % config["eval_every_epoch"] == 0:
             adapter.eval()
             llm.eval()
@@ -623,9 +629,10 @@ def train(config: dict) -> None:
             print("\tVal Loss {:.04f}".format(avg_val_loss))
         print("\tLearning Rate {:.07f}".format(curr_lr))
 
-        # Save best
-        if avg_val_loss is not None and avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        # Save best — selected on val_sfs_f1 (higher = better). avg_sfs_f1 is set
+        # when val-time generation runs (val_sfs_n > 0); skip selection on epochs where it didn't.
+        if avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
+            best_val_sfs_f1 = avg_sfs_f1
             torch.save(
                 {
                     "epoch": epoch,
@@ -633,13 +640,13 @@ def train(config: dict) -> None:
                     "lora_state_dict": llm.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "best_val_loss": best_val_loss,
+                    "best_val_sfs_f1": best_val_sfs_f1,
                     "wandb_run_id": wandb_run_id,
                     "config": config,
                 },
                 os.path.join(config["save_dir"], "best.pt"),
             )
-            print("Saved best val model")
+            print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
 
         # Save last (for resuming)
         torch.save(
@@ -649,7 +656,7 @@ def train(config: dict) -> None:
                 "lora_state_dict": llm.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "best_val_loss": best_val_loss,
+                "best_val_sfs_f1": best_val_sfs_f1,
                 "wandb_run_id": wandb_run_id,
                 "config": config,
             },
@@ -658,7 +665,7 @@ def train(config: dict) -> None:
         print("Saved epoch model")
 
     wandb.finish()
-    print("\nTraining complete. Best val loss: {:.04f}".format(best_val_loss))
+    print("\nTraining complete. Best val_sfs_f1: {:.04f}".format(best_val_sfs_f1))
 
 
 # ── CLI ──────────────────────────────────────────────

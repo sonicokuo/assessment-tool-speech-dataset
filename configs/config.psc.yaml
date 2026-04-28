@@ -52,14 +52,16 @@ pin_memory: true
 # loss = lambda_prose * lm_ce_prose + lambda_nums * lm_ce_nums + lambda_mse * masked_mse
 # Setting lambda_nums = lambda_mse = 0 collapses to legacy prose-only training.
 #
-# Forward B (prose) is the inference path — its target is what SFS evaluates. So it
-# gets the dominant weight. Forward A (bare-numbers) is auxiliary scaffolding that
-# helps shape the adapter; lambda_nums=0.3 keeps it useful without starving the prose.
-# MSE is normalized per-feature in src/feature_set.py::FEATURE_SCALES so all 13
-# features contribute equally regardless of magnitude.
-lambda_prose: 1.0   # natural-language description CE — primary task (inference path)
-lambda_nums:  0.3   # bare-numbers target CE — auxiliary scaffolding for adapter
-lambda_mse:   0.3   # auxiliary regression head MSE — normalized; direct adapter→scalar mapping
+# v3 weights (2026-04-28): flipped from v2 (1.0/0.3/0.3) after wandb analysis showed
+# prose CE plateaus at its digit-subword entropy floor (~0.43) within 1 epoch and
+# never decreases — making it 33-47% of total loss but contributing zero useful
+# gradient. Meanwhile nums-CE / MSE (the only terms that ground digits in audio) were
+# under-weighted and overfitting on train while degrading on val. SFS at v2 final:
+# precision=0.40, recall=0.85 — model writes the template but gets digits wrong 60%
+# of the time. v3 puts gradient on the digit-emission channel SFS evaluates.
+lambda_prose: 0.1   # prose CE already at entropy floor — keep small to preserve template only
+lambda_nums:  1.0   # bare-numbers CE — primary digit-grounding signal through LM head
+lambda_mse:   0.5   # aux regression head MSE — normalized; cleanest scalar gradient (bypasses digit tokenizer)
 
 # ── Evaluation ──────────────────────────
 eval_every_epoch: 1
