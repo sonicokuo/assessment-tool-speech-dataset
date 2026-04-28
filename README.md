@@ -450,17 +450,17 @@ fresh `_v2` (or `_v3` etc.) suffix on `save_dir` to keep these runs separate fro
 # Person 1 — concat-only (post-FiLM-fix baseline)
 python src/train.py --config configs/config.psc.yaml \
   --lm_name Qwen/Qwen3-8B --adapter_variant concat-only --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q3_8b_concat_v2 --wandb_run_name q3_8b-concat-only-v2
+  --save_dir $SHARED/checkpoints/q3_8b_concat_v3 --wandb_run_name q3_8b-concat-only-v3
 
 # Person 2 — qformer
 python src/train.py --config configs/config.psc.yaml \
   --lm_name Qwen/Qwen3-8B --adapter_variant qformer --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q3_8b_qformer_v2 --wandb_run_name q3_8b-qformer-v2
+  --save_dir $SHARED/checkpoints/q3_8b_qformer_v3 --wandb_run_name q3_8b-qformer-v3
 
 # Person 3 — film-attn (the proposed variant; with all five fixes stacked)
 python src/train.py --config configs/config.psc.yaml \
   --lm_name Qwen/Qwen3-8B --adapter_variant film-attn --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v2 --wandb_run_name q3_8b-film-attn-v2
+  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v3 --wandb_run_name q3_8b-film-attn-v3
 ```
 
 If a teammate hits CUDA OOM in the first batch (more likely now with `max_target_length=512` and
@@ -472,7 +472,7 @@ To detach training from the SSH session:
 ```bash
 nohup python src/train.py --config configs/config.psc.yaml \
   --lm_name Qwen/Qwen3-8B --adapter_variant film-attn --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v2 --wandb_run_name q3_8b-film-attn-v2 \
+  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v3 --wandb_run_name q3_8b-film-attn-v3 \
   > /tmp/train-film_attn-$USER.log 2>&1 &
 echo "started PID=$!"
 ```
@@ -679,24 +679,24 @@ Each teammate runs inference on **their own** trained checkpoint. The `save_dir`
 
 > **No `--lm_name` / `--adapter_variant` needed.** `inference.py` reads the training config embedded in the checkpoint and auto-sets `lm_name`, `adapter_variant`, and the LoRA hyperparameters. You'll see a `[config] <key>: old → new (from checkpoint)` line per substitution in the console at startup.
 
-**Three-run ablation (matches the Phase-2 training recipe — `_v2` suffix + Pyannote test set):**
+**Three-run ablation (matches the Phase-2 training recipe — `_v3` suffix + Pyannote test set):**
 
 ```bash
 # Person 1 — concat-only baseline
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_concat_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_concat_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 
 # Person 2 — Q-Former alternative
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_qformer_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_qformer_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 
 # Person 3 — FiLM + attention (proposed)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
@@ -706,31 +706,31 @@ python src/inference.py --config configs/config.psc.yaml \
 ```bash
 # sigmoid-gate
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_sigmoid_gate_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_sigmoid_gate_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film (FiLM only, no mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_film_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film-mamba (proposed variant with Mamba mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film-attn-2L (deeper attn mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_2L_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_2L_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film-mamba-2L (deeper Mamba mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba_2L_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba_2L_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 ```
 
-> For Phase-1 (legacy) checkpoints, drop the `_v2` suffix and use `$SHARED/data/processed/test` instead of `processed_pyannote/test`.
+> For Phase-1 (legacy, no λ-flip) checkpoints, drop the `_v3` suffix and use `$SHARED/data/processed/test` instead of `processed_pyannote/test`. Phase-2 (v2) checkpoints use the same Pyannote test set; just swap `_v3` → `_v2`.
 
 **Useful decoding flags:**
 - `--top_k 1` → greedy (recommended for the paper table; deterministic).
@@ -757,13 +757,13 @@ Full test set is **3000 clips** → ~60-90 min on Qwen3-8B. You can slice that u
 ```bash
 # First chunk — clips 0..499
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k 1 --start 0 --end 500
 
 # Later — clips 500..2999 (auto-skips the 500 already done)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v3/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k 1 --start 500 --end 3000
 ```
@@ -781,7 +781,7 @@ python src/inference.py --config configs/config.psc.yaml \
 ```bash
 for variant in concat qformer film_attn sigmoid_gate film film_mamba film_attn_2L film_mamba_2L; do
   python src/inference.py --config configs/config.psc.yaml \
-    --checkpoint $SHARED/checkpoints/q3_8b_${variant}_v2/best.pt \
+    --checkpoint $SHARED/checkpoints/q3_8b_${variant}_v3/best.pt \
     --test_dir   $SHARED/data/processed_pyannote/test \
     --top_k      1
 done
