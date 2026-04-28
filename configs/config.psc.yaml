@@ -26,7 +26,10 @@ bf16: True
 batch_size: 6
 gradient_accumulation_steps: 1 # change to 2 or larger if training unstable
 gradient_checkpointing: false
-epochs: 10 # change to 10-15 for after variant ablations
+epochs: 15 # v2 SFS_F1 trajectory: +0.022/ep (1-5), +0.0056/ep (5-10) — still climbing but decelerating
+           # 4×. Extra 5 epochs likely buys ~+0.02-0.03 F1; 25 was wishful (val_nums/mse overfit
+           # eventually). best.pt saves on peak val_sfs_f1 so post-peak epochs are wasted compute,
+           # not a quality risk. If by ep 12-13 the curve is dead-flat, kill the run early.
 seed: 73
 max_target_length: 384  # bumped from 256 — covers p99 of current corpus (~300 tokens) with margin.
                         # Run scratch/analyze_token_lengths.py against full descriptions.json to confirm.
@@ -52,16 +55,18 @@ pin_memory: true
 # loss = lambda_prose * lm_ce_prose + lambda_nums * lm_ce_nums + lambda_mse * masked_mse
 # Setting lambda_nums = lambda_mse = 0 collapses to legacy prose-only training.
 #
-# v3 weights (2026-04-28): flipped from v2 (1.0/0.3/0.3) after wandb analysis showed
-# prose CE plateaus at its digit-subword entropy floor (~0.43) within 1 epoch and
-# never decreases — making it 33-47% of total loss but contributing zero useful
-# gradient. Meanwhile nums-CE / MSE (the only terms that ground digits in audio) were
-# under-weighted and overfitting on train while degrading on val. SFS at v2 final:
-# precision=0.40, recall=0.85 — model writes the template but gets digits wrong 60%
-# of the time. v3 puts gradient on the digit-emission channel SFS evaluates.
-lambda_prose: 0.1   # prose CE already at entropy floor — keep small to preserve template only
-lambda_nums:  1.0   # bare-numbers CE — primary digit-grounding signal through LM head
-lambda_mse:   0.5   # aux regression head MSE — normalized; cleanest scalar gradient (bypasses digit tokenizer)
+# REVERTED to v2 weights after v3 (0.1/1.0/0.5) regressed: SFS_F1 dropped 0.566 → 0.412
+# (-27%), precision dropped 0.43 → 0.29 (-32%), filler-loop degeneration tripled
+# (6.3% → 18.8%), F0_mean bias tripled (+18 Hz → +53 Hz). Conditional analysis on
+# non-degenerate clips matched by filename (n=26): v3 lost 0/13 features on within-
+# tolerance%. Lambdas are not the lever — both nums-CE and MSE overfit harder under
+# more weight, while pulling λ_prose to 0.1 caused LM to drift off-distribution
+# (pretraining-residue filler text). The bottleneck is audio→adapter→prefix→digit
+# capacity, not loss-weight allocation. v2 was still climbing monotonically at
+# epoch 10 (precision hadn't plateaued); the cheapest next experiment is "v2 longer."
+lambda_prose: 1.0   # prose CE — primary task (also serves as on-distribution regularizer)
+lambda_nums:  0.3   # bare-numbers target CE — auxiliary scaffolding for adapter
+lambda_mse:   0.3   # aux regression head MSE — normalized; direct adapter→scalar mapping
 
 # ── Evaluation ──────────────────────────
 eval_every_epoch: 1

@@ -272,7 +272,7 @@ class SFSScorer:
         "f3_mean": 30.0,  # ±30 Hz
         "f4_mean": 30.0,  # ±30 Hz
         "snr": 2.0,  # ±2 dB
-        "rt60": 0.05,  # ±0.05 s
+        "rt60": 0.1,  # ±0.1 s — Schroeder/RIR-fit/ML-based estimators routinely disagree by 50-150 ms; ±0.05 was below inter-method noise floor
         "hnr": 2.0,  # ±2 dB
         "speaking_rate": 0.5,  # ±0.5 syl/s
         "articulation_rate": 0.5,  # ±0.5 syl/s
@@ -284,7 +284,7 @@ class SFSScorer:
         "sample_rate": 0.0,  # exact match (it's an integer)
         "duration_sec": 0.1,  # ±0.1 s (verbalizer rounds to 3 decimals, tolerance absorbs that)
         "overlap_ratio": 0.05,  # ±0.05 (unitless 0-1)
-        "pause_count": 0.0,  # exact match (integer)
+        "pause_count": 1.0,  # ±1 — discrete count is sensitive to min-pause threshold (200 vs 300 ms VAD configs); off-by-one is annotation noise, not error
         "pause_rate": 2.0,  # ±2 per min
     }
 
