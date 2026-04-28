@@ -284,7 +284,7 @@ cp $(ls $SHARED/data/processed/test/*.pt  | head -10) $SHARED/data/processed_smo
 
 # Launch — a smoke wandb run named "sanity-check"
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name          Qwen/Qwen3.5-9B \
+  --lm_name          Qwen/Qwen3-8B \
   --adapter_variant  film-attn \
   --data_dir         $SHARED/data/processed_smoke \
   --batch_size       4 \
@@ -309,8 +309,8 @@ rm -rf $SHARED/data/processed_smoke $SHARED/checkpoints/sanity_check
 | `--lm_name` | Size (bf16) | Notes |
 |---|---|---|
 | `Qwen/Qwen2.5-7B` | ~15 GB | Dense, 28 layers. Lightest; fits bs=8 on H100-80 without gradient checkpointing. |
-| `Qwen/Qwen3-8B` | ~16 GB | Dense, Qwen3 family. Phase-1 ablation results were produced on this model. Fits bs=6 on H100-80 (bs=8 OOMs without gradient checkpointing). |
-| `Qwen/Qwen3.5-9B` | ~18 GB | Dense, Qwen3.5 family. **Default for Phase-2 IDL report runs.** Tighter on H100-80 + B-full (two LM forwards, max_target_length=512). Recommended: `bs=4 --gradient_accumulation_steps 2` for effective bs=8, or `--gradient_checkpointing true` to keep bs=6. |
+| `Qwen/Qwen3-8B` | ~16 GB | Dense, Qwen3 family. **Default for both Phase-1 and Phase-2 IDL report runs.** Fits bs=6 cleanly on H100-80 with B-full's two LM forwards at max_target_length=512. bs=8 OOMs; if you need a bigger effective batch, use `--batch_size 4 --gradient_accumulation_steps 2`. |
+| `Qwen/Qwen3.5-9B` | ~18 GB | Dense, Qwen3.5 family. Heavier than Qwen3-8B; combined with B-full at 512 tokens, recommended `bs=4 --gradient_accumulation_steps 2` (effective bs=8) or `--gradient_checkpointing true` to keep bs=6. |
 | `Qwen/Qwen3.6-35B-A3B` | ~70 GB | Sparse MoE. **Needs 4-bit quantization** (bitsandbytes) — straight bf16 will OOM even on H100-80. |
 
 Swapping to a model not in that list will trigger a one-time HuggingFace download to the shared cache.
@@ -404,7 +404,7 @@ print('overlap_info shape:', sample['overlap_info'].shape, '← must be (T, 4)')
 ```bash
 python scratch/analyze_token_lengths.py \
   --descriptions $SHARED/data/descriptions.json \
-  --tokenizer    Qwen/Qwen3.5-9B
+  --tokenizer    Qwen/Qwen3-8B
 ```
 
 If `scratch/analyze_token_lengths.py` doesn't exist on PSC, recreate it from the project (gitignored
@@ -421,7 +421,7 @@ cp $(ls $SHARED/data/processed_pyannote/val/*.pt   | head -10) $SHARED/data/proc
 cp $(ls $SHARED/data/processed_pyannote/test/*.pt  | head -10) $SHARED/data/processed_pyannote_smoke/test/
 
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name          Qwen/Qwen3.5-9B \
+  --lm_name          Qwen/Qwen3-8B \
   --adapter_variant  film-mamba \
   --data_dir         $SHARED/data/processed_pyannote_smoke \
   --batch_size       4 \
@@ -449,18 +449,18 @@ fresh `_v2` (or `_v3` etc.) suffix on `save_dir` to keep these runs separate fro
 ```bash
 # Person 1 — concat-only (post-FiLM-fix baseline)
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name Qwen/Qwen3.5-9B --adapter_variant concat-only --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q35_9b_concat_v2 --wandb_run_name q35_9b-concat-only-v2
+  --lm_name Qwen/Qwen3-8B --adapter_variant concat-only --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_concat_v2 --wandb_run_name q3_8b-concat-only-v2
 
 # Person 2 — qformer
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name Qwen/Qwen3.5-9B --adapter_variant qformer --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q35_9b_qformer_v2 --wandb_run_name q35_9b-qformer-v2
+  --lm_name Qwen/Qwen3-8B --adapter_variant qformer --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_qformer_v2 --wandb_run_name q3_8b-qformer-v2
 
 # Person 3 — film-attn (the proposed variant; with all five fixes stacked)
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name Qwen/Qwen3.5-9B --adapter_variant film-attn --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q35_9b_film_attn_v2 --wandb_run_name q35_9b-film-attn-v2
+  --lm_name Qwen/Qwen3-8B --adapter_variant film-attn --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v2 --wandb_run_name q3_8b-film-attn-v2
 ```
 
 If a teammate hits CUDA OOM in the first batch (more likely now with `max_target_length=512` and
@@ -471,8 +471,8 @@ To detach training from the SSH session:
 
 ```bash
 nohup python src/train.py --config configs/config.psc.yaml \
-  --lm_name Qwen/Qwen3.5-9B --adapter_variant film-attn --batch_size 6 \
-  --save_dir $SHARED/checkpoints/q35_9b_film_attn_v2 --wandb_run_name q35_9b-film-attn-v2 \
+  --lm_name Qwen/Qwen3-8B --adapter_variant film-attn --batch_size 6 \
+  --save_dir $SHARED/checkpoints/q3_8b_film_attn_v2 --wandb_run_name q3_8b-film-attn-v2 \
   > /tmp/train-film_attn-$USER.log 2>&1 &
 echo "started PID=$!"
 ```
@@ -511,7 +511,7 @@ grep "^lambda_" configs/config.psc.yaml
 ### Three-run ablation recipe for the IDL report
 
 > ⚠ **Legacy (Phase-1) commands kept for historical reference.** These use the original
-> `q35_9b_<variant>` save_dirs (no `_v2` suffix) and were used to produce the v1 result
+> `q3_8b_<variant>` save_dirs (no `_v2` suffix) and were used to produce the v1 result
 > tables (concat=0.55, qformer=0.47, film_attn=0.55) that motivated the Phase-2 retrain.
 > If you're starting a fresh sweep today, **use the [Phase-2 training recipe](#phase-2-training-recipe-b-full--pyannote-inputs-default-as-of-2026-04-26) above instead** — it stacks the
 > 5 interventions (FiLM init, B-full, Pyannote inputs, dual-prompt, MSE normalization)
@@ -525,30 +525,30 @@ Each teammate runs one line on their own H100 — separate `save_dir` keeps chec
 ```bash
 # Person 1 — concat-only baseline
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant concat-only \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_concat \
-  --wandb_run_name  q35_9b-concat-only
+  --save_dir        $SHARED/checkpoints/q3_8b_concat \
+  --wandb_run_name  q3_8b-concat-only
 
 # Person 2 — Q-Former alternative
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant qformer \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_qformer \
-  --wandb_run_name  q35_9b-qformer
+  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
+  --wandb_run_name  q3_8b-qformer
 
 # Person 3 — FiLM + attention (proposed)
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film-attn \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_film_attn \
-  --wandb_run_name  q35_9b-film-attn
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
+  --wandb_run_name  q3_8b-film-attn
 ```
 
-> Qwen3.5-9B with B-full (two LM forwards) and `max_target_length=512` is tight on H100-80. Tested-safe settings: `bs=4 --gradient_accumulation_steps 2` (effective batch 8) or `bs=6 --gradient_checkpointing true`. If you hit CUDA OOM in the first batch, drop one of these knobs.
+> Qwen3-8B with B-full (two LM forwards) and `max_target_length=512` is tight on H100-80. Tested-safe settings: `bs=6` runs cleanly; if you bump batch size to 8 or run a larger LM, drop to `bs=4 --gradient_accumulation_steps 2` (effective batch 8) or add `--gradient_checkpointing true`.
 
 Naming convention: `<lm-slug>_<variant>` — makes checkpoints self-describing across a 3×3 LM × variant sweep.
 
@@ -563,46 +563,46 @@ The three-run recipe above covers the minimum story (baseline / popular alt / Fi
 ```bash
 # sigmoid-gate — a lighter overlap-aware mixing alternative to FiLM
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant sigmoid-gate \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_sigmoid_gate \
-  --wandb_run_name  q35_9b-sigmoid-gate
+  --save_dir        $SHARED/checkpoints/q3_8b_sigmoid_gate \
+  --wandb_run_name  q3_8b-sigmoid-gate
 
 # film — FiLM conditioning only, no sequential context mixer
 # Isolates the contribution of the temporal mixer (attn vs mamba vs nothing).
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_film \
-  --wandb_run_name  q35_9b-film
+  --save_dir        $SHARED/checkpoints/q3_8b_film \
+  --wandb_run_name  q3_8b-film
 
 # film-mamba — FiLM + Mamba SSM context (1 layer) — the default in build_adapter
 # The "proposed" variant for the paper's main claim. Worth running if mamba-ssm installs cleanly.
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film-mamba \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_film_mamba \
-  --wandb_run_name  q35_9b-film-mamba
+  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba \
+  --wandb_run_name  q3_8b-film-mamba
 
 # film-attn-2L — FiLM + self-attention context (2 layers)
 # Tests whether deeper context helps over 1-layer film-attn.
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film-attn-2L \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_film_attn_2L \
-  --wandb_run_name  q35_9b-film-attn-2L
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn_2L \
+  --wandb_run_name  q3_8b-film-attn-2L
 
 # film-mamba-2L — FiLM + Mamba (2 layers)
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film-mamba-2L \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_film_mamba_2L \
-  --wandb_run_name  q35_9b-film-mamba-2L
+  --save_dir        $SHARED/checkpoints/q3_8b_film_mamba_2L \
+  --wandb_run_name  q3_8b-film-mamba-2L
 ```
 
 Suggested filtering by story:
@@ -619,30 +619,30 @@ Every epoch writes `$SAVE_DIR/last.pt` (latest state) and updates `$SAVE_DIR/bes
 ```bash
 # Person 1 — resume concat-only
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant concat-only \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_concat \
-  --wandb_run_name  q35_9b-concat-only \
-  --resume_from     $SHARED/checkpoints/q35_9b_concat/last.pt
+  --save_dir        $SHARED/checkpoints/q3_8b_concat \
+  --wandb_run_name  q3_8b-concat-only \
+  --resume_from     $SHARED/checkpoints/q3_8b_concat/last.pt
 
 # Person 2 — resume qformer
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant qformer \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_qformer \
-  --wandb_run_name  q35_9b-qformer \
-  --resume_from     $SHARED/checkpoints/q35_9b_qformer/last.pt
+  --save_dir        $SHARED/checkpoints/q3_8b_qformer \
+  --wandb_run_name  q3_8b-qformer \
+  --resume_from     $SHARED/checkpoints/q3_8b_qformer/last.pt
 
 # Person 3 — resume film-attn
 python src/train.py --config configs/config.psc.yaml \
-  --lm_name         Qwen/Qwen3.5-9B \
+  --lm_name         Qwen/Qwen3-8B \
   --adapter_variant film-attn \
   --batch_size      6 \
-  --save_dir        $SHARED/checkpoints/q35_9b_film_attn \
-  --wandb_run_name  q35_9b-film-attn \
-  --resume_from     $SHARED/checkpoints/q35_9b_film_attn/last.pt
+  --save_dir        $SHARED/checkpoints/q3_8b_film_attn \
+  --wandb_run_name  q3_8b-film-attn \
+  --resume_from     $SHARED/checkpoints/q3_8b_film_attn/last.pt
 ```
 
 Extended-ablation resumes follow the same pattern — add `--resume_from $SHARED/checkpoints/<save_dir>/last.pt` to the matching launch line.
@@ -684,19 +684,19 @@ Each teammate runs inference on **their own** trained checkpoint. The `save_dir`
 ```bash
 # Person 1 — concat-only baseline
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_concat_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_concat_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 
 # Person 2 — Q-Former alternative
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_qformer_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_qformer_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 
 # Person 3 — FiLM + attention (proposed)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_film_attn_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
@@ -706,27 +706,27 @@ python src/inference.py --config configs/config.psc.yaml \
 ```bash
 # sigmoid-gate
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_sigmoid_gate_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_sigmoid_gate_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film (FiLM only, no mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_film_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film-mamba (proposed variant with Mamba mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_film_mamba_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film-attn-2L (deeper attn mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_film_attn_2L_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_2L_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 
 # film-mamba-2L (deeper Mamba mixer)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_film_mamba_2L_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_mamba_2L_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test --top_k 1
 ```
 
@@ -739,7 +739,7 @@ python src/inference.py --config configs/config.psc.yaml \
 
 #### Running by range + resuming crashes
 
-Full test set is **3000 clips** → ~60-90 min on Qwen3.5-9B. You can slice that up with `--start N --end M` (half-open: includes `N`, excludes `M`) and rerun safely — the script auto-resumes.
+Full test set is **3000 clips** → ~60-90 min on Qwen3-8B. You can slice that up with `--start N --end M` (half-open: includes `N`, excludes `M`) and rerun safely — the script auto-resumes.
 
 **Quick reference — find your case, copy the flags:**
 
@@ -757,13 +757,13 @@ Full test set is **3000 clips** → ~60-90 min on Qwen3.5-9B. You can slice that
 ```bash
 # First chunk — clips 0..499
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_film_attn_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k 1 --start 0 --end 500
 
 # Later — clips 500..2999 (auto-skips the 500 already done)
 python src/inference.py --config configs/config.psc.yaml \
-  --checkpoint $SHARED/checkpoints/q35_9b_film_attn_v2/best.pt \
+  --checkpoint $SHARED/checkpoints/q3_8b_film_attn_v2/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k 1 --start 500 --end 3000
 ```
@@ -781,7 +781,7 @@ python src/inference.py --config configs/config.psc.yaml \
 ```bash
 for variant in concat qformer film_attn sigmoid_gate film film_mamba film_attn_2L film_mamba_2L; do
   python src/inference.py --config configs/config.psc.yaml \
-    --checkpoint $SHARED/checkpoints/q35_9b_${variant}_v2/best.pt \
+    --checkpoint $SHARED/checkpoints/q3_8b_${variant}_v2/best.pt \
     --test_dir   $SHARED/data/processed_pyannote/test \
     --top_k      1
 done
