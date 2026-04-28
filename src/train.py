@@ -200,7 +200,7 @@ def train(config: dict) -> None:
     llm = AutoModelForCausalLM.from_pretrained(
         config["lm_name"],
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map={"": device},
     )
     llm = get_peft_model(
         llm,
