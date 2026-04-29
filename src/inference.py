@@ -201,7 +201,14 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     adapter.eval()
     llm.eval()
 
-    print(f"Loaded checkpoint: epoch {checkpoint['epoch']}, val_loss={checkpoint['best_val_loss']:.4f}")
+    # New checkpoints (post 2026-04-28) save best_val_sfs_f1 (higher is better);
+    # legacy ones saved best_val_loss (lower is better). Print whichever is present.
+    if "best_val_sfs_f1" in checkpoint:
+        print(f"Loaded checkpoint: epoch {checkpoint['epoch']}, val_sfs_f1={checkpoint['best_val_sfs_f1']:.4f}")
+    elif "best_val_loss" in checkpoint:
+        print(f"Loaded checkpoint: epoch {checkpoint['epoch']}, val_loss={checkpoint['best_val_loss']:.4f}")
+    else:
+        print(f"Loaded checkpoint: epoch {checkpoint['epoch']} (no best-metric scalar in ckpt)")
 
     # Prompt
     # Inference always uses the prose prompt. prompt_prose is the canonical key going
