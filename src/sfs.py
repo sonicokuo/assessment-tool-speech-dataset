@@ -3,6 +3,13 @@
 import re
 from dataclasses import dataclass
 
+from feature_tags import (
+    FEATURE_TAGS,
+    extract_overlap_segments,
+    extract_value,
+    iter_tagged_spans,
+)
+
 
 # ── Components ──────────────────────────────────────────────
 # Signal Faithfulness Score (SFS)
@@ -247,6 +254,69 @@ class ClaimParser:
                 extra.append(Claim(feature="overlap_start", value=s_val, unit="s", raw_text=raw))
                 extra.append(Claim(feature="overlap_end", value=e_val, unit="s", raw_text=raw))
         return extra
+
+
+# ── Tagged-prose parser (EMNLP rework) ──────────────────────────────
+class TaggedClaimParser:
+    """Parse `<f_NAME>…</f>` spans from tagged-prose outputs.
+
+    The model in the EMNLP rework wraps each numerical claim in a special-token
+    span (see src/feature_tags.py). That makes claim extraction unambiguous:
+    the tag identifies the feature, the body contains exactly one numerical
+    value (or, for `<f_overlap_segments>`, a list of `X-Ys` ranges).
+
+    Returns the same `Claim` shape as `ClaimParser` so `SFSScorer.score` doesn't
+    need to know which parser produced it. Tags whose `sfs_key` is None
+    (currently `silence_ratio`) are skipped — they're carried through prose for
+    the user's projection-to-spectrogram story but not scored by SFS.
+
+    For `<f_overlap_segments>`, we emit one `overlap_start` + one `overlap_end`
+    Claim per range so SFSScorer's IoU bipartite matcher works unchanged.
+    """
+
+    def parse(self, text: str) -> list["Claim"]:
+        claims: list[Claim] = []
+        for span in iter_tagged_spans(text):
+            ft = span.feature
+            if ft.name == "overlap_segments":
+                for s_val, e_val in extract_overlap_segments(span.body):
+                    claims.append(Claim(
+                        feature="overlap_start", value=s_val, unit="s",
+                        raw_text=span.body.strip()[:80],
+                    ))
+                    claims.append(Claim(
+                        feature="overlap_end", value=e_val, unit="s",
+                        raw_text=span.body.strip()[:80],
+                    ))
+                continue
+            if ft.sfs_key is None:
+                continue  # carried in prose but not SFS-scored (e.g. silence_ratio)
+            value = extract_value(span.body)
+            if value is None:
+                continue
+            claims.append(Claim(
+                feature=ft.sfs_key, value=value, unit=ft.unit,
+                raw_text=span.body.strip()[:80],
+            ))
+        return claims
+
+
+class HybridClaimParser:
+    """Try the tagged parser first; if no tags are found, fall back to the regex parser.
+
+    Lets the same `evaluate()` pipeline score both old (untagged) and new
+    (tagged) generations. Use this as the default at inference; use the
+    specific parsers directly when you need to know which path produced
+    which claim (e.g., per-format breakdown).
+    """
+
+    def __init__(self) -> None:
+        self._tagged = TaggedClaimParser()
+        self._legacy = ClaimParser()
+
+    def parse(self, text: str) -> list["Claim"]:
+        claims = self._tagged.parse(text)
+        return claims if claims else self._legacy.parse(text)
 
 
 class SFSScorer:

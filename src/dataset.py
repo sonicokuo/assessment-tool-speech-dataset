@@ -62,6 +62,13 @@ class PreprocessedDataset(Dataset):
             "overlap_segments": cached.get("overlap_segments", []),
         }
 
+        # Pass through BEATs patch embeddings if they were precomputed in this .pt
+        # (added by scripts/preprocess_beats.py for the EMNLP rework's section path).
+        # Absent on legacy .pt files — train.py falls back to online encoding or skips
+        # the section-query path depending on config.
+        if "beats_patches" in cached:
+            result["beats_patches"] = cached["beats_patches"]
+
         if self.descriptions and stem in self.descriptions:
             result["target_text"] = self.descriptions[stem]
 
@@ -110,10 +117,17 @@ def collate_fn(batch):
         "target_text": target_text,
     }
 
+    # BEATs patches — stack if every sample has them, else skip. For now all clips
+    # in a split have the same patch count (Libri2Mix is fixed-length-ish per split,
+    # and BEATs's grid is determined by clip duration); if you train on mixed
+    # durations later, change this to pad.
+    if "beats_patches" in batch[0]:
+        out["beats_patches"] = torch.stack([item["beats_patches"] for item in batch], dim=0)
+
     # B-full extras — present only when the dataset was constructed with features_csv.
     if "gt_scalars" in batch[0]:
-        out["gt_scalars"] = torch.stack([item["gt_scalars"] for item in batch], dim=0)  # (B, 13)
-        out["gt_mask"] = torch.stack([item["gt_mask"] for item in batch], dim=0)        # (B, 13)
-        out["target_nums"] = [item["target_nums"] for item in batch]                    # list[str]
+        out["gt_scalars"] = torch.stack([item["gt_scalars"] for item in batch], dim=0)
+        out["gt_mask"] = torch.stack([item["gt_mask"] for item in batch], dim=0)
+        out["target_nums"] = [item["target_nums"] for item in batch]
 
     return out

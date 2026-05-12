@@ -22,13 +22,235 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from tqdm.auto import tqdm
 
 from adapter import build_adapter
-from sfs import ClaimParser, SFSScorer
+from sfs import HybridClaimParser, SFSScorer
 from dataset import PreprocessedDataset, collate_fn
 from text_metrics import compute_generation_metrics
 from feature_set import FEATURE_SCALES
+from section_tags import (
+    SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
+    SECTION_TAGS,
+    N_SECTIONS,
+    section_open_token_ids,
+)
+from section_query import SectionQueryHead
+from spec_encoder import SpecEncoder
+
+
+# ── Tokenizer + LM setup helpers ──────────────────────────────────────────────
+def _use_lora(config: dict) -> bool:
+    """Whether to wrap the LM with PEFT LoRA. False = full fine-tuning."""
+    r = config.get("lora_rank")
+    return bool(r)  # 0 / None / False → full FT
+
+
+def _register_feature_tags(tokenizer: PreTrainedTokenizerBase, llm: nn.Module) -> int:
+    """Add per-feature `<f_*>` and `</f>` tokens, resize embeddings, mean-init new rows.
+
+    Uses `add_tokens(..., special_tokens=False)` so the tags get the 1-token
+    tokenization guarantee but are NOT stripped by `tokenizer.decode(
+    skip_special_tokens=True)` — which is the default everywhere in train.py
+    and inference.py. If we registered them as `additional_special_tokens`
+    instead, the decoded text would lose every `<f_*>` and `</f>` and SFS
+    would parse an empty string.
+
+    Returns the number of tokens added (0 if all tags were already in vocab —
+    e.g., on resume).
+    """
+    added = tokenizer.add_tokens(TAG_SPECIAL_TOKENS, special_tokens=False)
+    if added == 0:
+        return 0
+
+    old_vocab_size = llm.get_input_embeddings().weight.shape[0]
+    llm.resize_token_embeddings(len(tokenizer))
+
+    with torch.no_grad():
+        # Mean-init the new embedding rows. Tied embeddings (input == output)
+        # are handled by resize_token_embeddings; for untied LMs we also touch
+        # lm_head. Both branches are no-ops if the new rows fall outside the
+        # corresponding matrix's range.
+        in_emb = llm.get_input_embeddings().weight
+        mean_in = in_emb[:old_vocab_size].mean(dim=0)
+        in_emb[old_vocab_size:].copy_(mean_in.to(in_emb.dtype))
+
+        out_emb = llm.get_output_embeddings()
+        if out_emb is not None and out_emb.weight.shape[0] > old_vocab_size:
+            mean_out = out_emb.weight[:old_vocab_size].mean(dim=0)
+            out_emb.weight[old_vocab_size:].copy_(mean_out.to(out_emb.weight.dtype))
+
+    return added
 
 
 # ── Loss ──────────────────────────────────────────────
+def _build_section_ctx(
+    section_head: "SectionQueryHead | None",
+    spec_encoder: "SpecEncoder | None",
+    section_id_to_idx: dict[int, int],
+    batch: dict,
+    device: torch.device,
+    mode: str = "static",
+) -> dict | None:
+    """Compute the per-batch section context: K/V (+ e_all in static mode).
+
+    BEATs patches are read from the batch (cached during preprocessing); the
+    online encoder path isn't supported in v1 because waveforms aren't in the
+    .pt files.
+
+    Static mode: computes per-section audio summaries e_all upfront from
+    per-section static queries. Single-pass training in _ce_against_target.
+
+    Dynamic mode: defers e_t computation to pass 1 inside _ce_against_target,
+    where the LM's hidden states at <sec_X> positions are used as the query
+    source (q_t = W_q · h_t). Two-pass training.
+
+    Returns a dict consumed by _ce_against_target. Returns None when there's
+    nothing to inject (legacy .pt files without beats_patches → fallback to
+    plain LM-CE on the section tags treated as ordinary tokens).
+    """
+    patches = batch.get("beats_patches")
+    if patches is None:
+        if spec_encoder is None:
+            return None
+        raise RuntimeError(
+            "Online SpecEncoder path requested but waveforms are not in the dataset. "
+            "Run scripts/preprocess_beats.py to cache patches into the .pt files."
+        )
+
+    patches = patches.to(device).to(torch.bfloat16)
+    K, V = section_head.precompute_kv(patches)
+
+    if mode == "dynamic":
+        # Defer e_t — needs pass-1 hidden states which _ce_against_target produces.
+        return {
+            "mode": "dynamic",
+            "head": section_head,
+            "K": K, "V": V,
+            "section_id_to_idx": section_id_to_idx,
+        }
+
+    # Static mode: compute per-section summaries up front.
+    e_all, _alpha = section_head.forward_all_sections(K, V)
+    return {
+        "mode": "static",
+        "e_all": e_all,
+        "section_id_to_idx": section_id_to_idx,
+    }
+
+
+def _inject_section_summaries_dynamic(
+    llm: nn.Module,
+    prefix_embeds: torch.Tensor,
+    prompt_embeds: torch.Tensor,
+    target_embeds: torch.Tensor,
+    target_ids: torch.Tensor,
+    section_ctx: dict,
+) -> torch.Tensor:
+    """Dynamic-mode injection — pass 1 of the two-pass training.
+
+    Runs the LM once with un-injected target embeddings, extracts the hidden
+    state at each <sec_X> position, computes a per-position audio summary via
+    `head.forward_dynamic(h_t, K, V, batch_idx)`, and returns target_embeds
+    with those summaries residually added at the section positions.
+
+    Gradient flow: loss → pass-2 LM weights → target_embeds → e_t → W_q → h_t
+    → pass-1 LM weights, so the LM learns to produce query-friendly hidden
+    states at section opens. The section_head and the LM co-adapt.
+
+    Memory: pass 1's activations are retained for backprop. On Qwen3-1.7B
+    full-FT at batch 6 with grad checkpointing this peaks around 45-50 GB —
+    fits H100 80 GB with headroom; tight on A100 40 GB.
+    """
+    head = section_ctx["head"]
+    K, V = section_ctx["K"], section_ctx["V"]
+    id_to_idx = section_ctx["section_id_to_idx"]
+
+    section_open_ids_t = torch.tensor(
+        list(id_to_idx.keys()), device=target_ids.device, dtype=target_ids.dtype,
+    )
+
+    # Locate (b, l) coordinates of every <sec_X> open in the target.
+    is_section = (target_ids.unsqueeze(-1) == section_open_ids_t).any(-1)   # (B, L) bool
+    if not is_section.any():
+        # No sections in this batch → nothing to inject. Skip the pass-1 forward.
+        return target_embeds
+
+    bl = is_section.nonzero(as_tuple=False)                                  # (N, 2)
+    batch_idx = bl[:, 0]
+    local_pos = bl[:, 1]
+
+    # Pass 1: LM forward with un-injected target embeddings.
+    prefix_len = prefix_embeds.shape[1]
+    prompt_len = prompt_embeds.shape[1]
+    inputs_embeds_pass1 = torch.cat([prefix_embeds, prompt_embeds, target_embeds], dim=1)
+    out1 = llm(inputs_embeds=inputs_embeds_pass1, output_hidden_states=True)
+    hidden = out1.hidden_states[-1]                                          # (B, T, d_lm)
+
+    # Hidden state at each section-open position. abs_pos in [prefix_len + prompt_len, ...).
+    abs_pos = prefix_len + prompt_len + local_pos
+    h_t = hidden[batch_idx, abs_pos]                                         # (N, d_lm)
+
+    # Cross-attend with per-position queries.
+    e_t, _alpha = head.forward_dynamic(h_t, K, V, batch_idx=batch_idx)       # (N, d_lm)
+
+    # Inject e_t at the corresponding (b, l) in target_embeds.
+    # Build a sparse additive: scatter e_t into a (B, L, d_lm) zero tensor.
+    additive = torch.zeros_like(target_embeds)
+    additive[batch_idx, local_pos] = e_t.to(additive.dtype)
+    return target_embeds + additive
+
+
+def _inject_section_summaries(
+    target_ids: torch.Tensor,
+    target_embeds: torch.Tensor,
+    section_ctx: dict,
+) -> torch.Tensor:
+    """Add per-section audio summaries to target_embeds at <sec_X> open positions.
+
+    For each <sec_X> open token in target_ids, look up its precomputed section
+    summary e_all[b, section_idx] and add it residually to target_embeds[b, l]
+    so the LM's hidden state at that position is informed by the cross-attention
+    over the spectrogram. Vectorised — no Python loops over batch or positions.
+
+    Args:
+        target_ids:    (B, L) tokenized target.
+        target_embeds: (B, L, d_lm) embeddings of target_ids — modified residually.
+        section_ctx:   dict with keys:
+            "e_all":              (B, n_sections, d_lm) — precomputed summaries.
+            "section_id_to_idx":  dict {token_id: section_idx} for the section opens.
+
+    Returns:
+        Modified target_embeds tensor with the residual additions.
+    """
+    e_all = section_ctx["e_all"]
+    id_to_idx = section_ctx["section_id_to_idx"]
+    B, L = target_ids.shape
+
+    # Build a (B, L, n_sections) one-hot mask: mask[b, l, s] = 1 iff
+    # target_ids[b, l] is the open token for section s. Then a single einsum
+    # produces the additive embedding to add to target_embeds.
+    section_ids = torch.tensor(
+        list(id_to_idx.keys()), device=target_ids.device, dtype=target_ids.dtype,
+    )  # (n_sections,)
+    section_idx_lookup = torch.tensor(
+        list(id_to_idx.values()), device=target_ids.device, dtype=torch.long,
+    )  # (n_sections,)
+
+    # For each (b, l), find which (if any) section it matches.
+    # target_ids[..., None]: (B, L, 1); section_ids: (n_sections,). Compare → (B, L, n_sections).
+    is_match = target_ids.unsqueeze(-1) == section_ids       # (B, L, n_sections)
+    if not is_match.any():
+        return target_embeds  # nothing to inject
+
+    # Permute to the section_head's section_idx order:
+    # mask[b, l, section_idx_lookup[s]] = is_match[b, l, s]
+    n_sec = e_all.shape[1]
+    mask = torch.zeros(B, L, n_sec, dtype=target_embeds.dtype, device=target_embeds.device)
+    mask[..., section_idx_lookup] = is_match.to(target_embeds.dtype)
+
+    # additive: (B, L, d_lm) = einsum (B, L, n_sec) (B, n_sec, d_lm)
+    additive = torch.einsum("bls,bsd->bld", mask, e_all)
+    return target_embeds + additive
+
+
 def _ce_against_target(
     llm: nn.Module,
     embed_layer: nn.Module,
@@ -38,11 +260,23 @@ def _ce_against_target(
     target_text: list[str],
     max_length: int,
     device: torch.device,
+    section_ctx: dict | None = None,
 ) -> torch.Tensor:
     """Run one LM forward (prefix + prompt + target) and return CE loss on the target tokens.
 
     Tokens of the prefix and prompt are masked out via -100 labels so the loss reflects
     only the autoregressive prediction of the target tokens.
+
+    Section-query injection (when section_ctx is provided):
+      - mode="static":  precomputed per-section e_all is gathered by section_idx
+                        and added residually to target_embeds at <sec_X> positions.
+                        Single LM forward.
+      - mode="dynamic": runs a FIRST LM forward to extract hidden states at <sec_X>
+                        positions, computes per-position e_t = W_o(α·V) with
+                        α = softmax(W_q · h_t · K^T / √d_k), injects e_t into
+                        target_embeds, then runs a SECOND LM forward for the CE loss.
+                        Two-pass — ~1.5× compute, ~1.5× memory. Required by the
+                        professor's "LM generates a query vector" design.
     """
     target_ids = tokenizer(
         text=target_text,
@@ -54,6 +288,15 @@ def _ce_against_target(
 
     prompt_embeds = embed_layer(prompt_ids.expand(prefix_embeds.shape[0], -1))
     target_embeds = embed_layer(target_ids)
+
+    if section_ctx is not None:
+        if section_ctx.get("mode") == "dynamic":
+            target_embeds = _inject_section_summaries_dynamic(
+                llm, prefix_embeds, prompt_embeds, target_embeds, target_ids, section_ctx,
+            )
+        else:
+            target_embeds = _inject_section_summaries(target_ids, target_embeds, section_ctx)
+
     inputs_embeds = torch.cat([prefix_embeds, prompt_embeds, target_embeds], dim=1)
 
     N = prefix_embeds.shape[1]
@@ -82,6 +325,7 @@ def compute_loss(
     gt_scalars: torch.Tensor | None = None,
     gt_mask: torch.Tensor | None = None,
     prompt_nums_ids: torch.Tensor | None = None,
+    section_ctx: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """B-full multi-task forward + auxiliary regression head.
 
@@ -115,12 +359,15 @@ def compute_loss(
 
     metrics: dict[str, float] = {}
 
-    # Prose CE loss (always computed)
+    # Prose CE loss (always computed). When use_sections=true, section_ctx is
+    # threaded through so the per-section audio summaries get residually
+    # injected into the target embeddings at <sec_X> open positions.
     lm_loss_prose = _ce_against_target(
         llm, embed_layer, tokenizer,
         prefix_embeds, prompt_ids, target_text,
         max_length=config["max_target_length"],
         device=device,
+        section_ctx=section_ctx,
     )
     metrics["loss_lm_prose"] = float(lm_loss_prose.detach().item())
 
@@ -192,7 +439,7 @@ def train(config: dict) -> None:
     # Seed
     torch.manual_seed(config["seed"])
 
-    # Tokenizer + LLM + LoRA
+    # Tokenizer + LLM
     tokenizer = AutoTokenizer.from_pretrained(config["lm_name"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -202,17 +449,32 @@ def train(config: dict) -> None:
         torch_dtype=torch.bfloat16,
         device_map={"": device},
     )
-    llm = get_peft_model(
-        llm,
-        LoraConfig(
-            r=config["lora_rank"],
-            lora_alpha=config["lora_alpha"],
-            target_modules=config["lora_targets"],
-            lora_dropout=config["lora_dropout"],
-            bias="none",
-            task_type="CAUSAL_LM",
-        ),
-    )
+
+    # Register per-feature special tokens BEFORE LoRA wrap so the LoRA matrices
+    # see the resized embedding. Only runs when tagged_mode is on (the EMNLP
+    # rework path); legacy untagged training leaves the vocab unchanged.
+    n_added_tokens = 0
+    if config.get("tagged_mode"):
+        n_added_tokens = _register_feature_tags(tokenizer, llm)
+        print(f"[tagged-mode] Added {n_added_tokens} feature special tokens "
+              f"(vocab now {len(tokenizer)})")
+
+    full_ft = not _use_lora(config)
+    if full_ft:
+        print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → training all LM weights")
+    else:
+        llm = get_peft_model(
+            llm,
+            LoraConfig(
+                r=config["lora_rank"],
+                lora_alpha=config["lora_alpha"],
+                target_modules=config["lora_targets"],
+                lora_dropout=config["lora_dropout"],
+                bias="none",
+                task_type="CAUSAL_LM",
+            ),
+        )
+        print(f"[LoRA] rank={config['lora_rank']} alpha={config['lora_alpha']}")
 
     if config["gradient_checkpointing"]:
         llm.gradient_checkpointing_enable()
@@ -223,21 +485,72 @@ def train(config: dict) -> None:
     lm_hidden_size = llm.config.hidden_size
     adapter = build_adapter(config["adapter_variant"], lm_dim=lm_hidden_size).to(device).to(torch.bfloat16)
 
+    # ── Section-query branch (EMNLP rework, Path 3) ────────────────────────
+    # When use_sections=true, set up:
+    #   - SpecEncoder (BEATs by default) — frozen, runs once per batch (or skipped
+    #     if BEATs patches were precomputed and cached in the .pt files)
+    #   - SectionQueryHead — learnable per-section queries, cross-attends to spec
+    #     patches, produces audio summaries that get injected at <sec_X> positions.
+    use_sections = bool(config.get("use_sections"))
+    spec_encoder: SpecEncoder | None = None
+    section_head: SectionQueryHead | None = None
+    section_id_to_idx: dict[int, int] = {}
+    if use_sections:
+        # Spec encoder is only needed if patches aren't precomputed in the .pt files.
+        # `beats_cached: true` (default) → SpecEncoder is None at train time and we
+        # read patches from the batch.
+        if not config.get("beats_cached", True):
+            spec_encoder = SpecEncoder(
+                model_name=config.get("spec_encoder_name", "beats"),
+                checkpoint_name=config.get("spec_checkpoint_name", "BEATs_iter3_plus_AS2M.pt"),
+                checkpoint_path=config.get("spec_checkpoint_path"),
+                freeze=config.get("spec_freeze", True),
+            ).to(device)
+            print(f"[sections] online SpecEncoder: {config.get('spec_encoder_name', 'beats')}")
+        else:
+            print(f"[sections] using precomputed BEATs patches from .pt files (beats_cached=true)")
+
+        # SectionQueryHead's d_patch must match whatever K/V come from. For BEATs
+        # (default) this is 768. Override via config if using AST or a fine-tuned
+        # variant.
+        d_patch = int(config.get("spec_d_patch", 768))
+        section_head = SectionQueryHead(
+            n_sections=N_SECTIONS, d_patch=d_patch, d_lm=lm_hidden_size,
+            d_k=int(config.get("section_d_k", 256)),
+            d_v=int(config.get("section_d_v", 256)),
+        ).to(device).to(torch.bfloat16)
+
+        # Build the section_id → section_idx mapping. Must run AFTER the tokenizer
+        # has section tokens registered — done in _register_feature_tags above
+        # via TAG_SPECIAL_TOKENS which now contains both <f_*> and <sec_*> tags.
+        sec_name_to_id = section_open_token_ids(tokenizer)
+        section_id_to_idx = {sec_name_to_id[s.name]: i for i, s in enumerate(SECTION_TAGS)}
+        sq_mode = config.get("section_query_mode", "static").lower()
+        if sq_mode not in {"static", "dynamic"}:
+            raise ValueError(f"section_query_mode must be 'static' or 'dynamic', got {sq_mode!r}")
+        print(f"[sections] {N_SECTIONS} sections registered; "
+              f"query_mode={sq_mode}; ids {list(section_id_to_idx.keys())}")
+
     # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
-    # after wandb.init() below. Helps compare adapter vs LoRA footprint across runs in one glance.
+    # after wandb.init() below. Helps compare adapter vs LoRA/full-FT footprint across runs.
     lm_total = sum(p.numel() for p in llm.parameters())
-    lora_trainable = sum(p.numel() for p in llm.parameters() if p.requires_grad)
+    lm_trainable = sum(p.numel() for p in llm.parameters() if p.requires_grad)
     adapter_trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
-    trainable_total = lora_trainable + adapter_trainable
+    trainable_total = lm_trainable + adapter_trainable
     param_summary = {
         "params/lm_total": lm_total,
-        "params/lora_trainable": lora_trainable,
+        "params/lm_trainable": lm_trainable,         # full-FT: lm_total; LoRA: small subset
+        "params/lora_trainable": lm_trainable if not full_ft else 0,  # legacy compat key
         "params/adapter_trainable": adapter_trainable,
         "params/trainable_total": trainable_total,
         "params/trainable_pct_of_lm": 100.0 * trainable_total / lm_total,
+        "params/full_ft": int(full_ft),
+        "params/tagged_mode": int(bool(config.get("tagged_mode"))),
+        "params/n_added_tokens": n_added_tokens,
     }
+    mode = "full-FT" if full_ft else "LoRA"
     print(
-        f"Parameters  —  LM total: {lm_total/1e9:.2f}B  |  LoRA trainable: {lora_trainable/1e6:.1f}M  "
+        f"Parameters  —  LM total: {lm_total/1e9:.2f}B  |  {mode} trainable: {lm_trainable/1e6:.1f}M  "
         f"|  adapter trainable: {adapter_trainable/1e6:.1f}M  "
         f"|  grand total trainable: {trainable_total/1e6:.1f}M "
         f"({param_summary['params/trainable_pct_of_lm']:.3f}% of LM)"
@@ -315,11 +628,19 @@ def train(config: dict) -> None:
     )
 
     # Optimizer
+    # `lr_lm` is the canonical key going forward (covers both full-FT and LoRA).
+    # `lr_lora` stays supported as a fallback so existing PSC configs keep working.
+    lr_lm = float(config.get("lr_lm") or config.get("lr_lora"))
+    param_groups = [
+        {"params": adapter.parameters(), "lr": config["lr_adapter"]},
+        {"params": [p for p in llm.parameters() if p.requires_grad], "lr": lr_lm},
+    ]
+    if section_head is not None:
+        # Section-query head uses the adapter LR — it's a small new module similar
+        # in size to the adapter and learns from CE gradient.
+        param_groups.append({"params": section_head.parameters(), "lr": config["lr_adapter"]})
     optimizer = torch.optim.AdamW(
-        [
-            {"params": adapter.parameters(), "lr": config["lr_adapter"]},
-            {"params": llm.parameters(), "lr": config["lr_lora"]},
-        ],
+        param_groups,
         weight_decay=config["weight_decay"],
         betas=(config["adam_beta1"], config["adam_beta2"]),
         eps=config["adam_epsilon"],
@@ -360,7 +681,11 @@ def train(config: dict) -> None:
     if config.get("resume_from"):
         checkpoint = torch.load(config["resume_from"], weights_only=False)
         adapter.load_state_dict(checkpoint["adapter_state_dict"])
-        llm.load_state_dict(checkpoint["lora_state_dict"])
+        # New checkpoints use "llm_state_dict"; pre-2026-05-11 ones used "lora_state_dict".
+        llm_sd = checkpoint.get("llm_state_dict") or checkpoint["lora_state_dict"]
+        llm.load_state_dict(llm_sd)
+        if section_head is not None and "section_head_state_dict" in checkpoint:
+            section_head.load_state_dict(checkpoint["section_head_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -409,6 +734,10 @@ def train(config: dict) -> None:
         batch_bar = tqdm(total=len(train_loader), dynamic_ncols=True, leave=False, position=0, desc='Train')
 
         for batch_idx, batch in enumerate(train_loader):
+            section_ctx = _build_section_ctx(
+                section_head, spec_encoder, section_id_to_idx, batch, device, mode=sq_mode,
+            ) if section_head is not None else None
+
             loss, loss_metrics = compute_loss(
                 adapter,
                 llm,
@@ -424,6 +753,7 @@ def train(config: dict) -> None:
                 gt_scalars=batch.get("gt_scalars"),
                 gt_mask=batch.get("gt_mask"),
                 prompt_nums_ids=prompt_nums_ids,
+                section_ctx=section_ctx,
             )
             loss = loss / accum_steps
             loss.backward()
@@ -472,6 +802,10 @@ def train(config: dict) -> None:
             val_metrics_sum = {"loss_lm_prose": 0.0, "loss_lm_nums": 0.0, "loss_mse": 0.0}
             with torch.no_grad():
                 for batch in val_loader:
+                    section_ctx = _build_section_ctx(
+                        section_head, spec_encoder, section_id_to_idx, batch, device,
+                    ) if section_head is not None else None
+
                     loss, loss_metrics = compute_loss(
                         adapter,
                         llm,
@@ -486,6 +820,7 @@ def train(config: dict) -> None:
                         target_nums=batch.get("target_nums"),
                         gt_scalars=batch.get("gt_scalars"),
                         gt_mask=batch.get("gt_mask"),
+                        section_ctx=section_ctx,
                     )
                     val_loss += loss.item()
                     for k in val_metrics_sum:
@@ -502,7 +837,9 @@ def train(config: dict) -> None:
             # ── Qualitative: generate text on a fixed slice of val, SFS-score, log to wandb ──
             # Catches degenerate outputs ("AND THE THE THE...") immediately and tracks SFS F1
             # epoch-by-epoch so you can see the faithfulness curve without waiting for inference.py.
-            claim_parser = ClaimParser()
+            # HybridClaimParser auto-detects tagged spans (EMNLP rework) and falls back to the
+            # legacy regex parser on untagged outputs, so a single trainer handles both modes.
+            claim_parser = HybridClaimParser()
             sfs_scorer = SFSScorer()
 
             sample_rows = []
@@ -511,27 +848,55 @@ def train(config: dict) -> None:
             # 8 was too noisy to read F1 trends across epochs; 32 cuts noise floor in half
             # for ~2 minutes additional generation time per epoch.
             n_samples = min(config.get("val_sfs_n", 32), len(val_set))
+
+            # If use_sections=true, route val-time generation through inference.generate
+            # so the section hook fires and attention maps are produced (they're
+            # discarded here — we only need the text for SFS — but firing the hook
+            # is what makes the section_head learn signal-consistent queries).
+            inference_generate = None
+            if section_head is not None:
+                from inference import generate as inference_generate
+
             with torch.no_grad():
                 for i in range(n_samples):
                     sample = val_set[i]
-                    af = sample["audio_features"].unsqueeze(0).to(device).to(torch.bfloat16)
-                    oi = sample["overlap_info"].unsqueeze(0).to(device).to(torch.bfloat16)
-                    # Adapter may return (prefix, scalar_pred) when wrapped with aux head.
-                    out = adapter(af, oi)
-                    prefix = out[0] if isinstance(out, tuple) else out
 
-                    prompt_emb = embed_layer(prompt_ids)
-                    inputs_embeds = torch.cat([prefix, prompt_emb], dim=1)
-                    attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
-
-                    gen_ids = llm.generate(
-                        inputs_embeds=inputs_embeds,
-                        attention_mask=attention_mask,
-                        max_new_tokens=config.get("max_target_length", 256),  # matches training target length
-                        do_sample=False,                                       # greedy for reproducibility
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-                    gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+                    if inference_generate is not None and "beats_patches" in sample:
+                        # Section path: hand-rolled token-by-token with hook.
+                        patches = sample["beats_patches"].unsqueeze(0).to(device).to(torch.bfloat16)
+                        K, V = section_head.precompute_kv(patches)
+                        sec_name_to_id = section_open_token_ids(tokenizer)
+                        clip_section_ctx = {
+                            "mode": sq_mode,
+                            "head": section_head, "K": K, "V": V,
+                            "section_id_to_idx": section_id_to_idx,
+                            "id_to_section_name": {sec_name_to_id[s.name]: s.name for s in SECTION_TAGS},
+                        }
+                        gen_text, _attn_maps = inference_generate(
+                            adapter, llm, tokenizer,
+                            sample["audio_features"], sample["overlap_info"],
+                            prompt_ids, device,
+                            max_new_tokens=config.get("max_target_length", 256),
+                            temperature=1.0, top_k=0, top_p=1.0,  # greedy
+                            section_ctx=clip_section_ctx,
+                        )
+                    else:
+                        # Legacy path (no sections): HF's optimized generate.
+                        af = sample["audio_features"].unsqueeze(0).to(device).to(torch.bfloat16)
+                        oi = sample["overlap_info"].unsqueeze(0).to(device).to(torch.bfloat16)
+                        out = adapter(af, oi)
+                        prefix = out[0] if isinstance(out, tuple) else out
+                        prompt_emb = embed_layer(prompt_ids)
+                        inputs_embeds = torch.cat([prefix, prompt_emb], dim=1)
+                        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=device)
+                        gen_ids = llm.generate(
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=attention_mask,
+                            max_new_tokens=config.get("max_target_length", 256),
+                            do_sample=False,
+                            pad_token_id=tokenizer.pad_token_id,
+                        )
+                        gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
 
                     # SFS vs target text (parse both; use target claims as ground truth).
                     # Same approach inference.py uses when features_path isn't provided.
@@ -631,37 +996,34 @@ def train(config: dict) -> None:
 
         # Save best — selected on val_sfs_f1 (higher = better). avg_sfs_f1 is set
         # when val-time generation runs (val_sfs_n > 0); skip selection on epochs where it didn't.
-        if avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
-            best_val_sfs_f1 = avg_sfs_f1
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "adapter_state_dict": adapter.state_dict(),
-                    "lora_state_dict": llm.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "best_val_sfs_f1": best_val_sfs_f1,
-                    "wandb_run_id": wandb_run_id,
-                    "config": config,
-                },
-                os.path.join(config["save_dir"], "best.pt"),
-            )
-            print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
-
-        # Save last (for resuming)
-        torch.save(
-            {
-                "epoch": epoch,
+        def _ckpt_payload(epoch_idx: int) -> dict:
+            # New canonical key is `llm_state_dict` (covers both LoRA and full-FT
+            # weights). The pre-existing `lora_state_dict` alias is kept so older
+            # tools that look for that key still find the same tensor.
+            llm_sd = llm.state_dict()
+            payload = {
+                "epoch": epoch_idx,
                 "adapter_state_dict": adapter.state_dict(),
-                "lora_state_dict": llm.state_dict(),
+                "llm_state_dict": llm_sd,
+                "lora_state_dict": llm_sd,  # legacy alias
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "best_val_sfs_f1": best_val_sfs_f1,
                 "wandb_run_id": wandb_run_id,
                 "config": config,
-            },
-            os.path.join(config["save_dir"], "last.pt"),
-        )
+                "added_special_tokens": list(TAG_SPECIAL_TOKENS) if config.get("tagged_mode") else [],
+            }
+            if section_head is not None:
+                payload["section_head_state_dict"] = section_head.state_dict()
+            return payload
+
+        if avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
+            best_val_sfs_f1 = avg_sfs_f1
+            torch.save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "best.pt"))
+            print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
+
+        # Save last (for resuming)
+        torch.save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "last.pt"))
         print("Saved epoch model")
 
     wandb.finish()

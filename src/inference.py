@@ -26,8 +26,16 @@ from peft import LoraConfig, get_peft_model
 
 from adapter import build_adapter
 from dataset import PreprocessedDataset
-from sfs import ClaimParser, SFSScorer
+from sfs import HybridClaimParser, SFSScorer
 from text_metrics import compute_generation_metrics
+from section_tags import (
+    SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
+    SECTION_TAGS,
+    N_SECTIONS,
+    section_open_token_ids,
+)
+from section_query import SectionQueryHead
+from spec_encoder import SpecEncoder
 
 
 # ── Generation ──────────────────────────────────────────────
@@ -64,8 +72,28 @@ def generate(
     temperature: float = 1.0,
     top_k: int = 0,
     top_p: float = 1.0,
-) -> str:
-    """Generate a quality description from pre-computed features."""
+    section_ctx: dict | None = None,
+) -> tuple[str, dict]:
+    """Generate a quality description from pre-computed features.
+
+    If section_ctx is provided (use_sections=true at training time), this also
+    runs the per-section cross-attention hook: when a <sec_X> token is emitted,
+    the corresponding query attends over spec patches, the attention map is
+    saved into the returned dict, and the audio summary is residually injected
+    into the next-input embedding so the section body is conditioned on it.
+
+    Args:
+        section_ctx: dict with keys:
+            "head":              SectionQueryHead instance.
+            "K", "V":            (1, P, d) — precomputed patch projections.
+            "section_id_to_idx": {token_id: section_idx}.
+            "id_to_section_name": {token_id: "noise"/"reverb"/...}.
+
+    Returns:
+        (decoded_text, attention_maps) — attention_maps is {} if section_ctx
+        is None, else {section_name: tensor (P,)} for every section the model
+        emitted in this clip.
+    """
     audio_features = audio_features.unsqueeze(0).to(device).to(torch.bfloat16)
     overlap_info = overlap_info.unsqueeze(0).to(device).to(torch.bfloat16)
 
@@ -79,33 +107,91 @@ def generate(
     inputs_embeds = torch.cat([prefix_embeds, prompt_embeds], dim=1)
 
     # Generate token by token with KV cache
-    generated_ids = []
+    generated_ids: list[int] = []
+    attention_maps: dict[str, torch.Tensor] = {}
     past_key_values = None
+    pending_injection: torch.Tensor | None = None   # set after a section-open is emitted
+
+    # Whether to ask the LM to return hidden states. Only the dynamic section
+    # path needs them; turning the flag off when not needed avoids the extra
+    # memory copy.
+    needs_hidden = section_ctx is not None and section_ctx.get("mode") == "dynamic"
 
     # First forward: process prefix + prompt
-    outputs = llm(inputs_embeds=inputs_embeds, use_cache=True)
+    outputs = llm(inputs_embeds=inputs_embeds, use_cache=True, output_hidden_states=needs_hidden)
     past_key_values = outputs.past_key_values
     next_token_id = sample_token(outputs.logits[:, -1, :], temperature, top_k, top_p)
-    generated_ids.append(next_token_id.item())
+    token_id = next_token_id.item()
+    generated_ids.append(token_id)
+
+    if section_ctx is not None and token_id in section_ctx["section_id_to_idx"]:
+        # h_t is the last hidden state at the position that PRODUCED this token —
+        # i.e., the LM's prediction state. That's the natural query source.
+        h_t = outputs.hidden_states[-1][:, -1, :] if needs_hidden else None
+        pending_injection = _section_hook(token_id, section_ctx, attention_maps, h_t=h_t)
 
     # Subsequent: one token at a time
     for _ in range(max_new_tokens - 1):
         next_embeds = embed_layer(next_token_id)
+        if pending_injection is not None:
+            # Inject the prior section's audio summary into THIS step's input
+            # embedding. The LM's hidden state at this position is now informed
+            # by the cross-attention, and the section body it generates from
+            # here on will reflect the attended audio.
+            next_embeds = next_embeds + pending_injection
+            pending_injection = None
+
         outputs = llm(
             inputs_embeds=next_embeds,
             past_key_values=past_key_values,
             use_cache=True,
+            output_hidden_states=needs_hidden,
         )
         past_key_values = outputs.past_key_values
         next_token_id = sample_token(outputs.logits[:, -1, :], temperature, top_k, top_p)
-
         token_id = next_token_id.item()
         generated_ids.append(token_id)
 
         if token_id == tokenizer.eos_token_id:
             break
 
-    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+        if section_ctx is not None and token_id in section_ctx["section_id_to_idx"]:
+            h_t = outputs.hidden_states[-1][:, -1, :] if needs_hidden else None
+            pending_injection = _section_hook(token_id, section_ctx, attention_maps, h_t=h_t)
+
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return text, attention_maps
+
+
+def _section_hook(
+    section_token_id: int,
+    section_ctx: dict,
+    attention_maps: dict,
+    h_t: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the section query for a just-emitted <sec_X> token; record alpha; return e_t.
+
+    Static mode (default): query is looked up by section index.
+    Dynamic mode: query is `W_q · h_t` where h_t is the LM's last-layer hidden
+    state at the position of the just-emitted <sec_X> token. The caller must
+    pass `h_t` of shape (1, d_lm).
+    """
+    head = section_ctx["head"]
+    K, V = section_ctx["K"], section_ctx["V"]
+    mode = section_ctx.get("mode", "static")
+
+    if mode == "dynamic":
+        assert h_t is not None, "dynamic mode needs h_t from the just-finished LM forward"
+        e_t, alpha = head.forward_dynamic(h_t, K, V)   # (1, d_lm), (1, P)
+    else:
+        section_idx = section_ctx["section_id_to_idx"][section_token_id]
+        idx_t = torch.tensor([section_idx], device=K.device, dtype=torch.long)
+        e_t, alpha = head(idx_t, K, V)                 # (1, d_lm), (1, P)
+
+    section_name = section_ctx["id_to_section_name"][section_token_id]
+    attention_maps[section_name] = alpha.detach().squeeze(0).cpu()
+    # Reshape to (1, 1, d_lm) so it can be added to next_embeds (1, 1, d_lm).
+    return e_t.unsqueeze(1)
 
 
 # ── Evaluation ──────────────────────────────────────────────
@@ -118,6 +204,7 @@ _STRUCTURAL_KEYS = (
     "lora_alpha",
     "lora_targets",
     "lora_dropout",
+    "tagged_mode",  # tags vs legacy untagged prose — determines tokenizer setup
 )
 
 
@@ -163,7 +250,7 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     config["save_dir"] = os.path.dirname(os.path.abspath(checkpoint_path))
     print(f"[config] save_dir → {config['save_dir']} (inference outputs will land here)")
 
-    # Load tokenizer + LLM + LoRA
+    # Load tokenizer + LLM
     tokenizer = AutoTokenizer.from_pretrained(config["lm_name"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -173,17 +260,39 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
-    llm = get_peft_model(
-        llm,
-        LoraConfig(
-            r=config["lora_rank"],
-            lora_alpha=config["lora_alpha"],
-            target_modules=config["lora_targets"],
-            lora_dropout=config["lora_dropout"],
-            bias="none",
-            task_type="CAUSAL_LM",
-        ),
-    )
+
+    # If the checkpoint was trained with tagged-mode, register the feature
+    # tokens and resize the embedding matrix BEFORE loading state_dict so
+    # the embedding shapes match what the checkpoint expects.
+    #
+    # `add_tokens(..., special_tokens=False)` is deliberate: with
+    # `additional_special_tokens=...` the tags get stripped by the default
+    # `decode(skip_special_tokens=True)` call below in generate(), which
+    # silently makes every <f_*> tag invisible to the SFS parser.
+    if config.get("tagged_mode"):
+        added = tokenizer.add_tokens(TAG_SPECIAL_TOKENS, special_tokens=False)
+        if added:
+            llm.resize_token_embeddings(len(tokenizer))
+        print(f"[tagged-mode] vocab size = {len(tokenizer)} ({added} new tokens added)")
+
+    # LoRA wrap only for LoRA-trained checkpoints. Full-FT checkpoints contain
+    # the LM weights directly under llm_state_dict / lora_state_dict.
+    full_ft = not bool(config.get("lora_rank"))
+    if not full_ft:
+        llm = get_peft_model(
+            llm,
+            LoraConfig(
+                r=config["lora_rank"],
+                lora_alpha=config["lora_alpha"],
+                target_modules=config["lora_targets"],
+                lora_dropout=config["lora_dropout"],
+                bias="none",
+                task_type="CAUSAL_LM",
+            ),
+        )
+        print(f"[LoRA] rank={config['lora_rank']} (legacy ckpt path)")
+    else:
+        print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → loading LM weights directly")
 
     # Load checkpoint (use --checkpoint_device cpu for smaller GPUs)
     map_loc = config.get("checkpoint_device", "cuda")
@@ -196,7 +305,29 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         .to(torch.bfloat16)
     )
     adapter.load_state_dict(checkpoint["adapter_state_dict"])
-    llm.load_state_dict(checkpoint["lora_state_dict"])
+    # New checkpoints use `llm_state_dict`; legacy ones used `lora_state_dict`.
+    llm_sd = checkpoint.get("llm_state_dict") or checkpoint["lora_state_dict"]
+    llm.load_state_dict(llm_sd)
+
+    # Section-query head (EMNLP rework, Path 3). Same gate as in train.py.
+    section_head: SectionQueryHead | None = None
+    section_id_to_idx: dict[int, int] = {}
+    id_to_section_name: dict[int, str] = {}
+    sq_mode = config.get("section_query_mode", "static").lower()
+    if config.get("use_sections") and "section_head_state_dict" in checkpoint:
+        d_patch = int(config.get("spec_d_patch", 768))
+        section_head = SectionQueryHead(
+            n_sections=N_SECTIONS, d_patch=d_patch, d_lm=lm_hidden_size,
+            d_k=int(config.get("section_d_k", 256)),
+            d_v=int(config.get("section_d_v", 256)),
+        ).to(device).to(torch.bfloat16)
+        section_head.load_state_dict(checkpoint["section_head_state_dict"])
+        section_head.eval()
+        sec_name_to_id = section_open_token_ids(tokenizer)
+        section_id_to_idx = {sec_name_to_id[s.name]: i for i, s in enumerate(SECTION_TAGS)}
+        id_to_section_name = {sec_name_to_id[s.name]: s.name for s in SECTION_TAGS}
+        print(f"[sections] loaded section_head from checkpoint; mode={sq_mode}; "
+              f"section ids = {list(section_id_to_idx.keys())}")
 
     adapter.eval()
     llm.eval()
@@ -268,8 +399,10 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             json.dump(all_outputs, f, indent=2)
         os.replace(tmp, output_path)
 
-    # Generate + evaluate
-    claim_parser = ClaimParser()
+    # Generate + evaluate. HybridClaimParser auto-detects tagged spans for the
+    # EMNLP rework checkpoints and falls back to the legacy regex parser for
+    # older Phase-2 checkpoints.
+    claim_parser = HybridClaimParser()
     scorer = SFSScorer()
     n_new = 0
 
@@ -279,7 +412,22 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             continue
         stem = os.path.splitext(sample["filename"])[0]
 
-        generated = generate(
+        # Build the per-clip section context if we're using sections AND patches
+        # were cached into the .pt. Without cached patches the generate() call
+        # falls back to plain autoregressive generation (no attention maps saved).
+        clip_section_ctx = None
+        if section_head is not None and "beats_patches" in sample:
+            patches = sample["beats_patches"].unsqueeze(0).to(device).to(torch.bfloat16)
+            K, V = section_head.precompute_kv(patches)
+            clip_section_ctx = {
+                "mode": sq_mode,
+                "head": section_head,
+                "K": K, "V": V,
+                "section_id_to_idx": section_id_to_idx,
+                "id_to_section_name": id_to_section_name,
+            }
+
+        generated, attention_maps = generate(
             adapter, llm, tokenizer,
             sample["audio_features"],
             sample["overlap_info"],
@@ -288,12 +436,19 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             temperature=config.get("temperature", 1.0),
             top_k=config.get("top_k", 0),
             top_p=config.get("top_p", 1.0),
+            section_ctx=clip_section_ctx,
         )
 
         output_entry = {
             "filename": sample["filename"],
             "generated": generated,
         }
+        if attention_maps:
+            # Save as plain lists in JSON (per-clip); the plotting script reshapes
+            # to (T_p, F_p) using the spec encoder's grid metadata.
+            output_entry["attention_maps"] = {
+                name: tensor.tolist() for name, tensor in attention_maps.items()
+            }
 
         if "target_text" in sample:
             output_entry["target"] = sample["target_text"]
