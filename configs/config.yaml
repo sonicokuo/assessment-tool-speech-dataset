@@ -1,10 +1,17 @@
+# Local toy config for smoke tests. For PSC training:
+#   - Phase-2 baseline: configs/config.psc.yaml
+#   - EMNLP rework (Qwen3-1.7B full FT, tagged prose): configs/config.psc.emnlp.yaml
+
 # ── Model ──────────────────────────
 lm_name: "Qwen/Qwen3.5-9B" # swappeable to other models
 adapter_variant: "film-mamba"
-lora_rank: 16 # can go up after variant ablations; use use_rslora=True when expanding capacity
+lora_rank: 16 # set to 0 to disable LoRA and full-fine-tune
 lora_alpha: 32 # can go up after variant ablations; use use_rslora=True when expanding capacity
 lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 lora_dropout: 0.05
+
+# Set true to register per-feature <f_*> special tokens (see src/feature_tags.py).
+tagged_mode: false
 
 # ── Optimizer ──────────────────────────
 optimizer: "adamw"
