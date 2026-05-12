@@ -1,24 +1,23 @@
-"""Canonical 13-feature list for AQUA-NL B-full multi-task training and the aux regression head.
+"""Canonical 8-feature list for AQUA-NL B-full multi-task training and the aux regression head.
 
 Single source of truth for:
-  - The numerical target string used in B-full's forward A ("snr=15.66 hnr=8.34 ...").
-  - The (B, 13) scalar tensor + mask used by the aux regression head's MSE.
+  - The numerical target string used in B-full's forward A ("snr=15.66 srmr=4.5 ...").
+  - The (B, 8) scalar tensor + mask used by the aux regression head's MSE.
 
-These 13 features are chosen as the intersection of:
-  (a) features the metric SFSScorer (src/sfs.py) actually scores via TOLERANCES, AND
-  (b) features Libri2Mix feature extraction (feature_extractor_mix.py) actually produces
-      via VAD / Praat measurements per clip.
+These 8 features are the scalar entries inside src/section_tags.py's catalog —
+one per <f_*> open tag, excluding the overlap_segments span set (which isn't a
+scalar). Order MUST stay synced with the scalar entries of FEATURE_TAGS in
+section_tags.py.
 
-Why this exact set:
-  - All 13 are in SFSScorer.TOLERANCES — train-eval alignment.
-  - All 13 are in the feature CSV's columns (verified against scratch/verb_samples).
-  - sample_rate is excluded (always 16000 in this dataset, trivial supervision).
-  - overlap_segments is excluded (variable-length list, not a scalar — lives in prose target).
-  - 13 derivative features (f0_min/max/range, mean_pause_dur, total_pause_dur, jitter_rap, ...)
-    are excluded as redundant with the 13 we keep.
-
-Ordering: fixed canonical order so the bare-numbers target is predictable autoregressively
-(model learns "slot 1 is always SNR; slot 2 is always HNR; ...").
+Update history:
+  - 2026-05-11: trimmed from 13 → 7 (drop f0_sd, jitter, shimmer, srmr,
+    articulation_rate, pause_rate; keep duration + hnr).
+  - 2026-05-12: realigned to the section catalog (8 features). Reverb (srmr),
+    pitch SD (f0_sd), and pause_rate are restored because each has its own
+    section in the EMNLP design and needs scalar supervision. duration and hnr
+    are dropped — duration is an intro sentence outside any section; hnr was
+    grouped under voice_quality which we cut to avoid a redundant attention
+    figure with pitch.
 """
 
 from __future__ import annotations
@@ -29,57 +28,46 @@ import torch
 
 
 # (short_name, csv_column, format_string)
+# Order matches the scalar tags in src/section_tags.py::FEATURE_TAGS.
 SUPERVISED_FEATURES: list[tuple[str, str, str]] = [
     ("snr",               "snr_db",                          "{:.2f}"),
-    ("hnr",               "hnr_db",                          "{:.2f}"),
+    ("srmr",              "srmr",                            "{:.4f}"),
     ("f0_mean",           "f0_mean_hz",                      "{:.2f}"),
     ("f0_sd",             "f0_sd_hz",                        "{:.2f}"),
-    ("jitter",            "jitter_local_pct",                "{:.4f}"),
-    ("shimmer",           "shimmer_pct",                     "{:.4f}"),
-    ("srmr",              "srmr",                            "{:.4f}"),
-    ("overlap_ratio",     "overlap_ratio",                   "{:.4f}"),
     ("speaking_rate",     "praat_speaking_rate_syl_sec",     "{:.3f}"),
-    ("articulation_rate", "praat_articulation_rate_syl_sec", "{:.3f}"),
     ("pause_count",       "praat_pause_count",               "{:d}"),
     ("pause_rate",        "praat_pause_rate_per_min",        "{:.3f}"),
-    ("duration",          "duration_sec",                    "{:.3f}"),
+    ("overlap_ratio",     "overlap_ratio",                   "{:.4f}"),
 ]
 
-N_FEATURES: int = len(SUPERVISED_FEATURES)  # 13
+N_FEATURES: int = len(SUPERVISED_FEATURES)  # 8
 
 
 # Per-feature scales used to NORMALIZE the auxiliary-head MSE.
-# Without normalization, the F0 features (typical magnitude ~150 Hz) dominate the
-# squared-error sum 1000x over features like overlap_ratio (~0.5). The adapter then
-# optimizes almost exclusively for F0 prediction, starving the prose pathway.
-# Each scale is roughly the typical absolute value of that feature on real Libri2Mix
-# clips; dividing (pred - gt) by the scale gives a unit-free relative-error term.
+# Without normalization, F0 (typical magnitude ~150 Hz) dominates the squared-error
+# sum 1000x over features like overlap_ratio (~0.5). Each scale is roughly the typical
+# absolute value of that feature on real Libri2Mix clips; dividing (pred - gt) by the
+# scale gives a unit-free relative-error term so every feature contributes ~equally.
 # Order MUST match SUPERVISED_FEATURES.
 FEATURE_SCALES: tuple[float, ...] = (
     5.0,    # snr  (dB, typical ~15)
-    5.0,    # hnr  (dB, typical ~10)
+    2.0,    # srmr  (typical ~5)
     50.0,   # f0_mean  (Hz, typical ~150)
     20.0,   # f0_sd  (Hz, typical ~40)
-    1.0,    # jitter  (%, typical ~2)
-    5.0,    # shimmer  (%, typical ~12)
-    2.0,    # srmr  (typical ~5)
-    0.3,    # overlap_ratio  (typical ~0.5)
     2.0,    # speaking_rate  (syl/sec, typical ~6)
-    2.0,    # articulation_rate  (syl/sec, typical ~7)
     3.0,    # pause_count  (count, typical ~3)
     5.0,    # pause_rate  (per min, typical ~10)
-    5.0,    # duration  (sec, typical ~10)
+    0.3,    # overlap_ratio  (typical ~0.5)
 )
 assert len(FEATURE_SCALES) == N_FEATURES, "FEATURE_SCALES length must match SUPERVISED_FEATURES"
 
-# Features that are *integers in nature* — pause_count is the obvious case.
-# Used by build_nums_target to cast before formatting.
+# Features that are *integers in nature* — pause_count is the only one in the
+# trimmed catalog. Used by build_nums_target to cast before formatting.
 _INT_FEATURES = {"pause_count"}
 
 # Features whose 0.0 value is a *genuine zero*, not a "missing" signal.
-# E.g., a clip with no pauses really has pause_count=0 and pause_rate=0.0;
-# a clip with no overlap really has overlap_ratio=0.0.
-# These should NOT be replaced with "na" when zero-valued.
+# A clip with no pauses really has pause_count=0; a clip with no overlap really
+# has overlap_ratio=0.0. These should NOT be replaced with "na" when zero-valued.
 _GENUINE_ZERO_FEATURES = {
     "overlap_ratio", "pause_count", "pause_rate",
 }

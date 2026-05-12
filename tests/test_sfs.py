@@ -1,6 +1,6 @@
 """Tests for Signal Faithfulness Score (SFS) module."""
 
-from sfs import Claim, ClaimParser, SFSScorer
+from sfs import Claim, ClaimParser, HybridClaimParser, SFSScorer, TaggedClaimParser
 
 
 class TestClaimParser:
@@ -215,3 +215,90 @@ class TestSFSScorer:
         claims = [Claim("f0_mean", 187.0, "Hz", "F0 = 187 Hz")]
         result = self.scorer.score(claims, {"snr": 28.0})
         assert result["precision"] == 0.0
+
+
+class TestTaggedClaimParser:
+    """The tagged parser sees `<f_NAME>…</f>` spans and yields one Claim per
+    SFS-scored tag (with overlap_segments expanded to start/end pairs)."""
+
+    def setup_method(self):
+        self.parser = TaggedClaimParser()
+
+    def test_single_span(self):
+        claims = self.parser.parse("<f_snr>The SNR is 15.10 dB</f>")
+        assert len(claims) == 1
+        assert claims[0].feature == "snr"
+        assert claims[0].value == 15.10
+
+    def test_multiple_spans_in_order(self):
+        text = (
+            "<f_snr>the SNR is 15.10 dB</f> and "
+            "<f_srmr>the SRMR is 5.17</f>. "
+            "<f_pause_count>3 pauses</f>."
+        )
+        claims = self.parser.parse(text)
+        features = [c.feature for c in claims]
+        assert features == ["snr", "srmr", "pause_count"]
+
+    def test_overlap_segments_expanded_to_pairs(self):
+        text = "<f_overlap_segments>Overlap segments are present at 0.5-3.1s, 5.4-7.2s</f>"
+        claims = self.parser.parse(text)
+        # Two ranges → two starts + two ends
+        starts = [c for c in claims if c.feature == "overlap_start"]
+        ends = [c for c in claims if c.feature == "overlap_end"]
+        assert [c.value for c in starts] == [0.5, 5.4]
+        assert [c.value for c in ends] == [3.1, 7.2]
+
+    def test_non_sfs_tag_skipped(self):
+        # overlap_segments has sfs_key=None (scored via IoU, separately).
+        # The TaggedClaimParser expands it into overlap_start/overlap_end claim
+        # pairs, NOT a generic feature claim. So the parser yields overlap claims,
+        # not nothing — exercise that path explicitly.
+        text = "<f_overlap_segments>Overlap segments at 0.5-1.0s</f>"
+        claims = self.parser.parse(text)
+        # Should produce overlap_start + overlap_end (NOT a generic feature claim).
+        feats = {c.feature for c in claims}
+        assert feats == {"overlap_start", "overlap_end"}
+
+    def test_malformed_unmatched_close_skipped(self):
+        # Open tag without close → no span produced
+        claims = self.parser.parse("<f_snr>The SNR is 15.10 dB")
+        assert claims == []
+
+    def test_full_paragraph_round_trips_to_scorer(self):
+        """End-to-end: tagged text → parser → SFSScorer with within-tolerance GT."""
+        text = (
+            "<f_snr>The SNR is 15.10 dB</f> and "
+            "<f_srmr>the SRMR is 5.17</f>. "
+            "<f_overlap_segments>Overlap segments are present at 0.5-3.1s, 5.4-7.2s</f>."
+        )
+        claims = self.parser.parse(text)
+        scorer = SFSScorer()
+        gt = {
+            "snr": 15.0,            # within ±2 dB
+            "srmr": 5.0,            # within ±0.5
+            "overlap_segments": [(0.5, 3.1), (5.4, 7.2)],
+        }
+        result = scorer.score(claims, gt)
+        assert result["precision"] == 1.0
+        assert result["recall"] == 1.0
+
+
+class TestHybridClaimParser:
+    """Hybrid prefers tagged parsing; falls back to the legacy regex parser
+    on untagged text so old (Phase-2) outputs still score."""
+
+    def setup_method(self):
+        self.parser = HybridClaimParser()
+
+    def test_tagged_takes_precedence(self):
+        text = "<f_snr>The SNR is 15.10 dB</f>"
+        claims = self.parser.parse(text)
+        assert len(claims) == 1 and claims[0].feature == "snr"
+
+    def test_falls_back_to_regex_on_untagged(self):
+        text = "The SNR is 28 dB and the duration is 4.2 s."
+        claims = self.parser.parse(text)
+        features = {c.feature for c in claims}
+        assert "snr" in features
+        assert "duration_sec" in features

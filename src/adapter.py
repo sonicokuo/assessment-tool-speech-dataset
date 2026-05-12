@@ -20,7 +20,7 @@ AUDIO_DIM = 1024  # WavLM output dims
 # Old checkpoints (5-channel) are incompatible with this 4-channel layout; retrain after upgrading.
 OVERLAP_FEATURES = 4
 OVERLAP_DIM = 32  # output of OverlapEmbedding to learn representation
-N_AUX_FEATURES = 13  # matches src/feature_set.py::N_FEATURES; aux regression head output size
+N_AUX_FEATURES = 8  # matches src/feature_set.py::N_FEATURES; aux regression head output size
 
 
 # ── Components ──────────────────────────────────────────────
