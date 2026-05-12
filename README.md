@@ -1,6 +1,22 @@
 # assessment-tool-speech-dataset
 
-Overlap-aware speech quality assessment pipeline: extract audio features, verbalize them into natural language descriptions, and train an adapter (WavLM + FiLM conditioning) that bridges audio representations into a causal LM for generating quality descriptions.
+**AQUA-NL — Adaptive Audio Quality Assessment and Description in Natural Language.**
+Speech-quality pipeline that takes a waveform and emits a section-structured
+natural-language description with one cross-attention map per section back to
+the input spectrogram. The current architecture (EMNLP rework, Path 3):
+
+- Frozen WavLM-Large for the LM audio prefix.
+- Frozen BEATs (Microsoft, vendored under `src/beats/`) for the spec encoder
+  the section queries attend to.
+- Reliability-aware adapter (Conv8x + Mamba context + FiLM overlap gate)
+  produces the LM audio prefix.
+- SectionQueryHead: per-section dynamic queries derived from the LM's hidden
+  state at `<sec_X>` positions cross-attend to BEATs patches, producing one
+  attention map per quality dimension (and per overlap range via `<r>` markers).
+- Qwen3-1.7B-Instruct, full fine-tune, generates the section-structured text.
+
+Earlier recipes (Phase-1 single-task, Phase-2 B-full LoRA on Qwen3-8B) are
+preserved further down as legacy reference.
 
 ## Environment Setup
 
@@ -23,15 +39,17 @@ See [PSC Team Workflow](#psc-team-workflow) below for interact-node and allocati
 
 ## Pipeline
 
-Six stages end-to-end — four data-prep stages, then training and evaluation. See [Data pipeline (Bridges-2)](#data-pipeline-bridges-2), [Training](#training), and [Evaluation](#evaluation) below for exact commands.
+Seven stages for the current section-based recipe. See [EMNLP rework recipe](#emnlp-rework-recipe-current-default) below for the exact commands; earlier sections describe legacy Phase-1 / Phase-2 commands.
 
 ```
-Step 1: Feature extraction         src/feature_extractor_mix.py        →  features/{split}.csv       (includes overlap_segments from VAD on s1/s2 stems)
-Step 2: Verbalize (Ollama)         scripts/feature_verbalization.py    →  verbalized/{split}.csv
-Step 3: Concatenate + JSON         scripts/merge_verbalized_to_json.py →  descriptions.json
-Step 4: Preprocess audio (WavLM)   src/preprocess.py                   →  processed/{train,val,test}/*.pt
-Step 5: Train                      src/train.py                        →  checkpoints/{best,last}.pt  + wandb
-Step 6: Evaluate                   src/inference.py                    →  inference_{results,summary}.json + wandb test/*
+Step 1: Feature extraction         src/feature_extractor_mix.py             ->  features/{split}.csv
+Step 2: Verbalize (section tags)   scripts/feature_verbalization.py         ->  verbalized/{split}.csv
+                                       with --section-tagged for the EMNLP rework
+Step 3: Concatenate + JSON         scripts/merge_verbalized_to_json.py      ->  descriptions.json
+Step 4: Preprocess audio (WavLM)   src/preprocess.py                        ->  processed/{train,val,test}/*.pt
+Step 5: Cache BEATs patches        scripts/preprocess_beats.py              ->  beats_patches key added to each .pt
+Step 6: Train                      src/train.py --config config.psc.emnlp   ->  checkpoints/{best,last}.pt + wandb
+Step 7: Evaluate + plot            src/inference.py + plot_attention_*.py   ->  inference_results.json + attention figures
 ```
 
 Libri2Mix ships with speaker-disjoint `train-clean-100 / dev-clean / test-clean` splits, so `scripts/split_data.py` is **not** used in this workflow.
@@ -40,29 +58,53 @@ Libri2Mix ships with speaker-disjoint `train-clean-100 / dev-clean / test-clean`
 
 ```
 src/
-  feature_extractor.py      - Pyannote-based feature extractor (for cross-domain datasets without clean stems)
-  feature_extractor_mix.py  - Libri2Mix extractor; default overlap method is Silero VAD on s1/s2 stems (oracle labels)
-  preprocess.py             - WavLM features + 5-dim per-frame overlap context from the feature CSV → .pt files
-  adapter.py                - Reliability-aware adapter with FiLM conditioning + ablation variants
-  dataset.py                - Shared dataset and collate utilities
-  train.py                  - Training script (adapter + LoRA)
-  inference.py              - Generation + SFS evaluation
-  sfs.py                    - Signal Faithfulness Score metric (regex-based claim parser)
-  text_metrics.py           - BLEU-4 / ROUGE-L / BERTScore-F1 helpers (complement SFS)
+  feature_extractor.py      - Pyannote-based feature extractor (cross-domain datasets w/o clean stems)
+  feature_extractor_mix.py  - Libri2Mix extractor; default overlap method is Silero VAD on s1/s2 stems
+  preprocess.py             - WavLM features + 4-dim per-frame overlap context -> .pt files
+  adapter.py                - Reliability-aware adapter (Conv8x + Mamba + FiLM) + ablation variants
+  dataset.py                - Shared dataset and collate utilities (now also passes beats_patches)
+  train.py                  - Training loop (LoRA path + full-FT path; static + dynamic section queries)
+  inference.py              - Generation + SFS + per-section/per-range attention map capture
+  sfs.py                    - SFS metric: legacy ClaimParser + TaggedClaimParser + HybridClaimParser
+  text_metrics.py           - BLEU-4 / ROUGE-L / BERTScore-F1 helpers
+  feature_set.py            - Canonical 8 SFS-scored scalars (snr, srmr, f0_mean, f0_sd,
+                              speaking_rate, pause_count, pause_rate, overlap_ratio)
+  section_tags.py           - SoT for 6 section tags + 9 inner feature tags + <r> range markers
+                              (19 special tokens total)
+  section_query.py          - SectionQueryHead with static (lookup) and dynamic (W_q . h_t)
+                              cross-attention forward paths
+  spec_encoder.py           - SpecEncoder wrapper for BEATs (vendored) / AST (HF Hub)
+  feature_tags.py           - Compatibility shim re-exporting from section_tags.py
+  beats/                    - Vendored Microsoft BEATs encoder (BEATs.py, modules.py, backbone.py)
+
 scripts/
-  feature_verbalization.py         - LLM-based feature verbalization (Ollama/gemma4)
-  audit_verbalized_batches.py      - Scans verbalized CSVs for [ERROR] rows, gaps, tail-missing ranges
+  feature_verbalization.py         - Ollama-driven CSV -> prose. Supports --section-tagged
+                                     for the EMNLP rework section-structured prompt.
+  preprocess_beats.py              - Caches BEATs patch embeddings into each clip's .pt file.
+  plot_attention_spectrograms.py   - Renders per-clip attention overlays from inference_results.json.
+  audit_verbalized_batches.py      - Scans verbalized CSVs for [ERROR] rows, gaps, missing ranges
   merge_verbalized_to_json.py      - Concatenates verbalized CSVs across splits into descriptions.json
-  csv_to_json.py                   - Legacy single-CSV → JSON (kept for smoke tests)
+  csv_to_json.py                   - Legacy single-CSV -> JSON (kept for smoke tests)
   split_data.py                    - Speaker-disjoint train/val/test splits (unused for Libri2Mix)
+  run_pyannote_preprocessing.sh    - PSC batch script for Pyannote-on-mix preprocessing
+
 configs/
-  config.yaml               - Training configuration (toy/laptop defaults)
-  config.psc.yaml           - PSC Bridges-2 configuration (shared-storage paths + Qwen model)
+  config.yaml               - Local toy / laptop defaults
+  config.psc.yaml           - PSC Bridges-2 Phase-2 baseline (Qwen3-8B + LoRA + tagged_mode: false)
+  config.psc.emnlp.yaml     - EMNLP rework: Qwen3-1.7B full FT + sections + BEATs + dynamic queries
+
 experiments/
   Feature_Extractor_Final.ipynb    - Original feature extraction notebook
+  Feature_Extractor_MIX.ipynb      - Libri2Mix feature extraction notebook
+
 tests/
-  test_sfs.py               - Tests for SFS claim parser and scorer
-  test_text_metrics.py      - Tests for BLEU / ROUGE-L / BERTScore wrapper
+  test_sfs.py               - ClaimParser, TaggedClaimParser, HybridClaimParser, SFSScorer
+  test_feature_set.py       - 8-scalar canonical list, nums-target, scalar extraction
+  test_feature_tags.py      - Section + feature tag catalog, range markers, strip helpers
+  test_section_query.py     - SectionQueryHead (static + dynamic), BEATs integration (gated),
+                              EOS-supervision (handles pad==eos collision), range markers
+  test_compute_loss_b_full.py - B-full multi-task loss with mocked LM
+  test_text_metrics.py      - BLEU / ROUGE-L / BERTScore-F1 wrapper
 ```
 
 ## Testing
@@ -333,6 +375,181 @@ Uses whatever `lm_name` and `adapter_variant` are in `configs/config.psc.yaml`:
 ```bash
 python src/train.py --config configs/config.psc.yaml
 ```
+
+### EMNLP rework recipe (current default)
+
+This recipe trains the section-based design with BEATs cross-attention and
+Qwen3-1.7B full fine-tuning. It replaces Phase-2 as the default for new
+runs. The Phase-2 commands below remain available if you need to reproduce
+the 8B-LoRA baseline.
+
+Outputs per clip: section-structured prose + 6 section attention maps + N
+per-range attention maps for clips with multi-segment overlap.
+
+#### What's new vs Phase-2
+
+- **LM**: Qwen3-1.7B-Instruct (full FT) instead of Qwen3-8B + LoRA.
+- **New vocab**: 19 special tokens registered via `add_tokens(special_tokens=False)`
+  so they survive `decode(skip_special_tokens=True)`:
+  - 6 section opens (`<sec_noise>`, `<sec_reverb>`, `<sec_pitch>`,
+    `<sec_tempo>`, `<sec_pauses>`, `<sec_overlap>`) + shared `</sec>` close.
+  - 9 inner feature opens (`<f_snr>`, `<f_srmr>`, `<f_f0_mean>`,
+    `<f_f0_sd>`, `<f_speaking_rate>`, `<f_pause_count>`, `<f_pause_rate>`,
+    `<f_overlap_ratio>`, `<f_overlap_segments>`) + shared `</f>` close.
+  - Range marker pair (`<r>`, `</r>`) wraps each value inside
+    multi-value spans like `<f_overlap_segments>` so multi-overlap clips
+    get one attention map per range.
+- **New encoder**: BEATs (Microsoft, vendored) computes a 2D patch grid
+  per clip (T_p time bins x F_p=8 freq bins). Cached into the per-clip
+  `.pt` files via `scripts/preprocess_beats.py` so training reads
+  patches directly from disk.
+- **New module**: `SectionQueryHead` cross-attends section / range queries
+  to BEATs patches. Static mode uses learnable per-section queries; dynamic
+  mode (default) projects the LM's hidden state at each `<sec_X>` / `<r>`
+  position through `W_q` so the query reflects the LM's context.
+- **EOS supervision fix**: every target now ends with `eos_token_id` and
+  label masking uses `attention_mask` (not `pad_id == ...`) so EOS is in
+  the loss even when `pad_token == eos_token`. The model learns to stop
+  cleanly; `max_new_tokens` no longer triggers degenerate tail output.
+- **Aux head**: 8 supervised scalars (matches the 8 SFS-scored inner
+  features); same per-feature MSE normalisation as Phase-2.
+
+#### One-time preprocessing on PSC (after the legacy steps 1–4)
+
+Once the existing `processed_pyannote/{train,val,test}/*.pt` files are in
+place, cache BEATs patches into them. This adds a `beats_patches` key per
+clip (~200 KB extra per `.pt`):
+
+```bash
+export SHARED=/ocean/projects/cis260125p/shared
+
+for split in train val test; do
+  python scripts/preprocess_beats.py \
+    --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/$(echo $split | sed 's/val/dev/; s/^train$/train-100/')/mix_clean \
+    --pt_dir    $SHARED/data/processed_pyannote/$split \
+    --checkpoint_name BEATs_iter3_plus_AS2M.pt
+done
+```
+
+Roughly 3-4 hours on a single A100 for the 13 K train split. Idempotent:
+clips that already have `beats_patches` are skipped unless you pass
+`--overwrite`.
+
+Then re-verbalize with section structure to produce a tagged
+`descriptions_tagged.json`:
+
+```bash
+for split in train-100 dev test; do
+  python scripts/feature_verbalization.py --section-tagged \
+    --input  $SHARED/data/features_pyannote/${split}.csv \
+    --output $SHARED/data/verbalized_sections/${split}.csv
+done
+
+python scripts/merge_verbalized_to_json.py \
+  --verbalized_dir $SHARED/data/verbalized_sections \
+  --output         $SHARED/data/descriptions_tagged.json
+```
+
+#### Training
+
+```bash
+python src/train.py --config configs/config.psc.emnlp.yaml
+```
+
+Important config keys (all in `configs/config.psc.emnlp.yaml`):
+
+- `lm_name: "Qwen/Qwen3-1.7B-Instruct"`, `lora_rank: 0` (full FT)
+- `use_sections: true`, `section_query_mode: "dynamic"`
+- `spec_encoder_name: "beats"`, `spec_checkpoint_name: "BEATs_iter3_plus_AS2M.pt"`
+- `tagged_mode: true` (registers the 19 special tokens at training start)
+- `beats_cached: true` (reads pre-cached BEATs patches from each `.pt`)
+- `descriptions_path: $SHARED/data/descriptions_tagged.json`
+- `gradient_checkpointing: true` (required at full FT for the memory budget)
+
+The training loop:
+1. Reads `audio_features (T, 1024)` (WavLM), `overlap_info (T, 4)`
+   (Pyannote-derived), and `beats_patches (P, 768)` (cached) from each clip.
+2. Adapter (Conv8x + Mamba + FiLM) produces the LM audio prefix.
+3. SectionQueryHead's `W_k`, `W_v` project BEATs patches to K, V once
+   per batch.
+4. In dynamic mode: a pass-1 LM forward extracts hidden states at every
+   `<sec_X>` and `<r>` position in the target. Each `h_t` is projected to
+   a query `q_t = W_q . h_t`, attends over (K, V), produces `e_t`. The
+   per-position `e_t` is added residually to `target_embeds` at the same
+   position. A pass-2 LM forward computes the CE loss with `e_t` in
+   place. Gradient flows back through `e_t` into `W_q` and onward into the
+   pass-1 LM weights — the LM learns to make `h_t` at section opens
+   query-friendly.
+5. Loss = `lambda_prose * lm_ce_prose + lambda_nums * lm_ce_nums + lambda_mse * masked_mse`
+   (same B-full structure as Phase-2; aux head pools the audio prefix to
+   8 scalar predictions).
+6. EOS is appended to every target before tokenization; label masking
+   uses `attention_mask`, so genuine end-of-target EOS is in the loss.
+
+H100-80 fits `batch_size: 6` comfortably with dynamic mode. On smaller
+GPUs, set `section_query_mode: "static"` to drop to one LM forward per
+step (peak memory ~33 GB).
+
+#### Inference + per-section attention figures
+
+```bash
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/qwen3_17b_full_ft_tagged_v1/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+`inference_results.json` per clip now contains:
+
+- `generated` — the section-structured prose
+- `claims` — parsed `(feature, value)` pairs (from `TaggedClaimParser`)
+- `sfs_precision / sfs_recall / sfs_f1` and `per_feature` breakdown
+- `attention_maps` — dict of `(P,)` float lists. Keys:
+  - `noise, reverb, pitch, tempo, pauses, overlap` (one per section)
+  - `overlap@<start>-<end>s` for each emitted `<r>` range
+    (e.g., `overlap@0.5-1.0s`)
+
+Render attention overlays on log-mel spectrograms for the paper:
+
+```bash
+python scripts/plot_attention_spectrograms.py \
+  --results   $SHARED/checkpoints/qwen3_17b_full_ft_tagged_v1/inference_results.json \
+  --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/test/mix_clean \
+  --output    docs/report/figures/attention_overlays \
+  --limit     10 \
+  --format    pdf
+```
+
+Each output figure is a multi-panel PDF: one row per section + one row per
+emitted `<r>` range, log-mel spec in greyscale with the section's attention
+map overlaid as a hot heatmap. The `PatchGrid.reshape_attention` helper
+reshapes the saved flat vector back to the 2D (T_p, F_p) grid before
+overlaying.
+
+#### Tests
+
+```bash
+conda run -n idl python -m pytest tests/                # 113 unit tests
+RUN_BEATS_TEST=1 conda run -n idl python -m pytest \
+  tests/test_section_query.py::TestBEATsIntegration -v   # 2 integration tests
+                                                         # (downloads ~370 MB ckpt)
+```
+
+The integration tests load the actual Microsoft BEATs checkpoint and run a
+forward + SectionQueryHead pass to confirm the full path works
+end-to-end.
+
+#### Legacy compatibility
+
+- `configs/config.psc.yaml` still has `tagged_mode: false` and `lora_rank: 16`
+  so Phase-2 / Phase-1 reruns of the report's checkpoints reproduce
+  unchanged. Switching between recipes is purely a config swap.
+- The `feature_tags.py` module remains as a compatibility shim that
+  re-exports the renamed symbols from `section_tags.py`, so any external
+  scripts that imported the old names keep working.
+- The legacy `ClaimParser` regex path in `src/sfs.py` is untouched; the
+  new `HybridClaimParser` (used at inference) prefers tagged spans and
+  falls back to the regex parser for older untagged checkpoints.
 
 ### Phase-2 training recipe (B-full + Pyannote inputs, default as of 2026-04-26)
 
