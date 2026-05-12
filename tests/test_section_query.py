@@ -164,6 +164,105 @@ class TestSectionQueryHeadDynamic:
         assert self.head.queries.grad is None
 
 
+class TestEosSupervision:
+    """Verify training targets end with EOS AND that EOS appears in the loss
+    (not masked to -100) — even when pad_token == eos_token, which is the
+    common fallback for Qwen-style tokenizers."""
+
+    def _make_tokenizer(self, pad_equals_eos: bool):
+        """A minimal stand-in tokenizer that mimics HF's __call__ contract."""
+        class TinyTok:
+            def __init__(self, pad_equals_eos: bool):
+                self.eos_token_id = 99
+                self.pad_token_id = 99 if pad_equals_eos else 100
+                self.pad_token = "<pad>"
+                self.eos_token = "<eos>"
+
+            def __call__(self, text, truncation=True, max_length=None,
+                         add_special_tokens=False, return_tensors=None,
+                         padding=False):
+                # Each "word" → ord('a') + offset, e.g. "abc" → [97, 98, 99 capped].
+                # We just emit 1 id per character, capped at max_length.
+                if isinstance(text, str):
+                    ids = [ord(c) % 50 + 1 for c in text][: max_length or 10**9]
+                    from types import SimpleNamespace
+                    return SimpleNamespace(input_ids=ids)
+                raise NotImplementedError
+
+        return TinyTok(pad_equals_eos)
+
+    def _expected_last_content_idx(self, ids_row, attn_row):
+        # Find the last position with attention_mask=1 (i.e. EOS slot).
+        nonzero = (attn_row == 1).nonzero(as_tuple=True)[0]
+        return nonzero[-1].item() if nonzero.numel() else -1
+
+    def test_eos_appended_when_pad_distinct_from_eos(self):
+        from train import _tokenize_with_eos
+        tok = self._make_tokenizer(pad_equals_eos=False)
+        ids, attn = _tokenize_with_eos(tok, ["hello", "hi"], max_length=8,
+                                       device=torch.device("cpu"))
+        for row_ids, row_attn in zip(ids, attn):
+            last = self._expected_last_content_idx(row_ids, row_attn)
+            assert last >= 0, "no content positions"
+            assert row_ids[last].item() == tok.eos_token_id, (
+                "last content position should be EOS"
+            )
+
+    def test_eos_appended_when_pad_equals_eos(self):
+        # The collision case — most important: even when pad_id == eos_id,
+        # _tokenize_with_eos still correctly puts EOS at content end and the
+        # attention_mask marks it as content.
+        from train import _tokenize_with_eos
+        tok = self._make_tokenizer(pad_equals_eos=True)
+        ids, attn = _tokenize_with_eos(tok, ["abc", "hello world"],
+                                       max_length=20, device=torch.device("cpu"))
+        for row_ids, row_attn in zip(ids, attn):
+            last = self._expected_last_content_idx(row_ids, row_attn)
+            assert row_ids[last].item() == tok.eos_token_id
+            # And it's marked as content (1) in attn, so label masking
+            # (-100 where attn==0) will KEEP this EOS in the loss.
+            assert row_attn[last].item() == 1
+
+    def test_label_masking_keeps_eos_under_pad_equals_eos(self):
+        # Simulate the train.py label construction. Both pad and eos = 99.
+        # After tokenize-with-eos, ids = [...content..., 99, 99 (pad), 99 (pad)]
+        # but attn = [..., 1, 0, 0]. Label masking by attn=0 keeps the FIRST 99
+        # (the genuine EOS) in the loss, masks the pad 99s out.
+        from train import _tokenize_with_eos
+        tok = self._make_tokenizer(pad_equals_eos=True)
+        ids, attn = _tokenize_with_eos(tok, ["a", "ab"], max_length=10,
+                                       device=torch.device("cpu"))
+
+        labels = ids.clone()
+        labels[attn == 0] = -100
+
+        # Row 0 ("a" + EOS, padded to len 3): content = [t_a, 99]; pad = [99]
+        # Labels: [t_a, 99, -100]
+        assert labels[0, 0].item() != -100
+        assert labels[0, 1].item() == 99, "EOS at content end must NOT be masked"
+        assert labels[0, 2].item() == -100, "pad past content must be masked"
+
+        # Row 1 ("ab" + EOS, no padding needed): content = [t_a, t_b, 99]
+        # Labels: [t_a, t_b, 99]
+        assert (labels[1] != -100).all(), "row 1 has no pad and shouldn't be masked anywhere"
+        assert labels[1, -1].item() == 99, "row 1 must end with EOS"
+
+    def test_eos_survives_truncation(self):
+        # When the natural target is too long, _tokenize_with_eos truncates
+        # to max_length-1, then appends EOS, so the final length is exactly
+        # max_length and EOS is always present.
+        from train import _tokenize_with_eos
+        tok = self._make_tokenizer(pad_equals_eos=False)
+        long_text = "a" * 200
+        ids, attn = _tokenize_with_eos(tok, [long_text], max_length=20,
+                                       device=torch.device("cpu"))
+        assert ids.shape[1] == 20
+        assert ids[0, -1].item() == tok.eos_token_id, (
+            "even after truncation, EOS must be the last token"
+        )
+        assert attn[0, -1].item() == 1
+
+
 class TestRangeMarkers:
     """Verify <r>...</r> markers integrate cleanly with the rest of the pipeline.
 

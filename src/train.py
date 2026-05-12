@@ -82,6 +82,78 @@ def _register_feature_tags(tokenizer: PreTrainedTokenizerBase, llm: nn.Module) -
 
 
 # ── Loss ──────────────────────────────────────────────
+def _tokenize_with_eos(
+    tokenizer: PreTrainedTokenizerBase,
+    target_text: list[str],
+    max_length: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tokenize each target, append the EOS token, pad to batch-max.
+
+    Two bugs in the original tokenize-then-pad path made the model never learn
+    to stop generating:
+
+      1. `tokenizer(text)` does not append EOS by default — so the training
+         target ended with whatever the last natural-language token was, never
+         with the EOS token. The LM never saw EOS at a "this is the end"
+         position and at inference would keep generating until max_new_tokens.
+
+      2. `train.py` sets `pad_token = eos_token` when the tokenizer has no
+         pad_token (common with Qwen). The original label-masking step
+         `labels[labels == pad_token_id] = -100` then masks EVERY eos_token
+         out of the loss — even the genuine end-of-target EOS. So even if (1)
+         were fixed, EOS prediction would never be supervised.
+
+    Fix: tokenize each row individually, truncate to max_length - 1 (room for
+    EOS), append eos_token_id, pad with pad_token_id, and return both
+    target_ids and attention_mask. The caller uses attention_mask (not
+    pad_id == ...) to mask the loss — so a genuine EOS at content end is
+    supervised regardless of whether pad_id == eos_id.
+
+    Returns:
+        target_ids: (B, L) long. Each row is the tokenized target + one EOS,
+                    padded with pad_token_id up to L (the batch maximum).
+        attn_mask:  (B, L) long. 1 at content positions (including EOS),
+                    0 at padding positions.
+    """
+    eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        raise RuntimeError(
+            "tokenizer.eos_token_id is None; can't terminate generation. "
+            "Set tokenizer.eos_token before calling _tokenize_with_eos."
+        )
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        # Fall back to eos_id but we still need to distinguish content from
+        # padding for label masking — attention_mask handles that downstream.
+        pad_id = eos_id
+
+    truncated_max = max(1, max_length - 1)
+    ids_per_row: list[list[int]] = []
+    for t in target_text:
+        enc = tokenizer(
+            t,
+            truncation=True,
+            max_length=truncated_max,
+            add_special_tokens=False,
+        )
+        ids = list(enc.input_ids)
+        ids.append(eos_id)
+        ids_per_row.append(ids)
+
+    lengths = [len(ids) for ids in ids_per_row]
+    L = max(lengths) if lengths else 1
+    B = len(ids_per_row)
+
+    target_ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
+    attn_mask = torch.zeros((B, L), dtype=torch.long, device=device)
+    for i, ids in enumerate(ids_per_row):
+        target_ids[i, : lengths[i]] = torch.tensor(ids, dtype=torch.long, device=device)
+        attn_mask[i, : lengths[i]] = 1
+
+    return target_ids, attn_mask
+
+
 def _build_section_ctx(
     section_head: "SectionQueryHead | None",
     spec_encoder: "SpecEncoder | None",
@@ -289,13 +361,7 @@ def _ce_against_target(
                         Two-pass — ~1.5× compute, ~1.5× memory. Required by the
                         professor's "LM generates a query vector" design.
     """
-    target_ids = tokenizer(
-        text=target_text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    ).input_ids.to(device)
+    target_ids, target_attn = _tokenize_with_eos(tokenizer, target_text, max_length, device)
 
     prompt_embeds = embed_layer(prompt_ids.expand(prefix_embeds.shape[0], -1))
     target_embeds = embed_layer(target_ids)
@@ -313,8 +379,13 @@ def _ce_against_target(
     N = prefix_embeds.shape[1]
     P = prompt_embeds.shape[1]
     ignore_labels = torch.full((prefix_embeds.shape[0], N + P), -100, device=device)
+    # Mask labels using attention_mask, NOT pad_token_id equality. With
+    # pad_token == eos_token (Qwen fallback in train()), id-based masking
+    # would also drop the genuine end-of-target EOS from the loss and the
+    # model would never learn to stop. attn_mask is 1 at content (incl. EOS),
+    # 0 at padding — exactly what we want.
     target_labels = target_ids.clone()
-    target_labels[target_labels == tokenizer.pad_token_id] = -100
+    target_labels[target_attn == 0] = -100
     labels = torch.cat([ignore_labels, target_labels], dim=1)
 
     outputs = llm(inputs_embeds=inputs_embeds, labels=labels)
