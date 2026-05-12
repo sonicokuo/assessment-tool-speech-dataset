@@ -184,15 +184,22 @@ def _format_value_for_tag(tag, raw, sample_rate: int = 16000) -> str | None:
 
     Handles three special cases:
     - sample_rate: constant (16000), no CSV column.
-    - overlap_segments: variable-length list, formatted "X.X-Y.Ys, ..." or None
-      when the clip has no overlap.
+    - overlap_segments: variable-length list. For the section-tagged path each
+      range is wrapped in <r>…</r> markers so the inference-time hook can fire
+      once per range and produce a per-range attention map. Strip-tags removes
+      the markers at display time so the rendered prose still reads naturally:
+          "overlap segments at 0.5-1.0s, 3.0-4.5s, and 7.0-9.0s"
     - pause_count: integer.
     """
     if tag.name == "sample_rate":
         return str(int(sample_rate))
     if tag.name == "overlap_segments":
         formatted = _parse_overlap_segments(raw or "", sample_rate=sample_rate)
-        return None if formatted == "None" else formatted
+        if formatted == "None":
+            return None
+        # Wrap each comma-separated range with <r>...</r> for per-range attention.
+        ranges = [r.strip() for r in formatted.split(",") if r.strip()]
+        return ", ".join(f"<r>{r}</r>" for r in ranges)
     if not _present(raw):
         return None
     fmt = _TAG_FORMAT.get(tag.name, "{}")
@@ -331,6 +338,10 @@ def generate_quality_description_tagged(row: dict) -> str:
 
     bullet_block = "\n".join(f"- {s}" for s in spans)
 
+    # Note about range markers (<r>...</r>) — these appear inside <f_overlap_segments>
+    # spans, one wrapper per time range. They look unusual but the LLM is told to
+    # reproduce them verbatim like all the other tags; they trigger per-range
+    # attention maps at inference time and get stripped before display.
     prompt = f"""You are writing a quality description of a speech recording. You are given a list of pre-formatted claims, each wrapped in tags. Your job is to assemble them into a coherent paragraph.
 
 HARD RULES (non-negotiable):

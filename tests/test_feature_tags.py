@@ -22,13 +22,16 @@ from feature_tags import (
 
 class TestModuleConstants:
     def test_special_tokens_include_features_plus_sections_plus_shared_closes(self):
-        # SPECIAL_TOKENS now covers both layers: section opens + </sec> + feature opens + </f>.
-        # Catalog: 9 feature opens, 6 section opens, 2 shared closes = 17.
+        # SPECIAL_TOKENS covers four kinds:
+        #   - section opens (6) + </sec> close
+        #   - feature opens (9) + </f> close
+        #   - range marker open + close (<r>, </r>) used inside multi-value spans
+        # Catalog total: 6 + 1 + 9 + 1 + 2 = 19.
         from section_tags import SECTION_TAGS
         n_sections = len(SECTION_TAGS)
         n_features = len(FEATURE_TAGS)
-        # 2 shared closes (</sec>, </f>)
-        assert len(SPECIAL_TOKENS) == n_sections + n_features + 2
+        n_range_markers = 2
+        assert len(SPECIAL_TOKENS) == n_sections + n_features + 2 + n_range_markers
         assert CLOSE_TAG in SPECIAL_TOKENS
 
     def test_catalog_has_9_tags(self):

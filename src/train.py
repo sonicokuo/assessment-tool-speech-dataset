@@ -30,6 +30,7 @@ from section_tags import (
     SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
     SECTION_TAGS,
     N_SECTIONS,
+    RANGE_OPEN_TAG,
     section_open_token_ids,
 )
 from section_query import SectionQueryHead
@@ -88,6 +89,7 @@ def _build_section_ctx(
     batch: dict,
     device: torch.device,
     mode: str = "static",
+    range_open_id: int | None = None,
 ) -> dict | None:
     """Compute the per-batch section context: K/V (+ e_all in static mode).
 
@@ -120,11 +122,15 @@ def _build_section_ctx(
 
     if mode == "dynamic":
         # Defer e_t — needs pass-1 hidden states which _ce_against_target produces.
+        # range_open_id (optional): when set, _inject_section_summaries_dynamic
+        # also fires the cross-attention query at every <r> open in the target,
+        # so multi-value spans get per-range training signal too.
         return {
             "mode": "dynamic",
             "head": section_head,
             "K": K, "V": V,
             "section_id_to_idx": section_id_to_idx,
+            "range_open_id": range_open_id,
         }
 
     # Static mode: compute per-section summaries up front.
@@ -163,14 +169,19 @@ def _inject_section_summaries_dynamic(
     K, V = section_ctx["K"], section_ctx["V"]
     id_to_idx = section_ctx["section_id_to_idx"]
 
-    section_open_ids_t = torch.tensor(
-        list(id_to_idx.keys()), device=target_ids.device, dtype=target_ids.dtype,
-    )
+    # Build the full set of "query positions": every <sec_X> open + every <r>
+    # open. Both kinds produce dynamic queries through the same forward path;
+    # the LM learns to make all of them query-friendly hidden states.
+    open_ids: list[int] = list(id_to_idx.keys())
+    range_open_id = section_ctx.get("range_open_id")
+    if range_open_id is not None:
+        open_ids.append(range_open_id)
+    open_ids_t = torch.tensor(open_ids, device=target_ids.device, dtype=target_ids.dtype)
 
-    # Locate (b, l) coordinates of every <sec_X> open in the target.
-    is_section = (target_ids.unsqueeze(-1) == section_open_ids_t).any(-1)   # (B, L) bool
+    # Locate (b, l) coordinates of every query-firing open in the target.
+    is_section = (target_ids.unsqueeze(-1) == open_ids_t).any(-1)           # (B, L) bool
     if not is_section.any():
-        # No sections in this batch → nothing to inject. Skip the pass-1 forward.
+        # Nothing to inject. Skip the pass-1 forward.
         return target_embeds
 
     bl = is_section.nonzero(as_tuple=False)                                  # (N, 2)
@@ -528,8 +539,12 @@ def train(config: dict) -> None:
         sq_mode = config.get("section_query_mode", "static").lower()
         if sq_mode not in {"static", "dynamic"}:
             raise ValueError(f"section_query_mode must be 'static' or 'dynamic', got {sq_mode!r}")
+        # <r> open token id — used by dynamic-mode injection so the per-range
+        # queries inside multi-value spans also get training signal.
+        range_open_id_train = tokenizer.convert_tokens_to_ids(RANGE_OPEN_TAG)
         print(f"[sections] {N_SECTIONS} sections registered; "
-              f"query_mode={sq_mode}; ids {list(section_id_to_idx.keys())}")
+              f"query_mode={sq_mode}; ids {list(section_id_to_idx.keys())}; "
+              f"range_open_id={range_open_id_train}")
 
     # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
     # after wandb.init() below. Helps compare adapter vs LoRA/full-FT footprint across runs.
@@ -735,7 +750,8 @@ def train(config: dict) -> None:
 
         for batch_idx, batch in enumerate(train_loader):
             section_ctx = _build_section_ctx(
-                section_head, spec_encoder, section_id_to_idx, batch, device, mode=sq_mode,
+                section_head, spec_encoder, section_id_to_idx, batch, device,
+                mode=sq_mode, range_open_id=range_open_id_train,
             ) if section_head is not None else None
 
             loss, loss_metrics = compute_loss(

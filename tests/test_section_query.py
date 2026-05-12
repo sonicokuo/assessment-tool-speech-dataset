@@ -164,6 +164,73 @@ class TestSectionQueryHeadDynamic:
         assert self.head.queries.grad is None
 
 
+class TestRangeMarkers:
+    """Verify <r>...</r> markers integrate cleanly with the rest of the pipeline.
+
+    The markers are added inside <f_overlap_segments> spans so multi-range
+    overlap clips get one attention map per range while keeping the visible
+    prose clean (strip_all_tags removes them).
+    """
+
+    def test_special_tokens_includes_range_markers(self):
+        from section_tags import RANGE_OPEN_TAG, RANGE_CLOSE_TAG, SPECIAL_TOKENS
+        assert RANGE_OPEN_TAG in SPECIAL_TOKENS
+        assert RANGE_CLOSE_TAG in SPECIAL_TOKENS
+
+    def test_strip_removes_range_markers(self):
+        from section_tags import strip_all_tags
+        text = (
+            "<sec_overlap><f_overlap_segments>overlap at "
+            "<r>0.5-1.0s</r>, <r>3.0-4.5s</r></f></sec>"
+        )
+        assert strip_all_tags(text) == "overlap at 0.5-1.0s, 3.0-4.5s"
+
+    def test_sfs_parser_handles_range_markers_transparently(self):
+        # The TaggedClaimParser regex doesn't care about <r>...</r> wrappers
+        # because extract_overlap_segments scans the whole feature-span body.
+        from sfs import TaggedClaimParser
+        text = (
+            "<f_overlap_segments>overlap at <r>0.5-1.0s</r>, "
+            "<r>3.0-4.5s</r>, <r>7.0-9.0s</r></f>"
+        )
+        claims = TaggedClaimParser().parse(text)
+        starts = [c.value for c in claims if c.feature == "overlap_start"]
+        ends = [c.value for c in claims if c.feature == "overlap_end"]
+        assert starts == [0.5, 3.0, 7.0]
+        assert ends == [1.0, 4.5, 9.0]
+
+    def test_range_attention_key_from_body(self):
+        # The inference-time helper that maps a parsed <r> body to its
+        # attention-map key.
+        from inference import _range_attention_key
+        assert _range_attention_key("0.5-1.0s") == "overlap@0.5-1.0s"
+        assert _range_attention_key("0.5 to 1.0 s") == "overlap@0.5-1.0s"
+        # Unparseable body → fallback key with truncated raw text
+        assert _range_attention_key("around half a second").startswith("overlap@malformed:")
+
+    def test_verbalizer_wraps_ranges_in_marker_tags(self):
+        # Section body from the verbalizer should contain <r>...</r> per range,
+        # not the legacy comma-joined single-string value.
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+        from feature_verbalization import _build_section_bodies
+        row = {
+            "duration_sec": "10.0", "snr_db": "12.5", "srmr": "4.8",
+            "f0_mean_hz": "188.0", "f0_sd_hz": "42.0",
+            "praat_speaking_rate_syl_sec": "4.9",
+            "praat_pause_count": "4", "praat_pause_rate_per_min": "24.0",
+            "overlap_ratio": "0.65",
+            "overlap_segments": "8000-16000;48000-72000;112000-144000",
+        }
+        body = _build_section_bodies(row)["overlap"]
+        # Three ranges, each in its own <r>...</r>
+        assert body.count("<r>") == 3
+        assert body.count("</r>") == 3
+        assert "<r>0.5-1.0s</r>" in body
+        assert "<r>3.0-4.5s</r>" in body
+        assert "<r>7.0-9.0s</r>" in body
+
+
 class TestDynamicInjectionHelper:
     """End-to-end test of train.py::_inject_section_summaries_dynamic with a mock LM."""
 

@@ -32,6 +32,8 @@ from section_tags import (
     SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
     SECTION_TAGS,
     N_SECTIONS,
+    RANGE_OPEN_TAG,
+    RANGE_CLOSE_TAG,
     section_open_token_ids,
 )
 from section_query import SectionQueryHead
@@ -112,10 +114,21 @@ def generate(
     past_key_values = None
     pending_injection: torch.Tensor | None = None   # set after a section-open is emitted
 
-    # Whether to ask the LM to return hidden states. Only the dynamic section
-    # path needs them; turning the flag off when not needed avoids the extra
-    # memory copy.
+    # Whether to ask the LM to return hidden states. Both the dynamic section
+    # path and any <r>-marker firing need them; turning the flag off when not
+    # needed avoids the extra memory copy.
     needs_hidden = section_ctx is not None and section_ctx.get("mode") == "dynamic"
+
+    # Token ids for range markers (<r>, </r>). Stored on the ctx so generate()
+    # doesn't have to do tokenizer lookups per step.
+    range_open_id = section_ctx.get("range_open_id") if section_ctx else None
+    range_close_id = section_ctx.get("range_close_id") if section_ctx else None
+
+    # State machine for the in-flight <r>...</r> span. While open we collect
+    # body token ids; at </r> we decode, parse the value, and key the saved
+    # attention map by that value (e.g. "overlap@0.5-1.0s").
+    range_pending_alpha: torch.Tensor | None = None
+    range_body_ids: list[int] = []
 
     # First forward: process prefix + prompt
     outputs = llm(inputs_embeds=inputs_embeds, use_cache=True, output_hidden_states=needs_hidden)
@@ -124,11 +137,12 @@ def generate(
     token_id = next_token_id.item()
     generated_ids.append(token_id)
 
-    if section_ctx is not None and token_id in section_ctx["section_id_to_idx"]:
-        # h_t is the last hidden state at the position that PRODUCED this token —
-        # i.e., the LM's prediction state. That's the natural query source.
-        h_t = outputs.hidden_states[-1][:, -1, :] if needs_hidden else None
-        pending_injection = _section_hook(token_id, section_ctx, attention_maps, h_t=h_t)
+    pending_injection, range_pending_alpha, range_body_ids = _maybe_fire_hooks(
+        token_id, outputs, needs_hidden, section_ctx,
+        range_open_id, range_close_id,
+        range_pending_alpha, range_body_ids,
+        attention_maps, tokenizer,
+    )
 
     # Subsequent: one token at a time
     for _ in range(max_new_tokens - 1):
@@ -155,12 +169,113 @@ def generate(
         if token_id == tokenizer.eos_token_id:
             break
 
-        if section_ctx is not None and token_id in section_ctx["section_id_to_idx"]:
-            h_t = outputs.hidden_states[-1][:, -1, :] if needs_hidden else None
-            pending_injection = _section_hook(token_id, section_ctx, attention_maps, h_t=h_t)
+        # Accumulate body tokens while inside an <r>...</r> span.
+        if range_pending_alpha is not None and token_id != range_close_id:
+            range_body_ids.append(token_id)
+
+        pending, range_pending_alpha, range_body_ids = _maybe_fire_hooks(
+            token_id, outputs, needs_hidden, section_ctx,
+            range_open_id, range_close_id,
+            range_pending_alpha, range_body_ids,
+            attention_maps, tokenizer,
+        )
+        if pending is not None:
+            pending_injection = pending
 
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     return text, attention_maps
+
+
+def _maybe_fire_hooks(
+    token_id: int,
+    outputs,
+    needs_hidden: bool,
+    section_ctx: dict | None,
+    range_open_id: int | None,
+    range_close_id: int | None,
+    range_pending_alpha: torch.Tensor | None,
+    range_body_ids: list[int],
+    attention_maps: dict,
+    tokenizer,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, list[int]]:
+    """Dispatch section-open / range-open / range-close events.
+
+    Returns:
+        pending_injection: e_t (1, 1, d_lm) to add to the LM's next input
+                           embedding, or None.
+        range_pending_alpha: the in-flight <r>...</r> attention map, or None
+                             if no range is currently open.
+        range_body_ids: token ids collected so far inside the open range.
+    """
+    if section_ctx is None:
+        return None, range_pending_alpha, range_body_ids
+
+    pending_injection: torch.Tensor | None = None
+
+    # <sec_X> open — fire the section query hook.
+    if token_id in section_ctx["section_id_to_idx"]:
+        h_t = outputs.hidden_states[-1][:, -1, :] if needs_hidden else None
+        pending_injection = _section_hook(token_id, section_ctx, attention_maps, h_t=h_t)
+
+    # <r> open — fire the per-range query hook. Reuses dynamic-mode forward;
+    # body tokens accumulate via the generate-loop caller until </r>.
+    elif range_open_id is not None and token_id == range_open_id:
+        h_t = outputs.hidden_states[-1][:, -1, :] if needs_hidden else None
+        e_t, alpha = _range_hook(section_ctx, h_t)
+        pending_injection = e_t.unsqueeze(1) if e_t is not None else None
+        range_pending_alpha = alpha
+        range_body_ids = []                                    # reset buffer
+
+    # </r> close — finalise the in-flight range: parse its body, key the
+    # attention map by the parsed value (e.g. "overlap@0.5-1.0s").
+    elif range_close_id is not None and token_id == range_close_id and range_pending_alpha is not None:
+        body = tokenizer.decode(range_body_ids, skip_special_tokens=True).strip()
+        key = _range_attention_key(body)
+        # If the key collides with a prior occurrence, suffix with a counter.
+        final_key = key
+        suffix = 2
+        while final_key in attention_maps:
+            final_key = f"{key}#{suffix}"
+            suffix += 1
+        attention_maps[final_key] = range_pending_alpha.detach().squeeze(0).cpu()
+        range_pending_alpha = None
+        range_body_ids = []
+
+    return pending_injection, range_pending_alpha, range_body_ids
+
+
+def _range_hook(
+    section_ctx: dict,
+    h_t: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Run the per-range cross-attention.
+
+    Returns (e_t, alpha) where e_t is (1, d_lm) to be injected at the next
+    position and alpha is (1, P) for the saved attention map. Static mode
+    has no meaningful per-range query, so this returns (None, None) there —
+    range markers are a dynamic-mode-only feature.
+    """
+    if section_ctx.get("mode") != "dynamic" or h_t is None:
+        return None, None
+    head = section_ctx["head"]
+    K, V = section_ctx["K"], section_ctx["V"]
+    return head.forward_dynamic(h_t, K, V)
+
+
+def _range_attention_key(body: str) -> str:
+    """Key for an attention map saved at </r>, based on the parsed range body.
+
+    Examples:
+        "0.5-1.0s"          → "overlap@0.5-1.0s"
+        "0.5 to 1.0 s"      → "overlap@0.5-1.0s"
+        (unparseable body)  → "overlap@malformed:<raw text>"
+    """
+    from section_tags import extract_overlap_segments
+    ranges = extract_overlap_segments(body)
+    if ranges:
+        s, e = ranges[0]
+        return f"overlap@{s}-{e}s"
+    return f"overlap@malformed:{body[:24]}"
 
 
 def _section_hook(
@@ -425,6 +540,10 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
                 "K": K, "V": V,
                 "section_id_to_idx": section_id_to_idx,
                 "id_to_section_name": id_to_section_name,
+                # <r>...</r> sub-spans inside <f_overlap_segments> produce
+                # per-range attention maps when sq_mode == "dynamic".
+                "range_open_id": tokenizer.convert_tokens_to_ids(RANGE_OPEN_TAG),
+                "range_close_id": tokenizer.convert_tokens_to_ids(RANGE_CLOSE_TAG),
             }
 
         generated, attention_maps = generate(

@@ -206,6 +206,17 @@ FEATURE_BY_TOKEN: dict[str, FeatureTag] = {f.tag: f for f in FEATURE_TAGS}
 N_FEATURE_TAGS: int = len(FEATURE_TAGS)  # 9
 
 
+# ── Range marker tokens ─────────────────────────────────────────────────────
+# Inside multi-value spans (currently only <f_overlap_segments>) each value is
+# wrapped in <r>…</r>. This lets the inference-time section-query hook fire
+# once per value while keeping the parent span's natural-language flow:
+#     "overlap segments at <r>0.5-1.0s</r>, <r>3.0-4.5s</r>, and <r>7.0-9.0s</r>"
+# These markers are stripped at display time (strip_all_tags below) so the
+# rendered prose reads as plain comma list.
+RANGE_OPEN_TAG: str = "<r>"
+RANGE_CLOSE_TAG: str = "</r>"
+
+
 # ── Vocabulary registration ──────────────────────────────────────────────────
 # All the tokens we add via tokenizer.add_tokens(..., special_tokens=False).
 # `special_tokens=False` is deliberate: we want skip_special_tokens=True to KEEP
@@ -217,8 +228,9 @@ SPECIAL_TOKENS: list[str] = (
     + [SECTION_CLOSE_TAG]
     + [f.tag for f in FEATURE_TAGS]
     + [FEATURE_CLOSE_TAG]
+    + [RANGE_OPEN_TAG, RANGE_CLOSE_TAG]
 )
-# 6 + 1 + 9 + 1 = 17 new tokens
+# 6 + 1 + 9 + 1 + 2 = 19 new tokens
 
 
 # ── Section parsing ──────────────────────────────────────────────────────────
