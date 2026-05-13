@@ -463,6 +463,10 @@ def main():
                         help="Emit section-structured tagged prose: each quality dimension wrapped in "
                              "`<sec_X>…</sec>` with inner `<f_*>…</f>` claims (EMNLP rework Path 3). "
                              "Overrides --tagged when both are set.")
+    parser.add_argument("--resume", action="store_true",
+                        help="If the output CSV already exists, read it, figure out which filenames "
+                             "are already done, and skip those input rows. Long verbalization runs "
+                             "(13k+ clips, hours of gemma4 time) should always use this for crash safety.")
     args = parser.parse_args()
 
     mode = ("section-tagged (EMNLP rework Path 3)" if args.section_tagged
@@ -485,8 +489,29 @@ def main():
     rows = rows[args.offset:]
     if args.limit:
         rows = rows[:args.limit]
+
+    # Resume support: when the output CSV already exists, read it, build the
+    # set of already-processed filenames, and skip those input rows. Costs one
+    # extra pass over the existing output (cheap) and saves potentially hours
+    # of gemma4 time on a relaunched run.
+    already_done: set[str] = set()
+    append_mode = False
+    if args.resume and os.path.exists(args.output):
+        try:
+            with open(args.output, "r", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    name = r.get("filename", "").strip()
+                    if name:
+                        already_done.add(name)
+            if already_done:
+                append_mode = True
+                print(f"  Resume: found {len(already_done)} already-done rows in {args.output}")
+        except Exception as e:
+            print(f"  Resume: could not parse {args.output} ({e}); starting fresh.")
+            already_done = set()
+            append_mode = False
+
     total = len(rows)
-    results = []
 
     if args.section_tagged:
         generate_fn = generate_quality_description_sectioned
@@ -495,32 +520,60 @@ def main():
     else:
         generate_fn = generate_quality_description
 
-    for i, row in enumerate(rows):
-        fname = row.get("filename", "?")
-        print(f"[{i+1}/{total}] {fname} ... ", end="", flush=True)
+    # Determine the fieldnames that will appear in the output. The two columns
+    # we add (feature_summary, quality_description) may not be in the input.
+    if not rows:
+        print("  No input rows; nothing to do.")
+        return
+    fieldnames = list(rows[0].keys())
+    if "feature_summary" not in fieldnames:
+        fieldnames.append("feature_summary")
+    if "quality_description" not in fieldnames:
+        fieldnames.append("quality_description")
 
-        # Section 1: formatted feature numbers
-        feature_summary = build_feature_summary(row)
+    # Open output in the right mode. append_mode skips the header line.
+    open_mode = "a" if append_mode else "w"
+    out_f = open(args.output, open_mode, newline="", encoding="utf-8")
+    writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+    if not append_mode:
+        writer.writeheader()
+        out_f.flush()
 
-        # Section 2: LLM quality description
-        quality_desc = generate_fn(row)
+    n_written = 0
+    n_skipped = 0
+    try:
+        for i, row in enumerate(rows):
+            fname = row.get("filename", "?")
+            if fname in already_done:
+                n_skipped += 1
+                if (i + 1) % 100 == 0:
+                    print(f"[{i+1}/{total}] skipped (already done): {n_skipped}", flush=True)
+                continue
 
-        row["feature_summary"] = feature_summary
-        row["quality_description"] = quality_desc
-        results.append(row)
+            print(f"[{i+1}/{total}] {fname} ... ", end="", flush=True)
 
-        # Show a snippet
-        snippet = quality_desc[:100] + "..." if len(quality_desc) > 100 else quality_desc
-        print(f"done → {snippet}")
+            # Section 1: formatted feature numbers
+            feature_summary = build_feature_summary(row)
 
-    # Save
-    if results:
-        fieldnames = list(results[0].keys())
-        with open(args.output, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
-        print(f"\n✅ Done! Saved {len(results)} rows to {args.output}")
+            # Section 2: LLM quality description
+            quality_desc = generate_fn(row)
+
+            row["feature_summary"] = feature_summary
+            row["quality_description"] = quality_desc
+
+            # Write this row immediately and flush so a crash after this line
+            # loses at most one in-flight clip.
+            writer.writerow(row)
+            out_f.flush()
+            n_written += 1
+
+            # Show a snippet
+            snippet = quality_desc[:100] + "..." if len(quality_desc) > 100 else quality_desc
+            print(f"done → {snippet}")
+    finally:
+        out_f.close()
+
+    print(f"\n✅ Done! Wrote {n_written} new rows ({n_skipped} skipped) to {args.output}")
 
 
 if __name__ == "__main__":
