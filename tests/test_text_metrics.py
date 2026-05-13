@@ -50,11 +50,21 @@ def test_unrelated():
 
 
 def test_corpus_with_real_descriptions():
-    """Use two real gemma4 descriptions as reference, one matching + one mismatching prediction."""
-    import csv, glob
+    """Use two real gemma4 descriptions as reference, one matching + one mismatching prediction.
+
+    Skipped when the local-only fixture isn't present (scratch/ is gitignored,
+    so CI / PSC checkouts don't have these CSVs).
+    """
+    import csv, glob, pytest
     samples = []
-    for path in sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "scratch",
-                                              "verb_samples", "train-100_*.csv"))):
+    paths = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "scratch",
+                                          "verb_samples", "train-100_*.csv")))
+    if not paths:
+        pytest.skip(
+            "scratch/verb_samples/train-100_*.csv not present "
+            "(scratch/ is gitignored; this test relies on local-only fixtures)."
+        )
+    for path in paths:
         with open(path) as f:
             for row in csv.DictReader(f):
                 desc = row.get("quality_description", "") or ""
@@ -64,7 +74,8 @@ def test_corpus_with_real_descriptions():
                     break
         if len(samples) >= 3:
             break
-    assert len(samples) >= 3, "need 3 real descriptions from scratch/verb_samples"
+    if len(samples) < 3:
+        pytest.skip(f"only {len(samples)} usable descriptions found in scratch/verb_samples")
 
     # Build 3 hyp/ref pairs:
     # (a) identical   (b) swap target  (c) light paraphrase via a word change
