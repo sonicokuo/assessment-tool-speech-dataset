@@ -190,6 +190,12 @@ def _build_section_ctx(
         )
 
     patches = patches.to(device).to(torch.bfloat16)
+    # (B, P_max) bool — True at padded positions. Cross-attention sets those
+    # to -inf before the softmax so attention never lands on padding. Passed
+    # through to SectionQueryHead.forward_dynamic / forward_all_sections.
+    key_padding_mask = batch.get("beats_patches_mask")
+    if key_padding_mask is not None:
+        key_padding_mask = key_padding_mask.to(device)
     K, V = section_head.precompute_kv(patches)
 
     if mode == "dynamic":
@@ -201,12 +207,13 @@ def _build_section_ctx(
             "mode": "dynamic",
             "head": section_head,
             "K": K, "V": V,
+            "key_padding_mask": key_padding_mask,
             "section_id_to_idx": section_id_to_idx,
             "range_open_id": range_open_id,
         }
 
     # Static mode: compute per-section summaries up front.
-    e_all, _alpha = section_head.forward_all_sections(K, V)
+    e_all, _alpha = section_head.forward_all_sections(K, V, key_padding_mask=key_padding_mask)
     return {
         "mode": "static",
         "e_all": e_all,
@@ -271,8 +278,14 @@ def _inject_section_summaries_dynamic(
     abs_pos = prefix_len + prompt_len + local_pos
     h_t = hidden[batch_idx, abs_pos]                                         # (N, d_lm)
 
-    # Cross-attend with per-position queries.
-    e_t, _alpha = head.forward_dynamic(h_t, K, V, batch_idx=batch_idx)       # (N, d_lm)
+    # Cross-attend with per-position queries. Pass the padding mask so the
+    # softmax over patches ignores padded BEATs slots.
+    key_padding_mask = section_ctx.get("key_padding_mask")
+    e_t, _alpha = head.forward_dynamic(
+        h_t, K, V,
+        batch_idx=batch_idx,
+        key_padding_mask=key_padding_mask,
+    )       # (N, d_lm)
 
     # Inject e_t at the corresponding (b, l) in target_embeds.
     # Build a sparse additive: scatter e_t into a (B, L, d_lm) zero tensor.

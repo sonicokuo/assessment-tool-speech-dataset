@@ -117,12 +117,23 @@ def collate_fn(batch):
         "target_text": target_text,
     }
 
-    # BEATs patches — stack if every sample has them, else skip. For now all clips
-    # in a split have the same patch count (Libri2Mix is fixed-length-ish per split,
-    # and BEATs's grid is determined by clip duration); if you train on mixed
-    # durations later, change this to pad.
+    # BEATs patches — variable patch count per clip because Libri2Mix durations
+    # vary. Zero-pad to the batch max and emit a (B, P_max) bool mask that's
+    # True at padded positions; SectionQueryHead's cross-attention uses that
+    # mask to fill those positions with -inf before the softmax, so attention
+    # never lands on padding.
     if "beats_patches" in batch[0]:
-        out["beats_patches"] = torch.stack([item["beats_patches"] for item in batch], dim=0)
+        patches_list = [item["beats_patches"] for item in batch]
+        d_patch = patches_list[0].shape[1]
+        max_len = max(p.shape[0] for p in patches_list)
+        patches_padded = torch.zeros(B, max_len, d_patch, dtype=patches_list[0].dtype)
+        patches_mask = torch.zeros(B, max_len, dtype=torch.bool)
+        for i, p in enumerate(patches_list):
+            L = p.shape[0]
+            patches_padded[i, :L] = p
+            patches_mask[i, L:] = True   # True = padded (excluded from softmax)
+        out["beats_patches"] = patches_padded
+        out["beats_patches_mask"] = patches_mask
 
     # B-full extras — present only when the dataset was constructed with features_csv.
     if "gt_scalars" in batch[0]:

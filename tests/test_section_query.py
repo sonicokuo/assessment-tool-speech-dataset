@@ -263,6 +263,86 @@ class TestEosSupervision:
         assert attn[0, -1].item() == 1
 
 
+class TestVariableLengthBatching:
+    """Libri2Mix clips have variable durations -> BEATs patch counts vary
+    per clip. collate_fn pads to the batch max and emits a mask;
+    SectionQueryHead must respect that mask so attention never lands on
+    padded positions.
+    """
+
+    def test_collate_pads_and_emits_mask(self):
+        from dataset import collate_fn
+        # Two synthetic batch items with different "patch counts"
+        a_patches = torch.randn(100, 768)
+        b_patches = torch.randn(248, 768)
+        batch = [
+            {
+                "audio_features": torch.zeros(10, 1024),
+                "overlap_info":   torch.zeros(10, 4),
+                "target_text":    "a",
+                "filename":       "a.wav",
+                "beats_patches":  a_patches,
+            },
+            {
+                "audio_features": torch.zeros(10, 1024),
+                "overlap_info":   torch.zeros(10, 4),
+                "target_text":    "b",
+                "filename":       "b.wav",
+                "beats_patches":  b_patches,
+            },
+        ]
+        out = collate_fn(batch)
+        assert out["beats_patches"].shape == (2, 248, 768)
+        assert out["beats_patches_mask"].shape == (2, 248)
+        # Row 0 has 100 real patches then 148 padded → mask True from 100 onward
+        assert (out["beats_patches_mask"][0, :100] == False).all()
+        assert (out["beats_patches_mask"][0, 100:] == True).all()
+        # Row 1 has 248 real patches → mask is all False
+        assert (out["beats_patches_mask"][1] == False).all()
+        # Padded rows in beats_patches are zero
+        assert (out["beats_patches"][0, 100:] == 0).all()
+
+    def test_attention_ignores_padded_positions(self):
+        from section_query import SectionQueryHead
+        head = SectionQueryHead(n_sections=6, d_patch=768, d_lm=2048, d_k=256, d_v=256)
+        B, P_max = 2, 100
+        patches = torch.randn(B, P_max, 768)
+        key_padding_mask = torch.zeros(B, P_max, dtype=torch.bool)
+        # First clip has 60 real patches; second has 100 real patches
+        key_padding_mask[0, 60:] = True
+        K, V = head.precompute_kv(patches)
+        # forward_all_sections returns alpha of shape (B, n_sections, P_max)
+        _, alpha = head.forward_all_sections(K, V, key_padding_mask=key_padding_mask)
+        # For row 0, attention at padded positions (60:) must be 0 after softmax
+        assert torch.allclose(alpha[0, :, 60:].sum(-1), torch.zeros(6), atol=1e-6), \
+            "attention leaked to padded positions"
+        # Row 0's attention over real positions should sum to 1
+        assert torch.allclose(alpha[0, :, :60].sum(-1), torch.ones(6), atol=1e-5)
+        # Row 1 is unmasked → full sum to 1 across all positions
+        assert torch.allclose(alpha[1].sum(-1), torch.ones(6), atol=1e-5)
+
+    def test_dynamic_attention_ignores_padded_positions(self):
+        from section_query import SectionQueryHead
+        head = SectionQueryHead(n_sections=6, d_patch=768, d_lm=2048, d_k=256, d_v=256)
+        B, P_max = 3, 80
+        patches = torch.randn(B, P_max, 768)
+        key_padding_mask = torch.zeros(B, P_max, dtype=torch.bool)
+        key_padding_mask[0, 40:] = True   # clip 0: 40 real, 40 pad
+        key_padding_mask[1, 70:] = True   # clip 1: 70 real, 10 pad
+        K, V = head.precompute_kv(patches)
+        h_t = torch.randn(5, 2048)
+        batch_idx = torch.tensor([0, 0, 1, 1, 2])
+        _, alpha = head.forward_dynamic(h_t, K, V, batch_idx=batch_idx,
+                                        key_padding_mask=key_padding_mask)
+        # Queries 0, 1 are from clip 0 → their alpha must be 0 at pad positions
+        assert torch.allclose(alpha[0, 40:].sum(), torch.tensor(0.0), atol=1e-6)
+        assert torch.allclose(alpha[1, 40:].sum(), torch.tensor(0.0), atol=1e-6)
+        # Queries 2, 3 from clip 1 → 0 at positions 70+
+        assert torch.allclose(alpha[2, 70:].sum(), torch.tensor(0.0), atol=1e-6)
+        # Each row sums to 1 over the unmasked positions
+        assert torch.allclose(alpha.sum(-1), torch.ones(5), atol=1e-5)
+
+
 class TestRangeMarkers:
     """Verify <r>...</r> markers integrate cleanly with the rest of the pipeline.
 
