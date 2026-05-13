@@ -314,7 +314,18 @@ Overlap context: {overlap_str}
         with urllib.request.urlopen(req, timeout=180) as response:
             result = json.loads(response.read().decode("utf-8"))
             text = result.get("response", "").strip()
-            return " ".join(text.split())
+            text = " ".join(text.split())
+            # Add period after every </sec> when followed by any non-whitespace content.
+            import re as _re
+            text = _re.sub(r'(</sec>)\s+(\S)', r'\1. \2', text)
+            # Capitalize the first letter after a period, skipping over any tags in between.
+            # e.g. "long. <sec_noise><f_snr>the signal..." → "long. <sec_noise><f_snr>The signal..."
+            text = _re.sub(
+                r'(\.)(\s*(?:<[^>]+>\s*)*)([a-z])',
+                lambda m: m.group(1) + m.group(2) + m.group(3).upper(),
+                text,
+            )
+            return text
     except Exception as e:
         return f"[ERROR] Ollama ({MODEL}): {e}"
 
