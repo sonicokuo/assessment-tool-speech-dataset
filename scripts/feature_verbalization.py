@@ -480,6 +480,12 @@ def main():
                         help="If the output CSV already exists, read it, figure out which filenames "
                              "are already done, and skip those input rows. Long verbalization runs "
                              "(13k+ clips, hours of gemma4 time) should always use this for crash safety.")
+    parser.add_argument("--retry-errors", action="store_true",
+                        help="With --resume: only treat SUCCESSFUL rows (no [ERROR] prefix) as done. "
+                             "Existing error rows in the output get re-attempted. The new successful "
+                             "row gets appended and the merge step (which keeps the LAST row per "
+                             "filename) overwrites the earlier error. Use this when a verbalization "
+                             "run hit a high Ollama-error rate and you want a cheap retry pass.")
     args = parser.parse_args()
 
     mode = ("section-tagged (EMNLP rework Path 3)" if args.section_tagged
@@ -507,18 +513,33 @@ def main():
     # set of already-processed filenames, and skip those input rows. Costs one
     # extra pass over the existing output (cheap) and saves potentially hours
     # of gemma4 time on a relaunched run.
+    #
+    # With --retry-errors: rows whose quality_description starts with "[ERROR]"
+    # are NOT added to the skip set, so they get re-attempted on resume. The
+    # new successful row gets appended after the original error row; the merge
+    # step keeps the later row per filename, so the error is effectively
+    # overwritten at JSON-build time.
     already_done: set[str] = set()
+    n_error_rows_kept_open = 0
     append_mode = False
     if args.resume and os.path.exists(args.output):
         try:
             with open(args.output, "r", encoding="utf-8") as f:
                 for r in csv.DictReader(f):
                     name = r.get("filename", "").strip()
-                    if name:
-                        already_done.add(name)
-            if already_done:
+                    if not name:
+                        continue
+                    desc = r.get("quality_description", "") or ""
+                    if args.retry_errors and desc.startswith("[ERROR]"):
+                        n_error_rows_kept_open += 1
+                        continue
+                    already_done.add(name)
+            if already_done or n_error_rows_kept_open:
                 append_mode = True
-                print(f"  Resume: found {len(already_done)} already-done rows in {args.output}")
+                msg = f"  Resume: found {len(already_done)} already-done rows in {args.output}"
+                if args.retry_errors:
+                    msg += f" ({n_error_rows_kept_open} error rows queued for retry)"
+                print(msg)
         except Exception as e:
             print(f"  Resume: could not parse {args.output} ({e}); starting fresh.")
             already_done = set()
