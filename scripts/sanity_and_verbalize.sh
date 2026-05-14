@@ -59,6 +59,13 @@ export PATH="$SHARED/ollama/bin:$PATH"
 export LD_LIBRARY_PATH="$SHARED/ollama/lib:${LD_LIBRARY_PATH:-}"
 export OLLAMA_MODELS="$SHARED/ollama_models"
 export OLLAMA_NUM_PARALLEL=2
+# Pin the context window. Left unset, Ollama 0.21 auto-sizes num_ctx from free
+# VRAM and picks 131072 on an idle 80 GB GPU, which makes gemma4:e2b spend ~50s
+# building an oversized compute graph at load time (the "waiting for llama
+# runner to start responding" hang). 4096 is ~2.5x headroom for the
+# section-tagged prompts (measured worst case ~1640 prompt+output tokens) and
+# brings the model load down to ~3s.
+export OLLAMA_CONTEXT_LENGTH=4096
 nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
 sleep 5
 if ! curl -s -m 5 http://localhost:11434/api/tags > /dev/null 2>&1; then
