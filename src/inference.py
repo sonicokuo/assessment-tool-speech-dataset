@@ -35,6 +35,7 @@ from section_tags import (
     RANGE_OPEN_TAG,
     RANGE_CLOSE_TAG,
     section_open_token_ids,
+    strip_all_tags,
 )
 from section_query import SectionQueryHead
 from spec_encoder import SpecEncoder
@@ -561,6 +562,7 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         output_entry = {
             "filename": sample["filename"],
             "generated": generated,
+            "generated_clean": strip_all_tags(generated),
         }
         if attention_maps:
             # Save as plain lists in JSON (per-clip); the plotting script reshapes
