@@ -315,11 +315,13 @@ Overlap context: {overlap_str}
             result = json.loads(response.read().decode("utf-8"))
             text = result.get("response", "").strip()
             text = " ".join(text.split())
-            # Add period after every </sec> when followed by any non-whitespace content.
+            # Add period after </sec> when followed by a transition word (not another section tag).
+            # e.g. "</sec> The speaking rate" → "</sec>. The speaking rate"
             import re as _re
             text = _re.sub(r'(</sec>)\s+(\S)', r'\1. \2', text)
             # Capitalize the first letter after a period, skipping over any tags in between.
             # e.g. "long. <sec_noise><f_snr>the signal..." → "long. <sec_noise><f_snr>The signal..."
+            # e.g. "</sec>. the speaking" → "</sec>. The speaking"
             text = _re.sub(
                 r'(\.)(\s*(?:<[^>]+>\s*)*)([a-z])',
                 lambda m: m.group(1) + m.group(2) + m.group(3).upper(),
