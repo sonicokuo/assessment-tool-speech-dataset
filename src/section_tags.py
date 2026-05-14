@@ -378,6 +378,15 @@ def build_section_body(section_name: str, feature_values: dict[str, str]) -> str
             continue
         ft = FEATURE_BY_NAME[fname]
         body = ft.template.format(value=feature_values[fname])
+        # Capitalize the first character of the FIRST inner-span body so each
+        # section starts with a proper sentence-leading capital (e.g.,
+        # "<f_snr>The SNR is..."). Subsequent spans in a multi-feature section
+        # stay lowercase because they're joined by " and " mid-sentence.
+        # This makes Step 1's deterministic output already correctly cased and
+        # removes the dependence on Freya's post-process regex for the
+        # capitalization half of the cap+period fix in scripts/feature_verbalization.py.
+        if not spans and body and body[0].islower():
+            body = body[0].upper() + body[1:]
         spans.append(render_feature_span(fname, body))
     return " and ".join(spans) if spans else ""
 
