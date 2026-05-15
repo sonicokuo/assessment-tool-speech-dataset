@@ -15,7 +15,7 @@
 # See scratch/EMNLP_REWORK_PLAN_20260511.md for the decision rationale.
 
 # ── Model ──────────────────────────────────────────────
-lm_name: "Qwen/Qwen3-1.7B-Instruct"
+lm_name: "Qwen/Qwen3-1.7B"
 adapter_variant: "film-mamba"
 
 # Full fine-tuning: lora_rank: 0 disables the PEFT wrap and trains all LM
