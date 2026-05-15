@@ -7,6 +7,8 @@ data/LibriSpeech/
 data/*.tar.gz
 *.csv
 !data/**/.gitkeep
+descriptions.part*.json
+descriptions_tagged.json
 
 # Checkpoints
 checkpoints/
