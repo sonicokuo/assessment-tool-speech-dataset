@@ -95,7 +95,13 @@ gradient_accumulation_steps: 1
 gradient_checkpointing: true   # mandatory at full FT to stay under 40GB
 epochs: 15                     # same trajectory shape as the Phase-2 v2 config
 seed: 73
-max_target_length: 224         # 7-feature catalog → ~9 spans → ~180-200 tok median
+# max_target_length must exceed the longest tokenized description, otherwise
+# src/train.py::_tokenize_with_eos truncates the tail BEFORE appending EOS.
+# Measured on the merged descriptions.json (19,900 entries) with the Qwen3
+# tokenizer: min=242, p50=288, p99=379, max=452. 512 covers every entry with
+# margin; if memory becomes an issue, drop batch_size to 4 with
+# gradient_accumulation_steps=2 rather than truncating real training signal.
+max_target_length: 512
 max_nums_length: 64            # bare-nums target is 7 slots ≈ 50 tokens
 resume_from: null
 
