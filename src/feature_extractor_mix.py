@@ -165,19 +165,42 @@ def compute_overlap_pyannote(wav_path: str, pipeline, sample_rate: int, duration
             best_class = posteriors.argmax(axis=1)
             n_active   = np.where(best_class == 0, 0,
                          np.where(best_class <= 3, 1, 2))
+        # pyannote's sliding window over short clips emits frames past
+        # duration_sec (the model has a fixed receptive field). Clip frame
+        # endpoints AND ignore overlap flags entirely past duration_sec so
+        # padded-zero frames cannot create OOB segments like 5.0-7.5s on a
+        # 3.92s clip.
         overlap_mask  = (n_active >= 2).ravel().astype(bool)
-        overlap_ratio = float(overlap_mask.mean())
         frames        = output.sliding_window
+        clip_end_sec  = float(duration_sec)
+        # Compute ratio from frames whose centre is within the real audio.
+        in_clip_idx = [i for i in range(len(overlap_mask))
+                       if frames[i].start < clip_end_sec]
+        overlap_ratio = (
+            float(np.mean([overlap_mask[i] for i in in_clip_idx]))
+            if in_clip_idx else 0.0
+        )
         segments, in_overlap, start_time = [], False, 0.0
-        for i, is_overlap in enumerate(overlap_mask.tolist()):
-            frame_start = frames[i].start
+        for i in in_clip_idx:
+            is_overlap  = bool(overlap_mask[i])
+            frame_start = min(frames[i].start, clip_end_sec)
             if is_overlap and not in_overlap:
                 start_time, in_overlap = frame_start, True
             elif not is_overlap and in_overlap:
-                segments.append(f'{int(round(start_time*sample_rate))}-{int(round(frame_start*sample_rate))}')
+                end_time = min(frame_start, clip_end_sec)
+                if end_time > start_time:
+                    segments.append(
+                        f'{int(round(start_time*sample_rate))}-'
+                        f'{int(round(end_time*sample_rate))}'
+                    )
                 in_overlap = False
         if in_overlap:
-            segments.append(f'{int(round(start_time*sample_rate))}-{int(round(frames[-1].end*sample_rate))}')
+            end_time = min(frames[in_clip_idx[-1]].end, clip_end_sec)
+            if end_time > start_time:
+                segments.append(
+                    f'{int(round(start_time*sample_rate))}-'
+                    f'{int(round(end_time*sample_rate))}'
+                )
         return {
             'overlap_ratio':    round(overlap_ratio, 4),
             'overlap_segments': ';'.join(segments) if segments else float('nan'),
@@ -252,12 +275,15 @@ def compute_overlap_vad(wav_path: str, sr: int, vad_model, get_speech_timestamps
         if wav1.ndim > 1: wav1 = wav1.mean(axis=1)
         if wav2.ndim > 1: wav2 = wav2.mean(axis=1)
         overlaps      = get_overlap_segments(wav1, wav2, sr, vad_model, get_speech_timestamps)
-        total_samples = max(len(wav1), len(wav2))
-        if total_samples == 0 or not overlaps:
+        # Mix length in min-mode Libri2Mix is min(len(s1), len(s2)). The
+        # previous max(...) denominator was relative to the longer source and
+        # underestimated overlap_ratio.
+        mix_samples = min(len(wav1), len(wav2))
+        if mix_samples == 0 or not overlaps:
             return {'overlap_ratio': 0.0, 'overlap_segments': float('nan')}
         overlap_samples = sum(o['end'] - o['start'] for o in overlaps)
         return {
-            'overlap_ratio':    round(overlap_samples / total_samples, 4),
+            'overlap_ratio':    round(overlap_samples / mix_samples, 4),
             'overlap_segments': ';'.join(f"{o['start']}-{o['end']}" for o in overlaps),
         }
     except Exception as e:
