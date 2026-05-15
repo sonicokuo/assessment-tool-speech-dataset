@@ -135,6 +135,10 @@ top_p: 1.0
 save_dir: "/ocean/projects/cis260125p/shared/checkpoints/qwen3_17b_full_ft_tagged_v1"
 
 # ── Logging ──────────────────────────────────────────────
-wandb_project: "idl-ablation"
+# wandb_entity pins the team account so contributors don't need to export
+# WANDB_ENTITY each session. Override with --wandb_entity <other> on the CLI
+# if you want to send a run somewhere else.
+wandb_entity: "speech_quality_adapter"
+wandb_project: "aqua-nl-emnlp"
 wandb_run_name: null
 log_every: 10

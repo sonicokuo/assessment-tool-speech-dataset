@@ -795,11 +795,16 @@ def train(config: dict) -> None:
         wandb_run_id = checkpoint.get("wandb_run_id")
         print(f"Resumed from epoch {start_epoch}, best_val_sfs_f1={best_val_sfs_f1:.4f}")
 
-    # Wandb
+    # Wandb. `wandb_entity` in the YAML pins the team account so contributors
+    # don't have to remember to export WANDB_ENTITY every session. Passing
+    # `entity=None` lets wandb fall back to its own resolution (env var, then
+    # the default entity from `wandb login`'s ~/.netrc, then personal account).
     run_name = config.get("wandb_run_name") or f"{config['adapter_variant']}-seed{config['seed']}"
+    wandb_entity = config.get("wandb_entity")
     if wandb_run_id:
         wandb.init(
             project=config["wandb_project"],
+            entity=wandb_entity,
             id=wandb_run_id,
             resume="must",
             config=config,
@@ -807,6 +812,7 @@ def train(config: dict) -> None:
     else:
         wandb.init(
             project=config["wandb_project"],
+            entity=wandb_entity,
             name=run_name,
             config=config,
         )
