@@ -14,6 +14,7 @@ from fix_descriptions import (  # noqa: E402
     strip_prompt_echo,
     remove_unmatched_closings,
     wrap_bare_overlap_section,
+    strip_orphan_overlap_artifacts,
     ensure_terminal_period,
     fix_all,
     audit,
@@ -133,6 +134,26 @@ def main():
         "a. <f_overlap_segments>overlap segments present at <r>1-2s</r></f>. b")
     expect_true("orphan <f_overlap_segments> wrapped in <sec_overlap>",
                 '<sec_overlap><f_overlap_segments>' in got2 and '</f></sec>' in got2)
+
+    section("strip_orphan_overlap_artifacts (A8)")
+    expect("strips trailing F0 sentence when no overlap content",
+           strip_orphan_overlap_artifacts(
+               "x<sec_pauses>y</sec>. Finally, there are F0 and formant estimates are unreliable during overlap windows."),
+           "x<sec_pauses>y</sec>.")
+    expect("untouched when <sec_overlap> present",
+           strip_orphan_overlap_artifacts(
+               "<sec_overlap>x</sec>. F0 and formant estimates are unreliable during overlap windows."),
+           "<sec_overlap>x</sec>. F0 and formant estimates are unreliable during overlap windows.")
+    expect("untouched when <r> present somewhere",
+           strip_orphan_overlap_artifacts(
+               "<sec_x><r>1-2s</r></sec>. F0 and formant estimates are unreliable during overlap windows."),
+           "<sec_x><r>1-2s</r></sec>. F0 and formant estimates are unreliable during overlap windows.")
+    expect("untouched when no </sec>",
+           strip_orphan_overlap_artifacts("plain text"),
+           "plain text")
+    expect("untouched when trailing is innocuous",
+           strip_orphan_overlap_artifacts("x<sec_a>y</sec>. plain ending."),
+           "x<sec_a>y</sec>. plain ending.")
 
     section("ensure_terminal_period (B1)")
     expect("appends . when missing", ensure_terminal_period("a"), "a.")

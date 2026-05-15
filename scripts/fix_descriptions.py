@@ -172,6 +172,27 @@ def ensure_terminal_period(text):
     return t + '.' if t and not t.endswith('.') else t
 
 
+def strip_orphan_overlap_artifacts(text):
+    """A8: if there is no <sec_overlap> AND no <r> tag in the text but the
+    region after the last </sec> mentions overlap / F0 / formant, that text
+    is an orphaned reference to overlap content that no longer exists
+    (typically: drop_oob_ranges removed the only range, leaving a dangling
+    'Finally, there are. F0 and formant estimates are unreliable during
+    overlap windows.' fragment). Truncate at the last </sec>.
+    """
+    if '<sec_overlap>' in text or '<r>' in text:
+        return text
+    last_close = text.rfind('</sec>')
+    if last_close < 0:
+        return text
+    after = text[last_close + len('</sec>'):]
+    if ('overlap' in after.lower()
+            or 'F0' in after
+            or 'formant' in after.lower()):
+        return text[:last_close + len('</sec>')] + '.'
+    return text
+
+
 # ---- composite ----
 
 def fix_all(text):
@@ -182,6 +203,7 @@ def fix_all(text):
     text = drop_oob_ranges(text)
     text = remove_unmatched_closings(text)
     text = wrap_bare_overlap_section(text)
+    text = strip_orphan_overlap_artifacts(text)
     text = ensure_terminal_period(text)
     return text
 
@@ -229,6 +251,16 @@ def audit(text):
     for fm in _F_OPEN_RE.finditer(text):
         if not any(s <= fm.start() < e for s, e in sec_spans):
             issues.append('A3_orphan_f_outside_section'); break
+    # A8: orphan overlap-trailing artifacts (no <sec_overlap>, no <r>, but
+    # prose after the last </sec> mentions overlap/F0/formant).
+    if '<sec_overlap>' not in text and '<r>' not in text:
+        last_close = text.rfind('</sec>')
+        if last_close >= 0:
+            after = text[last_close + len('</sec>'):]
+            if ('overlap' in after.lower()
+                    or 'F0' in after
+                    or 'formant' in after.lower()):
+                issues.append('A8_orphan_overlap_trailing')
     return issues
 
 
