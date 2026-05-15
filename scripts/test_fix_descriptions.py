@@ -14,6 +14,8 @@ from fix_descriptions import (  # noqa: E402
     strip_prompt_echo,
     remove_unmatched_closings,
     wrap_bare_overlap_section,
+    merge_orphan_f_into_section,
+    strip_orphan_r_tags,
     strip_orphan_overlap_artifacts,
     ensure_terminal_period,
     fix_all,
@@ -135,6 +137,40 @@ def main():
     expect_true("orphan <f_overlap_segments> wrapped in <sec_overlap>",
                 '<sec_overlap><f_overlap_segments>' in got2 and '</f></sec>' in got2)
 
+    section("merge_orphan_f_into_section (A3 when target exists)")
+    got = merge_orphan_f_into_section(
+        "x <f_overlap_ratio>R</f> and "
+        "<sec_overlap><f_overlap_segments>S</f></sec>"
+    )
+    expect_true("orphan <f_overlap_ratio> moved into <sec_overlap>",
+                '<sec_overlap><f_overlap_ratio>R</f>' in got)
+    expect_true("inner <f_overlap_segments> still present", '<f_overlap_segments>S</f>' in got)
+    expect_true("merged section closes correctly", got.count('</sec>') == got.count('<sec_'))
+    expect("idempotent when no orphan",
+           merge_orphan_f_into_section(
+               "<sec_overlap><f_overlap_ratio>R</f></sec>"),
+           "<sec_overlap><f_overlap_ratio>R</f></sec>")
+    expect("untouched when target section absent",
+           merge_orphan_f_into_section("x <f_overlap_ratio>R</f>"),
+           "x <f_overlap_ratio>R</f>")
+    # snr orphan merged into sec_noise
+    got2 = merge_orphan_f_into_section(
+        "a <f_snr>S</f> b <sec_noise><f_other>X</f></sec> c"
+    )
+    expect_true("snr orphan merged into sec_noise",
+                '<sec_noise><f_snr>S</f>' in got2)
+
+    section("strip_orphan_r_tags (A9)")
+    expect("strips orphan <r> outside any <sec>",
+           strip_orphan_r_tags("prose <r>1-2s</r> more prose"),
+           "prose  more prose")
+    expect("keeps <r> that is inside <sec_*>",
+           strip_orphan_r_tags("<sec_a><r>1-2s</r></sec>"),
+           "<sec_a><r>1-2s</r></sec>")
+    expect("mixed: keeps inside, strips outside",
+           strip_orphan_r_tags("<r>0-1s</r> <sec_a><r>1-2s</r></sec>"),
+           " <sec_a><r>1-2s</r></sec>")
+
     section("strip_orphan_overlap_artifacts (A8)")
     expect("strips trailing F0 sentence when no overlap content",
            strip_orphan_overlap_artifacts(
@@ -213,16 +249,18 @@ def main():
     section("audit")
     expect("audit clean: []", audit(clean), [])
     expect("audit empty: A6 only", audit(""), ['A6_empty'])
-    # reversed range (20 > 7.5) + no terminal period
+    # reversed range (20 > 7.5) + no terminal period + the <r> is orphan
     a = audit("The recording is 10 s long. <r>20.0-7.5s</r>")
-    expect("audit reversed + B1",
+    expect("audit reversed + B1 + A9",
            sorted(a),
-           sorted(['C1_reversed_range', 'B1_no_terminal_period']))
-    # range fully beyond duration + no terminal period
+           sorted(['C1_reversed_range', 'B1_no_terminal_period',
+                   'A9_orphan_r_outside_section']))
+    # range fully beyond duration + no terminal period + the <r> is orphan
     a2 = audit("The recording is 4 s long. <r>5.0-7.0s</r>")
-    expect("audit beyond + B1",
+    expect("audit beyond + B1 + A9",
            sorted(a2),
-           sorted(['C2_range_beyond_duration', 'B1_no_terminal_period']))
+           sorted(['C2_range_beyond_duration', 'B1_no_terminal_period',
+                   'A9_orphan_r_outside_section']))
     # bare overlap content, no <sec_overlap>
     a3 = audit("done. overlap segments are present at <r>1-2s</r>.")
     expect_true("audit detects A1_bare_overlap", 'A1_bare_overlap' in a3)

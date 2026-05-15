@@ -37,6 +37,17 @@ from pathlib import Path
 
 # ---- regexes ----
 
+# Feature -> canonical section. Used by merge_orphan_f_into_section to move
+# orphan <f_*> tags into their owning section when present in the text.
+_FEATURE_TO_SECTION = {
+    "snr": "noise", "hnr": "noise",
+    "srmr": "reverb",
+    "f0_mean": "pitch", "f0_sd": "pitch",
+    "speaking_rate": "tempo", "articulation_rate": "tempo",
+    "pause_count": "pauses", "pause_rate": "pauses",
+    "overlap_ratio": "overlap", "overlap_segments": "overlap",
+}
+
 _RANGE_RE = re.compile(r'<r>([\d.]+)-([\d.]+)s</r>')
 _DURATION_RE = re.compile(r'^The recording is (\d+(?:\.\d+)?) s long\.')
 _OVERLAP_PROSE_RE = re.compile(
@@ -166,6 +177,70 @@ def wrap_bare_overlap_section(text):
     return text
 
 
+def _section_spans(text):
+    """Return list of (start, end, sec_name) for each <sec_NAME>...</sec> block."""
+    spans = []
+    i = 0
+    while i < len(text):
+        sm = re.search(r'<sec_(\w+)>', text[i:])
+        if not sm:
+            break
+        start = i + sm.start()
+        cm = re.search(r'</sec>', text[start:])
+        if not cm:
+            break
+        end = start + cm.end()
+        spans.append((start, end, sm.group(1)))
+        i = end
+    return spans
+
+
+def merge_orphan_f_into_section(text):
+    """A3 (when target section exists): move each orphan <f_X>Y</f> into the
+    canonical <sec_*> for that feature, inserted at the start of the section
+    content. The dangling connective prose before the now-merged orphan is
+    not cleaned (it remains a small cosmetic artifact)."""
+    # iterate until no more merges happen
+    for _ in range(20):
+        spans = _section_spans(text)
+        if not spans:
+            return text
+        sec_by_name = {n: (s, e) for s, e, n in spans}
+        moved = False
+        for fm in re.finditer(r'<f_(\w+)>.*?</f>', text, re.DOTALL):
+            if any(s <= fm.start() < e for s, e, _ in spans):
+                continue
+            target = _FEATURE_TO_SECTION.get(fm.group(1))
+            if not target or target not in sec_by_name:
+                continue
+            fbody = fm.group(0)
+            without = text[:fm.start()] + text[fm.end():]
+            tm = re.search(rf'<sec_{target}>', without)
+            if not tm:
+                continue
+            ip = tm.end()
+            text = without[:ip] + fbody + ' and ' + without[ip:]
+            moved = True
+            break
+        if not moved:
+            return text
+    return text
+
+
+def strip_orphan_r_tags(text):
+    """A9: drop <r>...</r> markers that sit outside any <sec_*> block.
+    These are typically duplicates that the model paraphrased into prose
+    while also keeping the canonical instance inside <sec_overlap>."""
+    spans = _section_spans(text)
+    out, last = [], 0
+    for rm in re.finditer(r'<r>[^<]*</r>', text):
+        if not any(s <= rm.start() < e for s, e, _ in spans):
+            out.append(text[last:rm.start()])
+            last = rm.end()
+    out.append(text[last:])
+    return ''.join(out)
+
+
 def ensure_terminal_period(text):
     """B1: append '.' if missing."""
     t = text.rstrip()
@@ -203,6 +278,8 @@ def fix_all(text):
     text = drop_oob_ranges(text)
     text = remove_unmatched_closings(text)
     text = wrap_bare_overlap_section(text)
+    text = merge_orphan_f_into_section(text)
+    text = strip_orphan_r_tags(text)
     text = strip_orphan_overlap_artifacts(text)
     text = ensure_terminal_period(text)
     return text
@@ -251,6 +328,9 @@ def audit(text):
     for fm in _F_OPEN_RE.finditer(text):
         if not any(s <= fm.start() < e for s, e in sec_spans):
             issues.append('A3_orphan_f_outside_section'); break
+    for rm in re.finditer(r'<r>', text):
+        if not any(s <= rm.start() < e for s, e in sec_spans):
+            issues.append('A9_orphan_r_outside_section'); break
     # A8: orphan overlap-trailing artifacts (no <sec_overlap>, no <r>, but
     # prose after the last </sec> mentions overlap/F0/formant).
     if '<sec_overlap>' not in text and '<r>' not in text:
