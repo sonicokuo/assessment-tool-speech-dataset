@@ -319,6 +319,9 @@ Overlap context: {overlap_str}
             # e.g. "</sec> The speaking rate" → "</sec>. The speaking rate"
             import re as _re
             text = _re.sub(r'(</sec>)\s+(\S)', r'\1. \2', text)
+            # Add period before <sec_X> when preceded by alphanumeric or a closing tag.
+            # e.g. "characteristics <sec_reverb>" -> "characteristics. <sec_reverb>"
+            text = _re.sub(r'([A-Za-z0-9>])\s+(<sec_)', r'\1. \2', text)
             # Capitalize the first letter after a period, skipping over any tags in between.
             # e.g. "long. <sec_noise><f_snr>the signal..." → "long. <sec_noise><f_snr>The signal..."
             # e.g. "</sec>. the speaking" → "</sec>. The speaking"
