@@ -106,7 +106,7 @@ resume_from: null
 # then rebuild descriptions.json with merge_verbalized_to_json.py and point
 # descriptions_path at it.
 data_dir: "/ocean/projects/cis260125p/shared/data/processed_pyannote"
-descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_tagged.json"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions.json"
 features_path: "/ocean/projects/cis260125p/shared/data/features.json"
 features_csv:
   train: "/ocean/projects/cis260125p/shared/data/features_pyannote/train-100.csv"
