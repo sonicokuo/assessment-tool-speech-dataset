@@ -36,8 +36,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import torch.nn.functional as F
-import torchaudio
-from transformers import WavLMModel
+
+# torchaudio and transformers are only needed by the CLI / main() — keep
+# them out of module scope so build_overlap_info can be unit-tested without
+# them installed.
 
 # WavLM-Large hop length in samples at 16 kHz → one output frame every 20 ms (50 Hz).
 WAVLM_HOP_SAMPLES = 320
@@ -85,6 +87,12 @@ def build_overlap_info(
     Returns:
         overlap_info  tensor of shape (T, 4)
         segments_sec  list of (start_sec, end_sec) tuples for metadata / logging.
+
+    Defensive clamp: any segment endpoint past T * WAVLM_HOP_SAMPLES is clamped
+    to the clip boundary, and reversed (b<a) endpoints are swapped. This
+    matters because pre-fix pyannote extractions produced segments that
+    extend past duration_sec (e.g. 5.0-7.5s on a 3.92s clip), which would
+    otherwise leak inflated `segment_duration_s` values into col 1.
     """
     del clip_overlap_ratio  # explicitly unused
     overlap_info = torch.zeros(T, 4)
@@ -92,6 +100,8 @@ def build_overlap_info(
 
     if not segs_str:
         return overlap_info, segments_sec
+
+    clip_end_samp = T * WAVLM_HOP_SAMPLES
 
     for seg in segs_str.split(";"):
         seg = seg.strip()
@@ -101,6 +111,13 @@ def build_overlap_info(
             s_samp, e_samp = (int(x) for x in seg.split("-"))
         except ValueError:
             continue
+        if e_samp < s_samp:
+            s_samp, e_samp = e_samp, s_samp
+        # Clamp to clip bounds — drop fully-OOB, trim partial-OOB.
+        if s_samp >= clip_end_samp:
+            continue
+        if e_samp > clip_end_samp:
+            e_samp = clip_end_samp
         if e_samp <= s_samp:
             continue
 
