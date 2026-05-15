@@ -154,6 +154,8 @@ def preprocess(
     output_dir: str,
     sample_rate: int = 16000,
 ):
+    import torchaudio
+    from transformers import WavLMModel
     os.makedirs(output_dir, exist_ok=True)
 
     device = torch.device(
