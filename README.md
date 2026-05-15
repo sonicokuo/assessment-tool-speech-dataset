@@ -293,7 +293,7 @@ Detached (survives SSH disconnect; output goes to a log file). Put `LOG=...` on 
 mkdir -p $SHARED/logs
 LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
 
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --wandb_run_name film-mamba \
   --save_dir       $SHARED/checkpoints/film_mamba__v1 \
   > "$LOG" 2>&1 &
@@ -308,6 +308,8 @@ echo "PID=$PID  log=$LOG"
 ```bash
 tail -f $LOG          # ctrl-C to stop following (the run keeps going)
 ```
+
+The `python -u` flag in the launch command above is **critical** — without it, when stdout is redirected to a file (as `nohup ... > $LOG` does), Python block-buffers stdout in ~8 KB chunks and the log file looks empty for minutes. `-u` forces unbuffered output so every print lands in `$LOG` immediately and `tail -f` shows real-time progress.
 
 What you should see:
 - ~1 min in: model construction banner (`[tagged-mode]`, `[full-FT]`, `[sections] 6 sections registered`), parameter counts, dataset load (`Loaded: train=13900, val=3000`), and the wandb URL.
@@ -372,14 +374,14 @@ Naming convention: `--wandb_run_name <variant>` and `--save_dir $SHARED/checkpoi
 ```bash
 # film-mamba (headline, this is the main config — no --adapter_variant needed)
 LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --save_dir       $SHARED/checkpoints/film_mamba__v1 \
   --wandb_run_name film-mamba \
   > "$LOG" 2>&1 &
 
 # concat-only
 LOG=$SHARED/logs/concat_only_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant concat-only \
   --save_dir        $SHARED/checkpoints/concat_only__v1 \
   --wandb_run_name  concat-only \
@@ -387,7 +389,7 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 # sigmoid-gate
 LOG=$SHARED/logs/sigmoid_gate_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant sigmoid-gate \
   --save_dir        $SHARED/checkpoints/sigmoid_gate__v1 \
   --wandb_run_name  sigmoid-gate \
@@ -395,7 +397,7 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 # film (FiLM only, no temporal mixer)
 LOG=$SHARED/logs/film_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film \
   --save_dir        $SHARED/checkpoints/film__v1 \
   --wandb_run_name  film \
@@ -403,7 +405,7 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 # film-attn
 LOG=$SHARED/logs/film_attn_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film-attn \
   --save_dir        $SHARED/checkpoints/film_attn__v1 \
   --wandb_run_name  film-attn \
@@ -411,7 +413,7 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 # film-attn-2L
 LOG=$SHARED/logs/film_attn_2L_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film-attn-2L \
   --save_dir        $SHARED/checkpoints/film_attn_2L__v1 \
   --wandb_run_name  film-attn-2L \
@@ -419,7 +421,7 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 # film-mamba-2L
 LOG=$SHARED/logs/film_mamba_2L_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film-mamba-2L \
   --save_dir        $SHARED/checkpoints/film_mamba_2L__v1 \
   --wandb_run_name  film-mamba-2L \
@@ -427,7 +429,7 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 # qformer
 LOG=$SHARED/logs/qformer_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant qformer \
   --save_dir        $SHARED/checkpoints/qformer__v1 \
   --wandb_run_name  qformer \
@@ -450,7 +452,7 @@ Run these only after the adapter sweep is done, to argue novelty of the section-
 ```bash
 # no-sections (free-form prose, no <sec_*> or <f_*> tags)
 LOG=$SHARED/logs/no_sections_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections false --tagged_mode false \
   --save_dir        $SHARED/checkpoints/no_sections__v1 \
   --wandb_run_name  no-sections \
@@ -458,7 +460,7 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 # static-queries (learnable per-section query, not LM-derived)
 LOG=$SHARED/logs/static_queries_$(date +%Y%m%d_%H%M%S).log
-nohup python src/train.py --config configs/config.psc.emnlp.yaml \
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --section_query_mode static \
   --save_dir        $SHARED/checkpoints/static_queries__v1 \
   --wandb_run_name  static-queries \
