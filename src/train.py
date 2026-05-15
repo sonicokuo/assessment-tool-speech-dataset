@@ -819,6 +819,8 @@ def train(config: dict) -> None:
     # Training loop
     os.makedirs(config["save_dir"], exist_ok=True)
 
+    max_steps = int(config["max_steps"]) if config.get("max_steps") else None
+
     for epoch in range(start_epoch, config["epochs"]):
         print("\nEpoch: {}/{}".format(epoch + 1, config["epochs"]))
 
@@ -867,6 +869,10 @@ def train(config: dict) -> None:
 
             train_loss += loss.item() * accum_steps
             n_steps += 1
+
+            if max_steps is not None and (n_steps + epoch * len(train_loader)) >= max_steps:
+                print(f"[max_steps] reached {max_steps} steps — stopping smoke run.")
+                sys.exit(0)
 
             if n_steps % config["log_every"] == 0:
                 wandb.log(
