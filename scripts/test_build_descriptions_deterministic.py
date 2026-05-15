@@ -18,6 +18,7 @@ from build_descriptions_deterministic import (  # noqa: E402
     build_description,
     _clean_overlap_segments,
     _prepare_row_for_build,
+    _iter_split,
     PART_SLICES,
 )
 
@@ -151,6 +152,45 @@ def main() -> int:
            {"train-100": (4634, 9268), "dev": (1000, 2000), "test": (1000, 2000)})
     expect("part 3", PART_SLICES[3],
            {"train-100": (9268, 13902), "dev": (2000, 3000), "test": (2000, 3000)})
+
+    section("_iter_split uses Python-slice (start, end) semantics, not (offset, count)")
+    import tempfile, csv as _csv
+    from pathlib import Path
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
+    w = _csv.writer(tmp)
+    w.writerow(["filename"])
+    for i in range(100):
+        w.writerow([f"clip_{i:03d}.wav"])
+    tmp.close()
+    try:
+        rows_a = list(_iter_split(Path(tmp.name), 10, 20))
+        expect("len rows[10:20] == 10", len(rows_a), 10)
+        expect("first row is clip_010", rows_a[0]["filename"], "clip_010.wav")
+        expect("last row is clip_019",  rows_a[-1]["filename"], "clip_019.wav")
+        # boundary that exposed the original bug: (4634, 9268) yielding 9268 rows
+        rows_b = list(_iter_split(Path(tmp.name), 50, 70))
+        expect("len rows[50:70] == 20", len(rows_b), 20)
+        rows_c = list(_iter_split(Path(tmp.name), 90, 200))
+        expect("end past CSV is fine (clamped)", len(rows_c), 10)
+    finally:
+        os.unlink(tmp.name)
+
+    section("PART_SLICES collectively cover all rows exactly once")
+    # The three parts should partition each split (train/dev/test) with no
+    # overlap and no gap (modulo train-100's actual length of 13900 not 13902).
+    for split_name, csv_len in (("train-100", 13900), ("dev", 3000), ("test", 3000)):
+        covered = set()
+        overlap_pairs = []
+        for part_n in (1, 2, 3):
+            start, end = PART_SLICES[part_n][split_name]
+            new = set(range(start, min(end, csv_len)))
+            if covered & new:
+                overlap_pairs.append((part_n, sorted(covered & new)[:3]))
+            covered |= new
+        expect_true(f"{split_name}: no part overlaps another  (overlaps={overlap_pairs})",
+                    not overlap_pairs)
+        expect(f"{split_name}: parts cover all {csv_len} rows",
+               len(covered), csv_len)
 
     section("overlap_ratio > 0 but empty segments still trips F0 trailing")
     edge = {"filename": "e.wav", "duration_sec": "2.0",

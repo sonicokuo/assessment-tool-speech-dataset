@@ -184,13 +184,20 @@ def build_description(row: dict, fallback_warned: dict | None = None) -> str:
     return text.strip()
 
 
-def _iter_split(csv_path: Path, offset: int, limit: int):
+def _iter_split(csv_path: Path, start: int, end: int):
+    """Yield rows in Python-slice semantics rows[start:end].
+
+    NOTE: PART_SLICES values are (start, end) like CSV[start:end], NOT
+    (offset, count). The previous implementation treated the second value
+    as a count, so Part 2's (4634, 9268) was iterating rows
+    [4634:4634+9268] = [4634:13902] and consuming Part 3's train clips.
+    """
     with csv_path.open() as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
-            if i < offset:
+            if i < start:
                 continue
-            if i >= offset + limit:
+            if i >= end:
                 break
             yield row
 
@@ -232,13 +239,13 @@ def main() -> int:
     out: dict[str, str] = {}
     n_empty = n_used_vad = n_used_fallback = 0
 
-    for split_name, (offset, limit) in splits.items():
+    for split_name, (start, end) in splits.items():
         csv_path = args.features_dir / f"{split_name}.csv"
         if not csv_path.exists():
             print(f"ERROR: {csv_path} not found", file=sys.stderr)
             return 2
         n_rows = 0
-        for row in _iter_split(csv_path, offset, limit):
+        for row in _iter_split(csv_path, start, end):
             fname = (row.get("filename") or "").strip()
             stem = os.path.splitext(fname)[0]
             if not stem:
@@ -254,7 +261,7 @@ def main() -> int:
                 n_used_vad += 1
             else:
                 n_used_fallback += 1
-        print(f"  {split_name:9s}: {n_rows} rows  (offset={offset} limit={limit})")
+        print(f"  {split_name:9s}: {n_rows} rows  (start={start} end={end})")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
