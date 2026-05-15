@@ -93,6 +93,19 @@ def merge_adjacent(segs, min_gap_samples: int = 0):
     return [(a, b) for a, b in out]
 
 
+def _write_csv_atomic(csv_path: Path, fieldnames, rows):
+    """Atomic write of rows to csv_path via .tmp + rename. Used for both the
+    end-of-run write and periodic checkpoints so a killed job preserves
+    partial progress on disk."""
+    tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with tmp.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+    tmp.replace(csv_path)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -107,6 +120,11 @@ def main() -> int:
                    help="expected sample rate (default: 16000)")
     p.add_argument("--limit", type=int, default=None,
                    help="process at most N rows (smoke test)")
+    p.add_argument("--checkpoint_every", type=int, default=500,
+                   help="save the (partial) CSV every N processed rows so a "
+                        "job kill preserves progress (default: 500; 0 = "
+                        "write only at end). Combined with the resume logic "
+                        "below, a re-run picks up where a killed run left off.")
     args = p.parse_args()
 
     # Heavy deps live here (only needed for the actual CSV-rewrite path).
@@ -141,8 +159,24 @@ def main() -> int:
             fieldnames.append(col)
 
     n_total = len(rows) if args.limit is None else min(len(rows), args.limit)
-    n_done = n_missing = n_with_overlap = 0
+    n_done = n_missing = n_with_overlap = n_resume_skip = 0
+
+    # Resume: any row that already has overlap_ratio_vad populated was
+    # processed by an earlier (possibly killed) run; do not re-process.
+    # This pairs with the periodic checkpoint write below so a killed job
+    # picks up where it left off when re-invoked.
+    n_resume_skip = sum(
+        1 for r in rows[:n_total]
+        if (r.get("overlap_ratio_vad") or "").strip()
+    )
+    if n_resume_skip:
+        print(f"[resume] {n_resume_skip}/{n_total} rows already have "
+              f"overlap_ratio_vad; will skip")
+
     for i, row in enumerate(rows[:n_total]):
+        # Resume: skip rows already processed (have overlap_ratio_vad).
+        if (row.get("overlap_ratio_vad") or "").strip():
+            continue
         fname = row.get("filename", "").strip()
         if not fname:
             row["overlap_segments_vad"] = ""
@@ -192,15 +226,12 @@ def main() -> int:
             n_with_overlap += 1
         if (i + 1) % 250 == 0 or i + 1 == n_total:
             print(f"  [{i+1}/{n_total}] done={n_done} missing={n_missing} "
-                  f"with_overlap={n_with_overlap}")
+                  f"with_overlap={n_with_overlap} skipped_resume={n_resume_skip}",
+                  flush=True)
+        if args.checkpoint_every > 0 and (i + 1) % args.checkpoint_every == 0:
+            _write_csv_atomic(csv_path, fieldnames, rows)
 
-    tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
-    with tmp.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
-    tmp.replace(csv_path)
+    _write_csv_atomic(csv_path, fieldnames, rows)
 
     print()
     print(f"wrote {csv_path}")
@@ -208,6 +239,7 @@ def main() -> int:
     print(f"  processed         : {n_done}")
     print(f"  missing stems     : {n_missing}")
     print(f"  with VAD overlap  : {n_with_overlap}")
+    print(f"  skipped on resume : {n_resume_skip}")
     return 0
 
 
