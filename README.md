@@ -291,11 +291,11 @@ Detached (survives SSH disconnect; output goes to a log file). Put `LOG=...` on 
 
 ```bash
 mkdir -p $SHARED/logs
-LOG=$SHARED/logs/a0_main_$(date +%Y%m%d_%H%M%S).log
+LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
 
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
-  --wandb_run_name a0-main \
-  --save_dir       $SHARED/checkpoints/a0__main__v1 \
+  --wandb_run_name film-mamba \
+  --save_dir       $SHARED/checkpoints/film_mamba__v1 \
   > "$LOG" 2>&1 &
 PID=$!
 echo "PID=$PID  log=$LOG"
@@ -350,85 +350,87 @@ python src/train.py --config configs/config.psc.emnlp.yaml \
 
 ## Ablations
 
-The headline run (`a0__main__v1`) uses the main config. Two ablation families:
+The headline run uses the main config (`film-mamba`). Two ablation families. Save_dirs and wandb run names mirror the adapter / knob being tested so you can read a checkpoint path and know what it is.
 
 ### Adapter-architecture sweep
 
 The paper's primary comparison table. Same data, same seed, same epochs, same section / BEATs / dynamic-query setup — **only `adapter_variant` changes**. Eight variants in `src/adapter.py::build_adapter`:
 
-| ID | adapter_variant | Conditioning | Temporal mixer | Notes |
-|---|---|---|---|---|
-| **A0** | `film-mamba` | FiLM | Mamba SSM (1 layer) | Headline result (current default) |
-| **A1** | `concat-only` | None (concat) | None | Baseline — argues for FiLM + mixer |
-| **A2** | `sigmoid-gate` | Sigmoid gate | None | Lighter gating alternative |
-| **A3** | `film` | FiLM | None | Isolates the temporal-mixer contribution |
-| **A4** | `film-attn` | FiLM | Self-attention (1 layer) | Argues Mamba vs attn |
-| **A5** | `film-attn-2L` | FiLM | Self-attention (2 layers) | Depth ablation for attn |
-| **A6** | `film-mamba-2L` | FiLM | Mamba SSM (2 layers) | Depth ablation for Mamba |
-| **A7** | `qformer` | Q-Former cross-attention | (implicit) | Alternative architecture |
+| adapter_variant | Conditioning | Temporal mixer | Notes |
+|---|---|---|---|
+| `film-mamba` | FiLM | Mamba SSM (1 layer) | Headline result (current default) |
+| `concat-only` | None (concat) | None | Baseline — argues for FiLM + mixer |
+| `sigmoid-gate` | Sigmoid gate | None | Lighter gating alternative |
+| `film` | FiLM | None | Isolates the temporal-mixer contribution |
+| `film-attn` | FiLM | Self-attention (1 layer) | Argues Mamba vs attn |
+| `film-attn-2L` | FiLM | Self-attention (2 layers) | Depth ablation for attn |
+| `film-mamba-2L` | FiLM | Mamba SSM (2 layers) | Depth ablation for Mamba |
+| `qformer` | Q-Former cross-attention | (implicit) | Alternative architecture |
+
+Naming convention: `--wandb_run_name <variant>` and `--save_dir $SHARED/checkpoints/<variant>__v1`. Reading a path tells you the variant. Bump to `__v2`, `__v3` etc. when re-tuning hyperparams.
 
 ```bash
-# A0 main (film-mamba, headline)
-LOG=$SHARED/logs/a0_main_$(date +%Y%m%d_%H%M%S).log
+# film-mamba (headline, this is the main config — no --adapter_variant needed)
+LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
-  --save_dir       $SHARED/checkpoints/a0__main__v1 \
-  --wandb_run_name a0-main \
+  --save_dir       $SHARED/checkpoints/film_mamba__v1 \
+  --wandb_run_name film-mamba \
   > "$LOG" 2>&1 &
 
-# A1 concat-only
-LOG=$SHARED/logs/a1_concat_$(date +%Y%m%d_%H%M%S).log
+# concat-only
+LOG=$SHARED/logs/concat_only_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant concat-only \
-  --save_dir        $SHARED/checkpoints/a1__concat_only__v1 \
-  --wandb_run_name  a1-concat-only \
+  --save_dir        $SHARED/checkpoints/concat_only__v1 \
+  --wandb_run_name  concat-only \
   > "$LOG" 2>&1 &
 
-# A2 sigmoid-gate
-LOG=$SHARED/logs/a2_sigmoid_$(date +%Y%m%d_%H%M%S).log
+# sigmoid-gate
+LOG=$SHARED/logs/sigmoid_gate_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant sigmoid-gate \
-  --save_dir        $SHARED/checkpoints/a2__sigmoid_gate__v1 \
-  --wandb_run_name  a2-sigmoid-gate \
+  --save_dir        $SHARED/checkpoints/sigmoid_gate__v1 \
+  --wandb_run_name  sigmoid-gate \
   > "$LOG" 2>&1 &
 
-# A3 film (FiLM only, no temporal mixer)
-LOG=$SHARED/logs/a3_film_$(date +%Y%m%d_%H%M%S).log
+# film (FiLM only, no temporal mixer)
+LOG=$SHARED/logs/film_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film \
-  --save_dir        $SHARED/checkpoints/a3__film__v1 \
-  --wandb_run_name  a3-film \
+  --save_dir        $SHARED/checkpoints/film__v1 \
+  --wandb_run_name  film \
   > "$LOG" 2>&1 &
 
-# A4 film-attn
-LOG=$SHARED/logs/a4_film_attn_$(date +%Y%m%d_%H%M%S).log
+# film-attn
+LOG=$SHARED/logs/film_attn_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film-attn \
-  --save_dir        $SHARED/checkpoints/a4__film_attn__v1 \
-  --wandb_run_name  a4-film-attn \
+  --save_dir        $SHARED/checkpoints/film_attn__v1 \
+  --wandb_run_name  film-attn \
   > "$LOG" 2>&1 &
 
-# A5 film-attn-2L
-LOG=$SHARED/logs/a5_film_attn_2L_$(date +%Y%m%d_%H%M%S).log
+# film-attn-2L
+LOG=$SHARED/logs/film_attn_2L_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film-attn-2L \
-  --save_dir        $SHARED/checkpoints/a5__film_attn_2L__v1 \
-  --wandb_run_name  a5-film-attn-2L \
+  --save_dir        $SHARED/checkpoints/film_attn_2L__v1 \
+  --wandb_run_name  film-attn-2L \
   > "$LOG" 2>&1 &
 
-# A6 film-mamba-2L
-LOG=$SHARED/logs/a6_film_mamba_2L_$(date +%Y%m%d_%H%M%S).log
+# film-mamba-2L
+LOG=$SHARED/logs/film_mamba_2L_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant film-mamba-2L \
-  --save_dir        $SHARED/checkpoints/a6__film_mamba_2L__v1 \
-  --wandb_run_name  a6-film-mamba-2L \
+  --save_dir        $SHARED/checkpoints/film_mamba_2L__v1 \
+  --wandb_run_name  film-mamba-2L \
   > "$LOG" 2>&1 &
 
-# A7 qformer
-LOG=$SHARED/logs/a7_qformer_$(date +%Y%m%d_%H%M%S).log
+# qformer
+LOG=$SHARED/logs/qformer_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --adapter_variant qformer \
-  --save_dir        $SHARED/checkpoints/a7__qformer__v1 \
-  --wandb_run_name  a7-qformer \
+  --save_dir        $SHARED/checkpoints/qformer__v1 \
+  --wandb_run_name  qformer \
   > "$LOG" 2>&1 &
 ```
 
@@ -438,28 +440,28 @@ nohup python src/train.py --config configs/config.psc.emnlp.yaml \
 
 For probing the section-attention design itself. Each toggles **one** of the EMNLP-novelty knobs while keeping the adapter at the headline `film-mamba`:
 
-| ID | Knob | Override |
+| Knob | Override | Run name |
 |---|---|---|
-| **D1** | no sections, free-form prose | `--use_sections false --tagged_mode false` |
-| **D2** | static section queries (learnable lookup) | `--section_query_mode static` |
+| No sections, free-form prose | `--use_sections false --tagged_mode false` | `no-sections` |
+| Static section queries (learnable lookup) | `--section_query_mode static` | `static-queries` |
 
 Run these only after the adapter sweep is done, to argue novelty of the section-query design itself — not strictly needed for the paper's main result table.
 
 ```bash
-# D1 no-sections
-LOG=$SHARED/logs/d1_no_sections_$(date +%Y%m%d_%H%M%S).log
+# no-sections (free-form prose, no <sec_*> or <f_*> tags)
+LOG=$SHARED/logs/no_sections_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections false --tagged_mode false \
-  --save_dir        $SHARED/checkpoints/d1__no_sections__v1 \
-  --wandb_run_name  d1-no-sections \
+  --save_dir        $SHARED/checkpoints/no_sections__v1 \
+  --wandb_run_name  no-sections \
   > "$LOG" 2>&1 &
 
-# D2 static-queries
-LOG=$SHARED/logs/d2_sec_static_$(date +%Y%m%d_%H%M%S).log
+# static-queries (learnable per-section query, not LM-derived)
+LOG=$SHARED/logs/static_queries_$(date +%Y%m%d_%H%M%S).log
 nohup python src/train.py --config configs/config.psc.emnlp.yaml \
   --section_query_mode static \
-  --save_dir        $SHARED/checkpoints/d2__sec_static__v1 \
-  --wandb_run_name  d2-sec-static \
+  --save_dir        $SHARED/checkpoints/static_queries__v1 \
+  --wandb_run_name  static-queries \
   > "$LOG" 2>&1 &
 ```
 
@@ -481,16 +483,16 @@ python src/inference.py --config configs/config.psc.emnlp.yaml \
 Loop over all adapter ablations:
 
 ```bash
-for a in a0__main a1__concat_only a2__sigmoid_gate a3__film \
-         a4__film_attn a5__film_attn_2L a6__film_mamba_2L a7__qformer; do
+for variant in film_mamba concat_only sigmoid_gate film \
+               film_attn film_attn_2L film_mamba_2L qformer; do
   python src/inference.py --config configs/config.psc.emnlp.yaml \
-    --checkpoint $SHARED/checkpoints/${a}__v1/best.pt \
+    --checkpoint $SHARED/checkpoints/${variant}__v1/best.pt \
     --test_dir   $SHARED/data/processed_pyannote/test \
     --top_k      1
 done
 ```
 
-For the design-ablation checkpoints (`d1__no_sections__v1`, `d2__sec_static__v1`), same pattern.
+For the design-ablation checkpoints (`no_sections__v1`, `static_queries__v1`), same pattern.
 
 ### Outputs
 
