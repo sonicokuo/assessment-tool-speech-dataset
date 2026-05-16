@@ -56,6 +56,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -149,12 +150,35 @@ def _prepare_row_for_build(row: dict, fallback_warned: dict) -> dict:
     return out
 
 
-def build_description(row: dict, fallback_warned: dict | None = None) -> str:
-    """Compose a fully-tagged description for one CSV row.
+# Matches:
+#   opens:  <sec_NAME>, <f_NAME>, <r>
+#   closes: </sec>,     </f>,     </r>
+# Note the closing tags don't carry the _NAME suffix (the catalog uses one
+# shared close per category), so the regex has to handle both forms.
+_TAG_STRIP_RE = re.compile(r"<sec_\w+>|</sec>|<f_\w+>|</f>|<r>|</r>")
 
-    A row with only `duration_sec` still gets the intro sentence. The trailing
-    'F0 and formant estimates are unreliable during overlap windows.' sentence
-    is appended when overlap_ratio > 0.
+
+def _strip_tags(s: str) -> str:
+    """Remove every <sec_*>, </sec>, <f_*>, </f>, <r>, </r> tag from s, leaving
+    the natural-language content. Used by --untagged to produce a target that
+    contains the same factual claims but no special tokens for the model to
+    learn."""
+    return _TAG_STRIP_RE.sub("", s)
+
+
+def build_description(row: dict, fallback_warned: dict | None = None,
+                      untagged: bool = False) -> str:
+    """Compose a description for one CSV row.
+
+    By default emits the tagged section format. With ``untagged=True`` the
+    same factual content is emitted as plain prose (every <sec_*>, <f_*>,
+    <r> tag stripped), which is the format used for the post-hoc attention
+    extraction path — the LM trains on standard prose and per-section
+    attention is recovered at inference by parsing the prose for section
+    spans and aggregating the LM's native attention over those spans.
+
+    The trailing 'F0 and formant estimates are unreliable during overlap
+    windows.' sentence is appended when overlap_ratio > 0.
     """
     fallback_warned = fallback_warned if fallback_warned is not None else {"warned": False}
     row = _prepare_row_for_build(row, fallback_warned)
@@ -181,7 +205,10 @@ def build_description(row: dict, fallback_warned: dict | None = None) -> str:
         ratio = 0.0
     if ratio > 0:
         text += " F0 and formant estimates are unreliable during overlap windows."
-    return text.strip()
+    text = text.strip()
+    if untagged:
+        text = _strip_tags(text)
+    return text
 
 
 def _iter_split(csv_path: Path, start: int, end: int):
@@ -215,6 +242,14 @@ def main() -> int:
                    / "data" / "features_pyannote")
     p.add_argument("--output", type=Path, default=None,
                    help="output JSON (default: $SHARED/data/descriptions.part{N}.json)")
+    p.add_argument("--untagged", action="store_true",
+                   help="Emit untagged prose (strip every <sec_*>, <f_*>, <r> "
+                        "tag from the target). The factual content is "
+                        "identical; only the special-token wrappers are "
+                        "removed. Use this for the post-hoc attention path "
+                        "where the LM trains on standard prose and per-section "
+                        "attention is recovered at inference via the LM's "
+                        "native attention layers.")
     args = p.parse_args()
 
     if not args.features_dir.is_dir():
@@ -250,7 +285,7 @@ def main() -> int:
             stem = os.path.splitext(fname)[0]
             if not stem:
                 continue
-            text = build_description(row, fallback_warned)
+            text = build_description(row, fallback_warned, untagged=args.untagged)
             out[stem] = text
             n_rows += 1
             if not text:
