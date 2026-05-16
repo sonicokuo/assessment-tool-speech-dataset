@@ -167,7 +167,8 @@ def _strip_tags(s: str) -> str:
 
 
 def build_description(row: dict, fallback_warned: dict | None = None,
-                      untagged: bool = False) -> str:
+                      untagged: bool = False,
+                      drop_overlap_segments: bool = False) -> str:
     """Compose a description for one CSV row.
 
     By default emits the tagged section format. With ``untagged=True`` the
@@ -177,11 +178,23 @@ def build_description(row: dict, fallback_warned: dict | None = None,
     attention is recovered at inference by parsing the prose for section
     spans and aggregating the LM's native attention over those spans.
 
+    With ``drop_overlap_segments=True``, the "overlap segments are present
+    at 0.5-3.6s, ..." sentence is omitted from the overlap section — only
+    the scalar `overlap_ratio` is emitted. WavLM features are temporally
+    pooled, so the LM cannot learn precise time-stamp emission from the
+    audio prefix and falls back to hallucinating a stereotyped tile-the-clip
+    pattern (5-7 evenly-spaced ranges) which the IoU≥0.8 SFS scorer rejects.
+    Matches the mamba-v2 description format which had no segment ranges and
+    reached val_sfs_recall=0.88.
+
     The trailing 'F0 and formant estimates are unreliable during overlap
     windows.' sentence is appended when overlap_ratio > 0.
     """
     fallback_warned = fallback_warned if fallback_warned is not None else {"warned": False}
     row = _prepare_row_for_build(row, fallback_warned)
+    if drop_overlap_segments:
+        row["overlap_segments"] = ""
+        row["overlap_segments_vad"] = ""
     bodies = _build_section_bodies(row)
     intro = ""
     dur = row.get("duration_sec")
@@ -250,6 +263,16 @@ def main() -> int:
                         "where the LM trains on standard prose and per-section "
                         "attention is recovered at inference via the LM's "
                         "native attention layers.")
+    p.add_argument("--no-overlap-segments", action="store_true",
+                   dest="no_overlap_segments",
+                   help="Drop the 'overlap segments are present at ...' "
+                        "sentence from the overlap section. The scalar "
+                        "overlap_ratio is still emitted. Use this when the "
+                        "model can't learn precise time-stamp emission from "
+                        "the temporally-pooled audio prefix — without this "
+                        "flag the LM tends to hallucinate a stereotyped "
+                        "tile-the-clip pattern (5-7 evenly-spaced ranges) "
+                        "that the IoU>=0.8 SFS scorer rejects.")
     args = p.parse_args()
 
     if not args.features_dir.is_dir():
@@ -285,7 +308,8 @@ def main() -> int:
             stem = os.path.splitext(fname)[0]
             if not stem:
                 continue
-            text = build_description(row, fallback_warned, untagged=args.untagged)
+            text = build_description(row, fallback_warned, untagged=args.untagged,
+                                     drop_overlap_segments=args.no_overlap_segments)
             out[stem] = text
             n_rows += 1
             if not text:
