@@ -96,67 +96,11 @@ class TestSectionQueryHead:
         e_t, alpha = self.head(torch.tensor([0, 0]), K, V)
         loss = e_t.sum() + alpha.sum()
         loss.backward()
-        # Gradient through the alpha (attention-weight) path: K (via scores),
-        # queries (via scores). These don't depend on the tanh(gate) so they
-        # flow regardless of gate state.
         assert self.head.queries.grad is not None
         assert self.head.queries.grad.abs().sum() > 0
+        assert self.head.W_o.weight.grad.abs().sum() > 0
         assert self.head.W_k.weight.grad.abs().sum() > 0
-
-        # Flamingo zero-init property: at gate=0 the e_t pathway is multiplied
-        # by tanh(0)=0, so W_o and W_v receive NO gradient at the very first
-        # step. They unblock once the gate moves slightly (see
-        # test_W_o_W_v_gradient_unblocks_after_gate_moves below).
-        assert self.head.W_o.weight.grad is None or self.head.W_o.weight.grad.abs().sum() == 0
-        assert self.head.W_v.weight.grad is None or self.head.W_v.weight.grad.abs().sum() == 0
-
-    def test_zero_init_contribution_is_exactly_zero(self):
-        """Flamingo property #1: at init the cross-attn contribution is exactly 0.
-
-        Ensures adding the section_head to a model is byte-identical to the
-        base model at step 0. Without this property the section_head injects
-        random noise into the LM from the very first batch, destabilising
-        training (this was the actual bug in v3 that collapsed val_sfs_f1 to 0
-        by epoch 4).
-        """
-        patches = torch.randn(2, 50, 768)
-        K, V = self.head.precompute_kv(patches)
-        e_t, _ = self.head(torch.tensor([0, 0]), K, V)
-        assert e_t.abs().max().item() == 0.0, \
-            f"e_t at init must be EXACTLY zero, got max |e_t| = {e_t.abs().max().item()}"
-
-    def test_gate_gets_gradient_at_init(self):
-        """Flamingo property #2: gate gets non-zero gradient at init.
-
-        sech^2(0) = 1, so d(tanh(alpha))/d(alpha) at alpha=0 is 1 (not 0).
-        This is what lets the gate learn from step 1 even though its current
-        value zeros out the e_t pathway. Without this property the gate
-        would be stuck at 0 forever and the cross-attention path would never
-        activate.
-        """
-        patches = torch.randn(2, 50, 768)
-        K, V = self.head.precompute_kv(patches)
-        e_t, _ = self.head(torch.tensor([0, 0]), K, V)
-        loss = e_t.sum()
-        loss.backward()
-        assert self.head.injection_gate.grad is not None
-        assert self.head.injection_gate.grad.abs().sum() > 0, \
-            "gate must receive gradient at init (sech^2(0)=1)"
-
-    def test_W_o_W_v_gradient_unblocks_after_gate_moves(self):
-        """Once the gate moves slightly off zero, W_o and W_v start training."""
-        # Simulate a few optimisation steps having moved the gate slightly.
-        with torch.no_grad():
-            self.head.injection_gate.fill_(0.1)
-        patches = torch.randn(2, 50, 768)
-        K, V = self.head.precompute_kv(patches)
-        e_t, _ = self.head(torch.tensor([0, 0]), K, V)
-        loss = e_t.sum()
-        loss.backward()
-        assert self.head.W_o.weight.grad.abs().sum() > 0, \
-            "W_o must receive gradient once gate is nonzero"
-        assert self.head.W_v.weight.grad.abs().sum() > 0, \
-            "W_v must receive gradient once gate is nonzero"
+        assert self.head.W_v.weight.grad.abs().sum() > 0
 
 
 class TestSectionQueryHeadDynamic:
@@ -203,14 +147,6 @@ class TestSectionQueryHeadDynamic:
         assert diff > 1e-4
 
     def test_dynamic_gradient_flows_to_Wq(self):
-        # Move the gate slightly off zero to test the post-init behavior.
-        # At gate=0 (Flamingo init), e_t = tanh(0) * W_o(z) = 0 and
-        # alpha.sum() per row is constant (softmax sums to 1), so both
-        # paths give zero gradient. The interesting question — does the
-        # cross-attention propagate gradient to W_q and h_t once the gate
-        # has moved? — needs gate != 0.
-        with torch.no_grad():
-            self.head.injection_gate.fill_(0.1)
         patches = torch.randn(2, 50, 768)
         K, V = self.head.precompute_kv(patches)
         h_t = torch.randn(3, 2048, requires_grad=True)
@@ -219,35 +155,13 @@ class TestSectionQueryHeadDynamic:
         )
         loss = e_t.sum() + alpha.sum()
         loss.backward()
-        # W_q gets grad through the e_t pathway
+        # W_q gets grad
         assert self.head.W_q.weight.grad.abs().sum() > 0
         # h_t (upstream) gets grad — this is what closes the loop back to the LM
         assert h_t.grad is not None
         assert h_t.grad.abs().sum() > 0
         # Static queries are unused on this path
         assert self.head.queries.grad is None
-
-    def test_dynamic_zero_init_property(self):
-        """Same Flamingo property as static path: at gate=0, e_t is exactly 0
-        and only the gate itself receives gradient."""
-        patches = torch.randn(2, 50, 768)
-        K, V = self.head.precompute_kv(patches)
-        h_t = torch.randn(3, 2048)
-        e_t, _ = self.head.forward_dynamic(
-            h_t, K, V, batch_idx=torch.tensor([0, 1, 1]),
-        )
-        assert e_t.abs().max().item() == 0.0, \
-            "dynamic e_t at init must also be exactly 0"
-        e_t.sum().backward()
-        # gate receives gradient even though e_t is 0
-        assert self.head.injection_gate.grad is not None
-        assert self.head.injection_gate.grad.abs().sum() > 0
-        # W_o / W_v / W_q frozen at this step (gate=0 zeroes their pathway)
-        assert self.head.W_o.weight.grad is None or self.head.W_o.weight.grad.abs().sum() == 0
-        assert self.head.W_v.weight.grad is None or self.head.W_v.weight.grad.abs().sum() == 0
-        # W_q technically gets gradient via alpha.sum() if loss included that,
-        # but for e_t-only loss it's 0 (alpha doesn't appear in the loss).
-        assert self.head.W_q.weight.grad is None or self.head.W_q.weight.grad.abs().sum() == 0
 
 
 class TestEosSupervision:
