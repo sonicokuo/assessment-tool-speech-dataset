@@ -104,6 +104,25 @@ class SectionQueryHead(nn.Module):
         # contribute as training progresses.
         nn.init.normal_(self.W_o.weight, mean=0.0, std=0.01)
 
+        # Magnitude-bounding LayerNorm + learnable scalar gate for the residual
+        # injection. Without these, W_o is free to grow without bound under Adam
+        # (lr_adapter=1e-4 × ~12k steps gives per-element drift ~1.0), and the
+        # raw `target_embeds + W_o(z)` injection eventually has ||e_t|| swamping
+        # ||embed(<sec_*>)|| (~1.4 in Qwen3-1.7B). When that happens the LM sees
+        # high-magnitude noise at section positions, can't produce any meaningful
+        # downstream tokens, and val_sfs_f1 collapses to 0 (typically by epoch
+        # 3-4 of training) even while train_loss keeps falling due to teacher
+        # forcing.
+        # The fix has two pieces:
+        #   1. norm_e: an elementwise-affine-free LayerNorm caps ||e_t|| at
+        #      ~sqrt(d_lm) regardless of W_o magnitude.
+        #   2. injection_gate: a single learnable scalar that controls how much
+        #      e_t is added. Init to 0.1 (NOT 0) so e_t has gradient flow from
+        #      the very first step — at exactly 0 the upstream gradient to W_o /
+        #      W_v / W_k / W_q would be zeroed out.
+        self.norm_e = nn.LayerNorm(d_lm, elementwise_affine=False)
+        self.injection_gate = nn.Parameter(torch.full((1,), 0.1))
+
     def precompute_kv(self, patches: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Project spec patches to K and V once per clip.
 
@@ -151,7 +170,9 @@ class SectionQueryHead(nn.Module):
 
         # attended value: (B, d_v) = einsum (B, P) (B, P, d_v)
         z = torch.einsum("bp,bpd->bd", alpha, V)
-        e_t = self.W_o(z)                            # (B, d_lm)
+        # Magnitude-bounded, gated injection: LayerNorm caps ||e_t||,
+        # injection_gate (init 0.1) controls strength. See __init__ comment.
+        e_t = self.norm_e(self.W_o(z)) * self.injection_gate
         return e_t, alpha
 
     def forward_dynamic(
@@ -209,7 +230,9 @@ class SectionQueryHead(nn.Module):
         else:
             z = torch.einsum("np,npd->nd", alpha, V_per_idx)
 
-        e_t = self.W_o(z)                                # (N or B, d_lm)
+        # Magnitude-bounded, gated injection: LayerNorm caps ||e_t||,
+        # injection_gate (init 0.1) controls strength. See __init__ comment.
+        e_t = self.norm_e(self.W_o(z)) * self.injection_gate
         return e_t, alpha
 
     def forward_all_sections(
@@ -239,5 +262,7 @@ class SectionQueryHead(nn.Module):
             scores = scores.masked_fill(key_padding_mask.unsqueeze(1), float("-inf"))
         alpha = scores.softmax(dim=-1)               # (B, n_sections, P)
         z = torch.einsum("bsp,bpd->bsd", alpha, V)
-        e_all = self.W_o(z)                          # (B, n_sections, d_lm)
+        # Magnitude-bounded, gated injection (see __init__). LayerNorm operates
+        # on the last dim (d_lm) so it normalises each (b, section) row.
+        e_all = self.norm_e(self.W_o(z)) * self.injection_gate
         return e_all, alpha

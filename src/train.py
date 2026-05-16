@@ -864,6 +864,19 @@ def train(config: dict) -> None:
                 section_ctx=section_ctx,
             )
             loss = loss / accum_steps
+            # Defensive NaN/Inf guard. Without this, one bad batch (e.g., a
+            # bf16 numerical issue in the section_head cross-attention, an
+            # all-padded BEATs row attended to -inf, an exploded W_o output
+            # before LayerNorm hits) would propagate NaN through
+            # optimizer.step() and silently corrupt every weight thereafter.
+            # Symptom would be exactly: train_loss looks fine for one more
+            # step then val collapses to 0 permanently.
+            if not torch.isfinite(loss):
+                print(f"[WARN] non-finite loss at step {n_steps} "
+                      f"(batch {batch_idx}, epoch {epoch+1}); "
+                      f"skipping this step")
+                optimizer.zero_grad()
+                continue
             loss.backward()
 
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
