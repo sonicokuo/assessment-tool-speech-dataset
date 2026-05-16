@@ -914,8 +914,15 @@ def train(config: dict) -> None:
             val_metrics_sum = {"loss_lm_prose": 0.0, "loss_lm_nums": 0.0, "loss_mse": 0.0}
             with torch.no_grad():
                 for batch in val_loader:
+                    # Match the training forward path exactly: pass `mode=sq_mode`
+                    # so val_loss is computed under the same section-query mode
+                    # the model is being trained with. Without this, val_loss
+                    # silently used mode="static" (the _build_section_ctx default)
+                    # even when training was using mode="dynamic", making
+                    # val_loss numbers an unreliable train/val gap signal.
                     section_ctx = _build_section_ctx(
                         section_head, spec_encoder, section_id_to_idx, batch, device,
+                        mode=sq_mode, range_open_id=range_open_id_train,
                     ) if section_head is not None else None
 
                     loss, loss_metrics = compute_loss(
@@ -932,6 +939,10 @@ def train(config: dict) -> None:
                         target_nums=batch.get("target_nums"),
                         gt_scalars=batch.get("gt_scalars"),
                         gt_mask=batch.get("gt_mask"),
+                        # Without this the val nums-loss falls back to prompt_ids,
+                        # silently using the prose prompt for the bare-numbers
+                        # target. Aligns val with train.
+                        prompt_nums_ids=prompt_nums_ids,
                         section_ctx=section_ctx,
                     )
                     val_loss += loss.item()
