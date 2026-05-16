@@ -869,6 +869,15 @@ def train(config: dict) -> None:
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(adapter.parameters(), config["grad_clip"])
                 torch.nn.utils.clip_grad_norm_(llm.parameters(), config["grad_clip"])
+                # section_head must be clipped too. In dynamic mode it sits at
+                # the end of a long backward chain (loss -> pass-2 LM ->
+                # target_embeds -> e_t -> W_q -> pass-1 LM); accumulated unclipped
+                # gradients let W_q drift to large magnitudes after a few epochs,
+                # which collapses the attention softmax and makes the LM
+                # memorize a degenerate query distribution. Symptom: train_loss
+                # drops smoothly while every val metric regresses by epoch 4.
+                if section_head is not None:
+                    torch.nn.utils.clip_grad_norm_(section_head.parameters(), config["grad_clip"])
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
