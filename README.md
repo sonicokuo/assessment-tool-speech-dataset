@@ -8,21 +8,25 @@ cross-attention map per section back to the input spectrogram.
 ```
 audio  →  WavLM-Large (frozen)  →  Adapter (Conv8x + Mamba + FiLM)  →  audio prefix tokens
                                                                           ↓
-                            BEATs (frozen, vendored)  →  spec patches  →  SectionQueryHead
+                              Qwen3-8B + LoRA r=16  →  natural-language description
                                                                           ↓
-                                Qwen3-1.7B (full FT)  →  "<sec_noise><f_snr>…"
+                            (post-hoc) attention extraction from LM layers
                                                                           ↓
-                                       per-section / per-range attention maps  +  prose
+                                       per-section attention maps  +  prose
 ```
 
 Two contributions:
 
-1. **Evidence-grounded section design.** Every `<sec_*>` token triggers a
-   cross-attention query against BEATs patches, producing a time-frequency
-   attention map for that claim. Multi-value features (overlap segments)
-   are split via `<r>` markers, yielding per-range maps.
-2. **Signal Faithfulness Score (SFS).** Regex-parses tagged numerical
-   claims and scores them against per-feature ground-truth tolerances.
+1. **Overlap-aware quality description.** FiLM conditioning modulates the
+   audio prefix using per-frame VAD-derived overlap context, so the model
+   hedges ("F0 estimates unreliable") during overlap rather than
+   hallucinating values. Per-section attention maps for the paper figure
+   are extracted post-hoc from the LM's native attention layers (the
+   earlier `<sec_*>`-tag + `SectionQueryHead` route is preserved as an
+   optional ablation toggle — see `use_sections: true`).
+2. **Signal Faithfulness Score (SFS).** Regex-parses numerical claims
+   from the generated prose and scores them against per-feature ground-truth
+   tolerances.
 
 ## Quick start (PSC Bridges-2)
 
@@ -72,17 +76,17 @@ Valid GPU types on Bridges-2:
 | `l40s-48` | 48 GB |
 | `h100-80` | 80 GB |
 
-The current pipeline assumes `h100-80` at `batch_size=6` with full FT + gradient checkpointing. Smaller GPUs need `--batch_size 4 --gradient_accumulation_steps 2` and/or `--section_query_mode static`.
+The current pipeline assumes `h100-80` at `batch_size=6` with Qwen3-8B + LoRA r=16 + gradient checkpointing. Smaller GPUs need `--batch_size 4 --gradient_accumulation_steps 2`. The 8B frozen backbone (~16 GB in bf16) is the memory floor; LoRA itself only adds ~45M trainable params.
 
 ## Architecture
 
 | Component | Choice | Why |
 |---|---|---|
-| LM | Qwen/Qwen3-1.7B, full FT | Small enough to fully fine-tune on one H100 |
-| Spec encoder | BEATs (Microsoft, vendored under `src/beats/`) | Pretrained on AudioSet, 2D patch grid preserved through the encoder so cross-attention has time-frequency localization |
-| Audio prefix encoder | WavLM-Large (frozen) | Used only to produce the LM audio prefix; not the evidence path |
+| LM | Qwen/Qwen3-8B + LoRA r=16 (default) | LoRA preserves the LM's instruction-following prior so it doesn't mode-collapse into off-topic ramble on weakly-conditioning clips; ~45M trainable on top of 8B frozen pretrained weights. v6 (1.7B + full FT) showed this is essential at 19,900-clip dataset scale. |
+| Audio prefix encoder | WavLM-Large (frozen) | Produces the LM audio prefix |
 | Adapter | Conv8× compression + Mamba context + FiLM overlap conditioning | Compresses WavLM frames 8× while injecting per-frame overlap-reliability signal |
-| Section queries | Dynamic — query = `W_q · h_t` where `h_t` is the LM hidden state at each `<sec_*>` position | Matches the professor's "the model generates a query" framing; static lookup mode also available |
+| Per-section attention | Post-hoc extraction from LM's native attention layers (default) | Parses generated prose for section spans, aggregates LM attention from those spans back to audio prefix tokens. Cleaner than the original `SectionQueryHead` path, which destabilized training when coupled with `tagged_mode=true` |
+| Spec encoder (optional, ablation row) | BEATs (Microsoft, vendored under `src/beats/`) | Only loaded when `use_sections=true`. Frozen, 2D patch grid for the legacy cross-attention design. |
 | Loss | `λ_prose · lm_ce(prose) + λ_nums · lm_ce(nums) + λ_mse · masked_mse(scalar regression)` | Three concurrent signals; nums target concentrates digit-tokenization gradient; MSE bypasses LM entirely to feed the adapter clean scalar gradient |
 
 ### Quality-feature taxonomy (6 sections, 8 SFS-scored scalars)
@@ -163,15 +167,35 @@ CPU only. ~15 minutes total for all 19,900 clips.
 
 ### Step 3 — build `descriptions.json` deterministically
 
-No LLM. Reads the VAD columns when present, falls back to pyannote columns with a one-shot warning. Produces structurally perfect output: every clip has all 6 sections in canonical order, every numerical claim wrapped in `<f_*>`, every overlap range wrapped in `<r>`. ~10 seconds end-to-end.
+No LLM. Reads the VAD columns when present, falls back to pyannote columns with a one-shot warning. ~10 seconds end-to-end.
+
+**Default for the LoRA+8B pipeline** (matches what `configs/config.psc.emnlp.yaml::descriptions_path` points at):
+
+```bash
+python scripts/build_descriptions_deterministic.py --all --untagged --no-overlap-segments \
+  --features-dir $SHARED/data/features_pyannote \
+  --output       $SHARED/data/descriptions_untagged_noseg.json
+```
+
+Sample entry (untagged + no overlap segments):
+
+```
+The recording is 3.920 s long. The signal-to-noise ratio SNR is 13.17 dB. The SRMR is 5.3646. The F0 mean is 152.48 Hz and the F0 standard deviation SD is 62.88 Hz. The speaking rate is 6.888 syl/sec. The pause count is 1 and the pause rate is 15.306 per min. The overlap ratio is 0.7908. F0 and formant estimates are unreliable during overlap windows.
+```
+
+Flag rationale:
+- **`--untagged`** strips the `<sec_*>`, `<f_*>`, `<r>` special-token wrappers from the prose. The LoRA path doesn't register them in the tokenizer (`tagged_mode: false`), and post-hoc attention extraction parses the prose directly for section spans.
+- **`--no-overlap-segments`** drops the "overlap segments are present at 0.5-3.6s, ..." sentence. WavLM features are temporally pooled and the LM cannot learn precise time-stamp emission, so without this flag it hallucinates a stereotyped tile-the-clip pattern that the IoU≥0.8 SFS scorer rejects. The scalar `overlap_ratio` is still emitted.
+
+**Tagged variant** (for the `use_sections=true` ablation row only — registers the 19 special tokens):
 
 ```bash
 python scripts/build_descriptions_deterministic.py --all \
   --features-dir $SHARED/data/features_pyannote \
-  --output       $SHARED/data/descriptions.json
+  --output       $SHARED/data/descriptions_tagged.json
 ```
 
-Sample entry:
+Sample tagged entry:
 
 ```
 The recording is 3.920 s long.
@@ -179,20 +203,12 @@ The recording is 3.920 s long.
 <sec_reverb><f_srmr>The SRMR is 5.3646</f></sec>.
 <sec_pitch><f_f0_mean>The F0 mean is 152.48 Hz</f> and
            <f_f0_sd>the F0 standard deviation SD is 62.88 Hz</f></sec>.
-<sec_tempo><f_speaking_rate>The speaking rate is 6.888 syl/sec</f></sec>.
-<sec_pauses><f_pause_count>The pause count is 1</f> and
-            <f_pause_rate>the pause rate is 15.306 per min</f></sec>.
 <sec_overlap><f_overlap_ratio>The overlap ratio is 0.5102</f> and
              <f_overlap_segments>overlap segments are present at <r>1.0-3.0s</r></f></sec>.
 F0 and formant estimates are unreliable during overlap windows.
 ```
 
-To rebuild only one third for distributed work:
-
-```bash
-python scripts/build_descriptions_deterministic.py --part 1 \
-  --output $SHARED/data/descriptions.part1.json
-```
+To rebuild only one third for distributed work, add `--part 1` (or 2, 3) instead of `--all`.
 
 ### Step 4 — WavLM features + overlap context → `.pt`
 
@@ -227,7 +243,9 @@ done
 
 CPU only. ~15 minutes total. Only mutates `overlap_info` and `overlap_segments`; `audio_features` and `beats_patches` survive byte-identical.
 
-### Step 5 — cache BEATs patches into each `.pt`
+### Step 5 — cache BEATs patches into each `.pt` *(optional — only needed for the `use_sections=true` ablation row)*
+
+The headline LoRA + 8B run uses post-hoc attention extraction from the LM's native layers and does NOT need BEATs. Only run this step if you plan to train the `section-head` or `static-queries` design-ablation rows (which re-enable the legacy `SectionQueryHead` path).
 
 Adds the `beats_patches` and `beats_grid_meta` keys to every `.pt`. Idempotent: clips that already have `beats_patches` are skipped unless `--overwrite`.
 
@@ -279,7 +297,7 @@ wandb: 🚀 View run at https://wandb.ai/speech_quality_adapter/aqua-nl-emnlp/ru
 
 ### Main run
 
-Uses `configs/config.psc.emnlp.yaml` defaults: Qwen3-1.7B full FT, `film-mamba` adapter, `use_sections: true`, `section_query_mode: dynamic`, BEATs cached, `batch_size: 6`, `epochs: 15`.
+Uses `configs/config.psc.emnlp.yaml` defaults: **Qwen3-8B + LoRA r=16**, `film-mamba` adapter, `use_sections: false`, `tagged_mode: false`, `beats_cached: false`, `batch_size: 6`, `epochs: 15`.
 
 Foreground (interactive shell visible — output streams to your terminal):
 
@@ -301,7 +319,7 @@ PID=$!
 echo "PID=$PID  log=$LOG"
 ```
 
-~33 min / epoch × 15 epochs ≈ 8 hours on a single H100.
+~33 min / epoch × 15 epochs ≈ 8 hours on a single H100. (Roughly the same as the old Qwen3-1.7B + full FT timing — the larger 8B forward is offset by LoRA's smaller backward + optimizer-state footprint.)
 
 **Follow progress in real time while detached**:
 
@@ -312,7 +330,7 @@ tail -f $LOG          # ctrl-C to stop following (the run keeps going)
 The `python -u` flag in the launch command above is **critical** — without it, when stdout is redirected to a file (as `nohup ... > $LOG` does), Python block-buffers stdout in ~8 KB chunks and the log file looks empty for minutes. `-u` forces unbuffered output so every print lands in `$LOG` immediately and `tail -f` shows real-time progress.
 
 What you should see:
-- ~1 min in: model construction banner (`[tagged-mode]`, `[full-FT]`, `[sections] 6 sections registered`), parameter counts, dataset load (`Loaded: train=13900, val=3000`), and the wandb URL.
+- ~1 min in: model construction banner (`[LoRA] rank=16 alpha=32`, `Parameters — LM total: 8.23B | LoRA trainable: 43.6M | adapter trainable: 51.0M | grand total trainable: 94.7M (1.150% of LM)`), dataset load (`Loaded: train=13900, val=3000`), and the wandb URL.
 - After ~30 s of warmup: loss prints every `log_every` steps (default 10), starts near 9 and falls toward 1-3 over the first epoch.
 - After each epoch: a val pass with BLEU / ROUGE / SFS, then a checkpoint write to `<save_dir>`.
 
@@ -324,8 +342,10 @@ Every epoch writes `<save_dir>/last.pt` (latest) and updates `<save_dir>/best.pt
 
 ```bash
 python src/train.py --config configs/config.psc.emnlp.yaml \
-  --resume_from $SHARED/checkpoints/qwen3_17b_full_ft_tagged_v1/last.pt
+  --resume_from $SHARED/checkpoints/film_mamba__v1/last.pt
 ```
+
+If `last.pt` is corrupted (e.g., session timed out mid-save — the file size will be much smaller than `best.pt`), resume from `best.pt` instead. The trainer writes `last.pt` non-atomically, so a SIGKILL during the save truncates it; `best.pt` only updates after a complete write of `last.pt`, so it's the safer fallback.
 
 ### Smoke run (50 micro-batches, no wandb)
 
@@ -335,7 +355,7 @@ The trainer accepts an inline `max_steps` cap via the config layer. Useful for v
 WANDB_MODE=disabled python src/train.py --config configs/config.psc.emnlp.yaml --max_steps 50
 ```
 
-Walltime ~1-2 min after the first-time Qwen3-1.7B HF download (~3.4 GB).
+Walltime ~1-2 min after the first-time Qwen3-8B HF download (~16 GB across 5 safetensors shards). Use `HF_HOME=$SHARED/hf_cache` to keep the cache on shared storage so other users / sessions don't re-download.
 
 ### Config overrides on the command line
 
@@ -353,6 +373,14 @@ python src/train.py --config configs/config.psc.emnlp.yaml \
 ## Ablations
 
 The headline run uses the main config (`film-mamba`). Two ablation families. Save_dirs and wandb run names mirror the adapter / knob being tested so you can read a checkpoint path and know what it is.
+
+**All ablations inherit the LoRA + 8B recipe from `configs/config.psc.emnlp.yaml`** — no per-command `--lm_name` / `--lora_rank` flags needed. To run a row with the OLD full-FT 1.7B recipe for comparison (e.g., to quantify how much LoRA matters at this dataset scale), append:
+
+```
+--lm_name Qwen/Qwen3-1.7B --lora_rank 0
+```
+
+to any of the commands below. Save it under a separate `__fullft` suffix to keep checkpoints distinct (e.g., `--save_dir $SHARED/checkpoints/film_mamba__fullft__v1`).
 
 ### Adapter-architecture sweep
 
@@ -440,30 +468,43 @@ nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
 
 ### Design ablations (orthogonal to the adapter sweep)
 
-For probing the section-attention design itself. Each toggles **one** of the EMNLP-novelty knobs while keeping the adapter at the headline `film-mamba`:
+For probing the section-attention design itself. Note that since v7 the YAML defaults are `use_sections: false` + `tagged_mode: false`, so the headline row already runs the "free-form prose" config. These ablations turn the section-tag path *back on*, to compare against the post-hoc attention extraction approach that's now the default:
 
-| Knob | Override | Run name |
+| Knob | Override (relative to YAML defaults) | Run name |
 |---|---|---|
-| No sections, free-form prose | `--use_sections false --tagged_mode false` | `no-sections` |
-| Static section queries (learnable lookup) | `--section_query_mode static` | `static-queries` |
+| Section-head ON + tagged-prose (legacy EMNLP-rework path) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json` | `section-head` |
+| Section-head ON, but static queries (learnable lookup, no LM-derived query) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json --section_query_mode static` | `static-queries` |
+| Full-FT comparison (Qwen3-1.7B, no LoRA) | `--lm_name Qwen/Qwen3-1.7B --lora_rank 0` | `fullft-1.7b` |
 
-Run these only after the adapter sweep is done, to argue novelty of the section-query design itself — not strictly needed for the paper's main result table.
+Section-head rows require the tagged JSON — rebuild via `scripts/build_descriptions_deterministic.py --all` (without `--untagged`/`--no-overlap-segments`) into a separate output file.
 
 ```bash
-# no-sections (free-form prose, no <sec_*> or <f_*> tags)
-LOG=$SHARED/logs/no_sections_$(date +%Y%m%d_%H%M%S).log
+# section-head (legacy EMNLP-rework path — needs descriptions_tagged.json)
+LOG=$SHARED/logs/section_head_$(date +%Y%m%d_%H%M%S).log
 nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --use_sections false --tagged_mode false \
-  --save_dir        $SHARED/checkpoints/no_sections__v1 \
-  --wandb_run_name  no-sections \
+  --use_sections true --tagged_mode true --beats_cached true \
+  --descriptions_path $SHARED/data/descriptions_tagged.json \
+  --save_dir          $SHARED/checkpoints/section_head__v1 \
+  --wandb_run_name    section-head \
   > "$LOG" 2>&1 &
 
-# static-queries (learnable per-section query, not LM-derived)
+# static-queries (static section queries instead of LM-derived dynamic queries)
 LOG=$SHARED/logs/static_queries_$(date +%Y%m%d_%H%M%S).log
 nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --use_sections true --tagged_mode true --beats_cached true \
+  --descriptions_path  $SHARED/data/descriptions_tagged.json \
   --section_query_mode static \
-  --save_dir        $SHARED/checkpoints/static_queries__v1 \
-  --wandb_run_name  static-queries \
+  --save_dir           $SHARED/checkpoints/static_queries__v1 \
+  --wandb_run_name     static-queries \
+  > "$LOG" 2>&1 &
+
+# fullft-1.7b (full FT comparison — the original v6 recipe before LoRA)
+LOG=$SHARED/logs/fullft_17b_$(date +%Y%m%d_%H%M%S).log
+nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --lm_name    Qwen/Qwen3-1.7B \
+  --lora_rank  0 \
+  --save_dir   $SHARED/checkpoints/fullft_17b__v1 \
+  --wandb_run_name fullft-1.7b \
   > "$LOG" 2>&1 &
 ```
 
@@ -503,10 +544,20 @@ Written **next to the checkpoint** (`dirname(--checkpoint)`):
 - `inference_results.json` — per-clip records flushed every 50 clips via atomic tmp+rename. Keys per clip:
   - `generated`, `target`, `claims` (parsed `(feature, value)` pairs)
   - `sfs_precision / sfs_recall / sfs_f1`, `per_feature` breakdown
-  - `attention_maps` — one flat-vector per section + one per `<r>` range:
-    - `noise`, `reverb`, `pitch`, `tempo`, `pauses`, `overlap`
-    - `overlap@<start>-<end>s` per emitted `<r>` range
+  - `attention_maps` — **only populated when `use_sections=true`** (the section-head ablation row). The headline LoRA + 8B path uses post-hoc attention extraction (see `scripts/extract_attention.py` — separate run after inference).
 - `inference_summary.json` — aggregate `sfs_precision / recall / f1`, `per_feature_accuracy`, `gen_metrics: {bleu, rouge_l, bertscore_f1}`.
+
+After inference, run the analysis scripts for paper-ready tables:
+
+```bash
+# Per-feature SFS breakdown (precision/recall/F1 per feature)
+python scripts/per_feature_sfs.py \
+  --inference_results $SHARED/checkpoints/film_mamba__v1/inference_results.json
+
+# Overlap hedging contingency table (evidence for contribution #1)
+python scripts/overlap_hedging_compare.py \
+  --inference_results $SHARED/checkpoints/film_mamba__v1/inference_results.json
+```
 
 The same wandb run page used at training time gets `test/sfs_*` and `test/{bleu,rouge_l,bertscore_f1}` (because the checkpoint embeds `wandb_run_id`).
 
@@ -526,9 +577,11 @@ Different `save_dir` ↔ independent `inference_results.json` files, so range-pa
 
 ### Attention figures
 
+**Section-head ablation row only** (`use_sections=true`). `scripts/plot_attention_spectrograms.py` reads the `attention_maps` field from `inference_results.json`, which is only populated when section_head fired during inference:
+
 ```bash
 python scripts/plot_attention_spectrograms.py \
-  --results   $SHARED/checkpoints/a0__main__v1/inference_results.json \
+  --results   $SHARED/checkpoints/section_head__v1/inference_results.json \
   --audio_dir $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/test/mix_clean \
   --output    docs/figures/attention_overlays \
   --limit     10 \
@@ -536,6 +589,8 @@ python scripts/plot_attention_spectrograms.py \
 ```
 
 Each PDF has one row per emitted section + one per `<r>` range, log-mel in greyscale + attention map overlaid as a hot heatmap. `PatchGrid.reshape_attention` reshapes the flat per-section vector back to the 2D `(T_p, F_p)` grid before plotting.
+
+**For the headline LoRA + 8B run** (no section_head), per-section attention maps are recovered post-hoc from the LM's native attention layers. `scripts/extract_attention.py` + `scripts/plot_attention.py` (in progress — task #59 / #60) do this without the section_head path. Same paper figure, no training-time coupling.
 
 ## Metric semantics
 
@@ -617,8 +672,8 @@ scripts/
   test_*.py                          — Standalone test scripts
 
 configs/
-  config.psc.emnlp.yaml    — Current default: Qwen3-1.7B full FT + sections + BEATs + dynamic
-  config.psc.yaml          — Older baseline (Qwen3-8B + LoRA + tagged_mode: false), kept for reference
+  config.psc.emnlp.yaml    — Current default: Qwen3-8B + LoRA r=16, untagged-noseg targets, no section_head
+  config.psc.yaml          — Older baseline (Qwen3-8B + LoRA + earlier description format), kept for reference
 
 tests/
   test_sfs.py                          — TaggedClaimParser + scorer
@@ -633,10 +688,10 @@ descriptions.json                      — 19,900 GT entries (regenerated by bui
 
 ## Conventions and gotchas
 
-- **`Qwen/Qwen3-1.7B` is the instruct-tuned model.** Qwen3 doesn't have a separate `-Instruct` suffix; bare name is the instruct variant, `-Base` is the SSL-only one. Don't reintroduce the `-Instruct` suffix.
+- **`Qwen/Qwen3-8B` is the default LM as of v7.** Earlier configs used 1.7B + full FT, which catastrophically forgot the LM's instruction-following prior on the ~6M target-token training set. LoRA on 8B keeps the prior frozen as an anchor — ~45M trainable params instead of 1.7B. Both `Qwen/Qwen3-8B` and `Qwen/Qwen3-1.7B` are the instruct-tuned variants (no `-Instruct` suffix in Qwen3).
 - **`overlap_info` in `.pt` files comes from `overlap_segments` (pyannote-on-mix), not `overlap_segments_vad`.** That's the intended input distribution. The description GT reads VAD-on-stems. Different signals on purpose, to prevent the trivial-copy data leakage.
-- **Special tokens are added with `special_tokens=False`** so `tokenizer.decode(..., skip_special_tokens=True)` keeps them in the output string — required for both the SFS parser and the attention hook to find section positions.
-- **`max_target_length: 224`** matches the trimmed 8-feature catalog (~9 spans, ~180-200 tokens median). The trimmed verbalization output is shorter than the 22-feature catalog the older recipes used.
-- **gradient_checkpointing is mandatory at full FT** on H100-80 to stay under the memory budget at batch_size=6.
-- **`<r>` markers exist inside `<f_overlap_segments>` only.** All other inner spans hold a single value and don't use `<r>`.
-- **Atomic writes everywhere.** `preprocess_beats.py`, `refresh_overlap_info.py`, `fix_overlap_csv.py`, and `inference.py` all use `.tmp` + `os.replace` so a SIGKILL mid-write can't corrupt artifacts.
+- **Special tokens (`<sec_*>`, `<f_*>`, `<r>`) are registered only when `tagged_mode: true`** (section-head ablation rows). They're added with `special_tokens=False` so `tokenizer.decode(..., skip_special_tokens=True)` keeps them in the output string — required for both the SFS parser and the section_head's attention hook. With `tagged_mode: false` (default), these tokens never enter the vocab and prose is generated as plain text.
+- **`max_target_length: 512`** covers the full untagged-noseg description format (p99 ~380 tokens, max ~430). The earlier 224 cap was set for a trimmed catalog and silently truncated tails; 512 absorbs the longest clip with margin.
+- **`gradient_checkpointing` is required at 8B + LoRA** to stay under H100-80 memory at `batch_size: 6`. The 8B frozen weights alone are ~16 GB in bf16; activations need to be checkpointed.
+- **`--no-overlap-segments` is critical for SFS.** Without it, the model hallucinates a stereotyped 5-7-segment "tile-the-clip" pattern at the end of each description. The IoU≥0.8 SFS scorer rejects almost all of these → overlap_span recall craters to 0. Verified in v6 → v7 transition: dropping the segments sentence took overlap_span recall from 0.0 to ~0.65.
+- **Atomic writes everywhere except `last.pt`.** `preprocess_beats.py`, `refresh_overlap_info.py`, `fix_overlap_csv.py`, and `inference.py` all use `.tmp` + `os.replace` so a SIGKILL mid-write can't corrupt artifacts. `last.pt` from `train.py` does NOT yet use atomic write — if the session times out mid-save, `last.pt` is truncated and resume must use `best.pt` instead.
