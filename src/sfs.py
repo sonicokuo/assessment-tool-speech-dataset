@@ -91,6 +91,14 @@ class ClaimParser:
             r"duration(?:\s+of\s+the\s+(?:speech\s+)?sample)?\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*s(?!yl)",
             [("duration_sec", 1, "s")],
         ),
+        # Duration — alternate phrasing "(The) recording is X s long" used by the
+        # deterministic builder. The old gemma4 verbalizer used "duration is X s"
+        # which the pattern above catches; the new builder phrases it differently
+        # and we'd otherwise score zero for duration on every clip.
+        (
+            r"(?:The\s+)?recording\s+is\s+(\d+\.?\d*)\s*s(?:ec(?:onds?)?)?\s+long",
+            [("duration_sec", 1, "s")],
+        ),
         # Overlap ratio — "The overlap ratio is 0.7528" (unitless 0-1)
         # Also handles "overlap ratio of the sample is 0.7528"
         (
