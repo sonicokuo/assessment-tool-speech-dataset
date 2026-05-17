@@ -1,48 +1,49 @@
-# EMNLP rework: Qwen3-1.7B-Instruct, full fine-tuning, tagged prose.
+# EMNLP rework: Qwen3-8B + LoRA r=16 (default — proven recipe from v7).
 #
-# How this differs from configs/config.psc.yaml (the existing Phase-2 baseline):
-#   - lm_name: Qwen3-8B → Qwen3-1.7B-Instruct  (~5× smaller, full-FT-friendly)
-#   - lora_rank: 16 → 0  (full FT — train all LM weights)
-#   - lr_lora removed, lr_lm: 1.0e-5 added  (lower LR for full FT)
-#   - tagged_mode: true  (registers 9 tags via add_tokens(special_tokens=False)
-#     so they survive decode(skip_special_tokens=True); see src/feature_tags.py)
-#   - gradient_checkpointing: true  (mandatory for full-FT memory budget)
-#   - max_target_length: 384 → 224  (catalog trimmed 16→8 features; each clip
-#     now has ~9 tagged spans instead of ~16, descriptions drop to ~180 tokens)
-#   - descriptions_path: points to the tagged JSON (re-verbalize with
-#     `scripts/feature_verbalization.py --tagged` first)
+# Recipe history:
+#   - v1-v5: Qwen3-1.7B + full FT + tagged_mode=true + section_head — collapsed
+#     val_sfs_f1 to 0 by epoch 4 every time (catastrophic forgetting + tag-token
+#     destabilization). Off-topic-ramble mode-split confirmed by sample audits.
+#   - v6: Qwen3-1.7B + full FT + untagged — peaked at val_sfs_f1=0.24 E4, drifted
+#     down by E8. Better than v1-v5 but still mode-split on short clips.
+#   - v7 (current): Qwen3-8B + LoRA r=16 + untagged + no-overlap-segments.
+#     Matches the q3_8b-film-mamba-v2 baseline (val_sfs_f1=0.61, recall=0.88)
+#     and is what all ablation runs now inherit.
+#
+# To run the old full-FT ablation row instead:
+#     python src/train.py --config configs/config.psc.emnlp.yaml \
+#       --lm_name Qwen/Qwen3-1.7B --lora_rank 0
 #
 # See scratch/EMNLP_REWORK_PLAN_20260511.md for the decision rationale.
 
 # ── Model ──────────────────────────────────────────────
-lm_name: "Qwen/Qwen3-1.7B"
+lm_name: "Qwen/Qwen3-8B"
 adapter_variant: "film-mamba"
 
-# Full fine-tuning: lora_rank: 0 disables the PEFT wrap and trains all LM
-# weights. Keep lora_alpha / targets / dropout for forward-compat (ignored).
-lora_rank: 0
+# LoRA on q/k/v/o + MLP projections. ~45M trainable on top of 8B frozen
+# pretrained weights → preserves the LM's instruction-following prior
+# (the lack of which caused v6's mode-collapse into off-topic ramble).
+lora_rank: 16
 lora_alpha: 32
 lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 lora_dropout: 0.05
 
-# Tagged-prose mode: registers per-section + per-feature special tokens before
-# training so the model can emit <sec_X>…</sec> and <f_*>…</f> spans directly.
-# See src/section_tags.py for the catalog (6 sections, 9 inner feature tags).
-tagged_mode: true
+# Tagged-prose mode: when true, registers per-section + per-feature special
+# tokens (19 new tokens) via tokenizer.add_tokens(special_tokens=False).
+# DEFAULT FALSE since v7: tagged_mode=true + full FT destabilized training
+# (new-token embeddings get noisy gradient → catastrophic forgetting). The
+# untagged prose path with post-hoc attention extraction (scripts/extract_
+# attention.py) replaces it cleanly.
+tagged_mode: false
 
-# Section-query design (Path 3 of the EMNLP rework). When use_sections=true:
-#   - 6 <sec_X> section tags + 1 shared </sec> close registered alongside
-#     the 9 <f_*> inner feature tags (all via add_tokens(special_tokens=False)).
-#   - A pretrained spec encoder (BEATs by default) produces 2D patch
-#     embeddings for each clip. Patches are precomputed via
-#     scripts/preprocess_beats.py and cached into the per-clip .pt files
-#     under the key "beats_patches".
-#   - SectionQueryHead has 6 learnable queries (one per section). At every
-#     <sec_X> emission, the corresponding query cross-attends to the spec
-#     patches, the resulting attention map is saved per clip, and the
-#     attended audio summary is residually injected into the LM input
-#     embedding at that position.
-use_sections: true
+# Section-query design (Path 3 of the EMNLP rework). When use_sections=true,
+# SectionQueryHead injects per-section cross-attention residuals at <sec_X>
+# positions. DEFAULT FALSE since v7: the section_head path collapsed val_sfs_f1
+# to 0 by epoch 4 across v3/v4/v5 (bf16 instability + zero-grad init + tagged-
+# mode coupling). The post-hoc attention extraction route gets the same paper
+# figure without touching the LM input distribution. To re-enable for ablation
+# rows, set use_sections=true on the CLI.
+use_sections: false
 
 # Spec encoder configuration. Default is BEATs (vendored under src/beats/);
 # AST is available via spec_encoder_name="ast" — see src/spec_encoder.py.
@@ -67,10 +68,12 @@ section_d_v: 256
 #               training compute and memory; fits H100 80 GB.
 section_query_mode: "dynamic"
 
-# Whether BEATs patches are precomputed and cached into the .pt files (recommended).
-# false → would re-run BEATs every batch (~10-20% slower, not supported in v1
-# because waveforms aren't in the .pt files).
-beats_cached: true
+# Whether BEATs patches are precomputed and cached into the .pt files.
+# DEFAULT FALSE since v7: BEATs is only needed by section_head (use_sections=true).
+# With use_sections=false, the dataloader skips loading the beats_patches key
+# even when it's present in the .pt — saves ~10% step time. Re-enable when
+# turning on use_sections for an ablation row.
+beats_cached: false
 
 # ── Optimizer ──────────────────────────────────────────────
 optimizer: "adamw"
@@ -78,8 +81,11 @@ adam_beta1: 0.9
 adam_beta2: 0.999
 adam_epsilon: 1.0e-8
 lr_adapter: 1.0e-4   # unchanged from Phase-2
-lr_lm: 1.0e-5        # full-FT LR — lower than the old lr_lora=2e-5 to avoid
-                     # catastrophic forgetting of pretraining distribution.
+lr_lm: 1.0e-5        # LR for the LM trainables. With lora_rank=16 (default)
+                     # this is the LR on the LoRA delta only — the 8B frozen
+                     # backbone never updates. With --lora_rank 0 it would be
+                     # the full-FT LR, which is fine because v6 already proved
+                     # 1e-5 is safe at this scale.
 weight_decay: 0.01
 grad_clip: 1.0
 
@@ -90,9 +96,11 @@ min_lr_ratio: 0.0
 
 # ── Training ──────────────────────────────────────────────
 bf16: true
-batch_size: 6                  # 1.7B + full FT + 4 overlap chans → 6 fits 40GB
+batch_size: 6                  # 8B + LoRA r=16 + gradient_checkpointing fits on
+                               # H100-80 at batch_size=6. Verified by v7-lora-8b
+                               # (~9 epochs before timeout, no OOMs).
 gradient_accumulation_steps: 1
-gradient_checkpointing: true   # mandatory at full FT to stay under 40GB
+gradient_checkpointing: true   # required at 8B + LoRA to stay under H100-80 memory
 epochs: 15                     # same trajectory shape as the Phase-2 v2 config
 seed: 73
 # max_target_length must exceed the longest tokenized description, otherwise
@@ -106,13 +114,20 @@ max_nums_length: 64            # bare-nums target is 7 slots ≈ 50 tokens
 resume_from: null
 
 # ── Data ──────────────────────────────────────────────
-# IMPORTANT: re-verbalize before training, e.g.:
-#   python scripts/feature_verbalization.py --tagged \
-#     --input features/<split>.csv --output verbalized_tagged/<split>.csv
-# then rebuild descriptions.json with merge_verbalized_to_json.py and point
-# descriptions_path at it.
+# IMPORTANT: descriptions_untagged_noseg.json is the v7-proven target format.
+# Generated by:
+#   python scripts/build_descriptions_deterministic.py --all \
+#     --untagged --no-overlap-segments \
+#     --features-dir $SHARED/data/features_pyannote \
+#     --output       $SHARED/data/descriptions_untagged_noseg.json
+#
+# The --no-overlap-segments flag drops the "overlap segments are present at
+# 0.5-3.6s, ..." sentence — WavLM features are temporally pooled and the LM
+# cannot learn precise time-stamp emission, so without this flag it hallucinates
+# a stereotyped "tile-the-clip" pattern that the IoU>=0.8 SFS scorer rejects.
+# Confirmed via per_feature_sfs.py: overlap_span recall went from 0 → 0.65 in v7.
 data_dir: "/ocean/projects/cis260125p/shared/data/processed_pyannote"
-descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions.json"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_untagged_noseg.json"
 features_path: "/ocean/projects/cis260125p/shared/data/features.json"
 features_csv:
   train: "/ocean/projects/cis260125p/shared/data/features_pyannote/train-100.csv"
@@ -138,7 +153,8 @@ top_k: 0
 top_p: 1.0
 
 # ── Saving ──────────────────────────────────────────────
-save_dir: "/ocean/projects/cis260125p/shared/checkpoints/qwen3_17b_full_ft_tagged_v1"
+# Override per-ablation with --save_dir $SHARED/checkpoints/<variant>__v1
+save_dir: "/ocean/projects/cis260125p/shared/checkpoints/v7_lora_8b"
 
 # ── Logging ──────────────────────────────────────────────
 # wandb_entity pins the team account so contributors don't need to export
