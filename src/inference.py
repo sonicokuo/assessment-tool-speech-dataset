@@ -559,20 +559,14 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             section_ctx=clip_section_ctx,
         )
 
-        # Prepend the measured duration to the generated output. WavLM-Large emits
-        # one frame per 320 samples at 16 kHz = 50 Hz frame rate, so the prefix
-        # token count → seconds is a direct conversion. We always do this because:
-        #   1. Duration is trivially measurable from the audio (not a learning task).
-        #   2. The model was mode-collapsing on duration (0/98 accuracy on v7-lora-8b
-        #      clean control — always emitted ~7-11s regardless of true length).
-        #   3. The ClaimParser dedup keeps the first occurrence per feature, so
-        #      even if the model also emits its own duration sentence, the
-        #      prepended correct value wins and the wrong one is silently dropped.
-        # If trained with --no-duration descriptions, the model never emits a
-        # competing duration sentence, and the output is clean.
+        # Measure duration from the WavLM frame count (50 Hz frame rate from
+        # the encoder's 320-sample stride at 16 kHz). Stored as a sidecar
+        # metadata field, NOT prepended to the generated prose — duration is
+        # an audio property, not a quality claim, and SFS no longer scores it.
+        # Downstream tools that need duration alongside the quality assessment
+        # read this field directly from inference_results.json.
         wavlm_frame_rate_hz = 50.0
         measured_duration_sec = sample["audio_features"].shape[0] / wavlm_frame_rate_hz
-        generated = f"The recording is {measured_duration_sec:.3f} s long. " + generated.lstrip()
 
         output_entry = {
             "filename": sample["filename"],
