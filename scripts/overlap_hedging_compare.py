@@ -16,6 +16,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -26,6 +27,27 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from sfs import ClaimParser  # noqa: E402
+
+
+def load_overlap_from_csv(csv_path: Path) -> dict[str, float]:
+    """Map filename → overlap_ratio from a features CSV.
+
+    Used when the inference run is on clips that don't have targets (e.g., the
+    clean-speech control set). Prefers overlap_ratio_vad (VAD-on-stems oracle)
+    when present, falls back to overlap_ratio (pyannote-on-mix).
+    """
+    out: dict[str, float] = {}
+    with csv_path.open() as f:
+        for row in csv.DictReader(f):
+            fname = (row.get("filename") or "").strip()
+            if not fname:
+                continue
+            raw = (row.get("overlap_ratio_vad") or row.get("overlap_ratio") or "").strip()
+            try:
+                out[fname] = float(raw) if raw else 0.0
+            except ValueError:
+                out[fname] = 0.0
+    return out
 
 
 # Hedging sentence the deterministic builder emits when overlap_ratio > 0.
@@ -64,10 +86,16 @@ BUCKETS = [
 ]
 
 
-def aggregate(results: list[dict]) -> dict[str, dict]:
+def aggregate(results: list[dict],
+              csv_overlap: dict[str, float] | None = None) -> dict[str, dict]:
     """Tally hedge presence per overlap-ratio bucket.
 
     Returns: {bucket_name: {"n": int, "n_hedged": int, "examples": list}}
+
+    Overlap ratio is resolved per clip by trying, in order:
+      1. parse it from the target text (works for the main test set)
+      2. look it up by filename in csv_overlap (works for the clean-control set,
+         which has no targets in the descriptions JSON)
     """
     agg: dict[str, dict] = {name: {"n": 0, "n_hedged": 0, "examples": []}
                             for name, _ in BUCKETS}
@@ -75,6 +103,8 @@ def aggregate(results: list[dict]) -> dict[str, dict]:
         target = entry.get("target") or ""
         generated = entry.get("generated") or ""
         ratio = overlap_ratio_from_target(target)
+        if ratio is None and csv_overlap is not None:
+            ratio = csv_overlap.get(entry.get("filename", ""))
         if ratio is None:
             continue  # can't bucket without GT overlap
         hedged = has_hedge(generated)
@@ -139,6 +169,10 @@ def main() -> int:
                    help="Path to inference_results.json produced by src/inference.py")
     p.add_argument("--output", type=Path, default=None,
                    help="Markdown output path (default: alongside the inference_results)")
+    p.add_argument("--features_csv", type=Path, default=None,
+                   help="Optional features CSV with overlap_ratio_vad / overlap_ratio columns. "
+                        "Used as a fallback when target text doesn't contain the overlap ratio "
+                        "(e.g., clean-speech control set with no descriptions).")
     args = p.parse_args()
 
     if not args.inference_results.is_file():
@@ -148,7 +182,15 @@ def main() -> int:
     results = json.loads(args.inference_results.read_text())
     print(f"Loaded {len(results)} clip results from {args.inference_results}")
 
-    agg = aggregate(results)
+    csv_overlap = None
+    if args.features_csv is not None:
+        if not args.features_csv.is_file():
+            print(f"ERROR: {args.features_csv} not found", file=sys.stderr)
+            return 2
+        csv_overlap = load_overlap_from_csv(args.features_csv)
+        print(f"Loaded {len(csv_overlap)} filename→overlap_ratio mappings from {args.features_csv}")
+
+    agg = aggregate(results, csv_overlap=csv_overlap)
     md = render_markdown(agg, total_clips=len(results))
 
     out_path = args.output or args.inference_results.with_name("overlap_hedging.md")
