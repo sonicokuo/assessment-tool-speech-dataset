@@ -1162,13 +1162,45 @@ def train(config: dict) -> None:
                 payload["section_head_state_dict"] = section_head.state_dict()
             return payload
 
+        # Atomic save: write to .tmp then os.replace (POSIX atomic). Without
+        # this, a SIGKILL / OOM / quota-truncate during torch.save leaves a
+        # partially-written file at the target path, corrupting the checkpoint.
+        # Lost v7-lora-8b's best.pt to exactly this kind of partial-write event.
+        def _atomic_save(payload, path):
+            tmp = path + ".tmp"
+            torch.save(payload, tmp)
+            os.replace(tmp, path)
+
+        # Upload best.pt to wandb as a versioned Artifact — off-site backup so
+        # local file loss (quota truncation, Lustre OST failure, accidental
+        # deletion, etc.) doesn't kill the training run. Failures here do NOT
+        # interrupt training — wandb upload is best-effort.
+        def _upload_to_wandb_artifact(path: str, name: str, metadata: dict) -> None:
+            try:
+                artifact = wandb.Artifact(name=name, type="model", metadata=metadata)
+                artifact.add_file(path)
+                wandb.log_artifact(artifact)
+                print(f"  [wandb-artifact] uploaded {os.path.basename(path)} "
+                      f"as {name}  (metadata={metadata})")
+            except Exception as e:
+                print(f"  [wandb-artifact] WARNING upload of {path} failed: "
+                      f"{type(e).__name__}: {e}")
+
         if avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
             best_val_sfs_f1 = avg_sfs_f1
-            torch.save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "best.pt"))
+            best_path = os.path.join(config["save_dir"], "best.pt")
+            _atomic_save(_ckpt_payload(epoch), best_path)
             print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
+            if config.get("upload_ckpt_to_wandb", True):
+                run_name = (wandb.run.name if wandb.run is not None else None) or "run"
+                _upload_to_wandb_artifact(
+                    best_path,
+                    name=f"best-{run_name}",
+                    metadata={"epoch": epoch, "val_sfs_f1": best_val_sfs_f1},
+                )
 
         # Save last (for resuming)
-        torch.save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "last.pt"))
+        _atomic_save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "last.pt"))
         print("Saved epoch model")
 
     wandb.finish()
