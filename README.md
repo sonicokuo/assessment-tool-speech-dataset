@@ -169,23 +169,27 @@ CPU only. ~15 minutes total for all 19,900 clips.
 
 No LLM. Reads the VAD columns when present, falls back to pyannote columns with a one-shot warning. ~10 seconds end-to-end.
 
-**Default for the LoRA+8B pipeline** (matches what `configs/config.psc.emnlp.yaml::descriptions_path` points at):
+**Default for the LoRA+8B pipeline (v8 recipe):**
 
 ```bash
-python scripts/build_descriptions_deterministic.py --all --untagged --no-overlap-segments \
+python scripts/build_descriptions_deterministic.py --all --untagged \
+  --no-overlap-segments --no-duration \
   --features-dir $SHARED/data/features_pyannote \
-  --output       $SHARED/data/descriptions_untagged_noseg.json
+  --output       $SHARED/data/descriptions_untagged_noseg_nodur.json
 ```
 
-Sample entry (untagged + no overlap segments):
+Sample entry (8 SFS-scored features, no duration / no overlap segments):
 
 ```
-The recording is 3.920 s long. The signal-to-noise ratio SNR is 13.17 dB. The SRMR is 5.3646. The F0 mean is 152.48 Hz and the F0 standard deviation SD is 62.88 Hz. The speaking rate is 6.888 syl/sec. The pause count is 1 and the pause rate is 15.306 per min. The overlap ratio is 0.7908. F0 and formant estimates are unreliable during overlap windows.
+The signal-to-noise ratio SNR is 13.17 dB. The SRMR is 5.3646. The F0 mean is 152.48 Hz and the F0 standard deviation SD is 62.88 Hz. The speaking rate is 6.888 syl/sec. The pause count is 1 and the pause rate is 15.306 per min. The overlap ratio is 0.7908. F0 and formant estimates are unreliable during overlap windows.
 ```
 
 Flag rationale:
 - **`--untagged`** strips the `<sec_*>`, `<f_*>`, `<r>` special-token wrappers from the prose. The LoRA path doesn't register them in the tokenizer (`tagged_mode: false`), and post-hoc attention extraction parses the prose directly for section spans.
 - **`--no-overlap-segments`** drops the "overlap segments are present at 0.5-3.6s, ..." sentence. WavLM features are temporally pooled and the LM cannot learn precise time-stamp emission, so without this flag it hallucinates a stereotyped tile-the-clip pattern that the IoU≥0.8 SFS scorer rejects. The scalar `overlap_ratio` is still emitted.
+- **`--no-duration`** drops the leading "The recording is X s long." sentence. Duration is trivially measurable from the wav header (`audio.shape[0] / sample_rate`) — the model has no genuine learning task there, and including it as a scored claim would either inflate SFS for models that emit a correct auto-prepend or penalize honest abstention. SFS now scores audio-QUALITY features only. Duration is stored as a separate `measured_duration_sec` sidecar field at inference time and can be rendered alongside the quality prose by downstream UIs.
+
+> **Note:** the YAML's `descriptions_path` should point at the file you just built. If you're using a different name, override via `--descriptions_path $SHARED/data/<your>.json` on the train CLI.
 
 **Tagged variant** (for the `use_sections=true` ablation row only — registers the 19 special tokens):
 
@@ -542,24 +546,75 @@ For the design-ablation checkpoints (`no_sections__v1`, `static_queries__v1`), s
 Written **next to the checkpoint** (`dirname(--checkpoint)`):
 
 - `inference_results.json` — per-clip records flushed every 50 clips via atomic tmp+rename. Keys per clip:
-  - `generated`, `target`, `claims` (parsed `(feature, value)` pairs)
+  - `filename`
+  - `generated` — model's audio-quality prose (no duration, no overlap segments)
+  - `measured_duration_sec` — sidecar metadata, computed from `audio_features.shape[0] / 50` Hz. Downstream renderers can join with `generated` if they want a duration-headed display
+  - `target`, `claims` (parsed `(feature, value)` pairs)
   - `sfs_precision / sfs_recall / sfs_f1`, `per_feature` breakdown
   - `attention_maps` — **only populated when `use_sections=true`** (the section-head ablation row). The headline LoRA + 8B path uses post-hoc attention extraction (see `scripts/extract_attention.py` — separate run after inference).
 - `inference_summary.json` — aggregate `sfs_precision / recall / f1`, `per_feature_accuracy`, `gen_metrics: {bleu, rouge_l, bertscore_f1}`.
 
-After inference, run the analysis scripts for paper-ready tables:
+The same wandb run page used at training time gets `test/sfs_*` and `test/{bleu,rouge_l,bertscore_f1}` (because the checkpoint embeds `wandb_run_id`).
+
+### Analysis scripts (run after inference)
+
+All read `inference_results.json` and produce paper-ready outputs alongside it.
 
 ```bash
-# Per-feature SFS breakdown (precision/recall/F1 per feature)
-python scripts/per_feature_sfs.py \
-  --inference_results $SHARED/checkpoints/film_mamba__v1/inference_results.json
+RES=$SHARED/checkpoints/v8_lora_8b_nodur/inference_results.json
+CKPT=$SHARED/checkpoints/v8_lora_8b_nodur/best.pt
 
-# Overlap hedging contingency table (evidence for contribution #1)
-python scripts/overlap_hedging_compare.py \
-  --inference_results $SHARED/checkpoints/film_mamba__v1/inference_results.json
+# Per-feature SFS table — P/R/F1 per feature, sorted by F1.
+# Surfaces which features are strong (pause_count, overlap_ratio) vs weak
+# (f0_mean, f0_sd). Writes per_feature_sfs.md + .json next to the input.
+python scripts/per_feature_sfs.py --inference_results $RES
+
+# Overlap-aware hedging contingency table.
+# Buckets clips by ground-truth overlap_ratio (none / low / mid / high / v_high)
+# and reports the rate at which the model emits the unreliability hedge.
+# Use --features_csv as a fallback when targets lack overlap_ratio (e.g., the
+# clean-speech control set).
+python scripts/overlap_hedging_compare.py --inference_results $RES
+
+# Zero-shot baseline — bare Qwen3-8B (no adapter, no LoRA, no audio prefix).
+# Establishes the floor that any audio-conditioned model must beat.
+python scripts/zero_shot_baseline.py --config configs/config.psc.emnlp.yaml \
+  --test_dir $SHARED/data/processed_pyannote/test \
+  --output_dir $SHARED/checkpoints/zero_shot_baseline \
+  --start 0 --end 100
+
+# Post-hoc per-section attention extraction (paper figure).
+mkdir -p $(dirname $RES)/attention
+python scripts/extract_attention.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $CKPT \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --filenames  "<clip1>.wav,<clip2>.wav,<clip3>.wav" \
+  --output_dir $(dirname $RES)/attention
+
+# Spectrogram + per-section heatmap overlay PDFs.
+python scripts/plot_attention.py \
+  --attention_dir $(dirname $RES)/attention \
+  --audio_dir     $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/test/mix_clean \
+  --output_dir    docs/figures/
+
+# Faithfulness study — mask top-K attended frames, re-run inference, measure
+# SFS drop per section vs random masking. Proves attention is CAUSAL.
+python scripts/faithfulness_study.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $CKPT \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --attention_dir $(dirname $RES)/attention \
+  --output     $(dirname $RES)/faithfulness.json --top_k_mask 5
+
+# SFS-vs-human correlation — validates that SFS tracks human judgement.
+# Two phases:
+python scripts/sfs_human_correlation.py --mode prepare \
+  --inference_results $RES \
+  --output_csv $(dirname $RES)/human_ratings.csv --n 50
+# (open the CSV, fill the `human_rating` column 1-5, then:)
+python scripts/sfs_human_correlation.py --mode analyze \
+  --rated_csv  $(dirname $RES)/human_ratings.csv \
+  --output_md  $(dirname $RES)/sfs_human_correlation.md
 ```
-
-The same wandb run page used at training time gets `test/sfs_*` and `test/{bleu,rouge_l,bertscore_f1}` (because the checkpoint embeds `wandb_run_id`).
 
 ### Range / resume / parallelism
 
@@ -575,9 +630,16 @@ Three thousand test clips → ~60-90 min on Qwen3-1.7B. The script auto-resumes 
 
 Different `save_dir` ↔ independent `inference_results.json` files, so range-parallel across ablations is fine. **Don't** range-parallel on the same checkpoint — both shards flush to one file and the later flush overwrites work in flight.
 
-### Attention figures
+### Attention figures (paper centerpiece)
 
-**Section-head ablation row only** (`use_sections=true`). `scripts/plot_attention_spectrograms.py` reads the `attention_maps` field from `inference_results.json`, which is only populated when section_head fired during inference:
+Two paths produce per-section attention maps:
+
+| Path | Used when | Script |
+|---|---|---|
+| **Post-hoc** (default) | LoRA + 8B headline run (no section_head) | `scripts/extract_attention.py` + `scripts/plot_attention.py` |
+| **Built-in attention_maps** | Section-head ablation row (`use_sections=true`) | `scripts/plot_attention_spectrograms.py` reads from `inference_results.json::attention_maps` |
+
+The post-hoc path is shown above in "Analysis scripts". For the section-head ablation:
 
 ```bash
 python scripts/plot_attention_spectrograms.py \
@@ -588,9 +650,7 @@ python scripts/plot_attention_spectrograms.py \
   --format    pdf
 ```
 
-Each PDF has one row per emitted section + one per `<r>` range, log-mel in greyscale + attention map overlaid as a hot heatmap. `PatchGrid.reshape_attention` reshapes the flat per-section vector back to the 2D `(T_p, F_p)` grid before plotting.
-
-**For the headline LoRA + 8B run** (no section_head), per-section attention maps are recovered post-hoc from the LM's native attention layers. `scripts/extract_attention.py` + `scripts/plot_attention.py` (in progress — task #59 / #60) do this without the section_head path. Same paper figure, no training-time coupling.
+Each PDF row corresponds to an emitted section + one per `<r>` range, log-mel in greyscale + attention map overlaid as a hot heatmap.
 
 ## Metric semantics
 
@@ -614,35 +674,80 @@ Checkpoint selection is on `val_loss` only — saving-best on a similarity metri
 
 ## Testing
 
-```bash
-pip install pytest sacrebleu rouge-score bert-score
-python -m pytest tests/ -v                           # full unit suite
+### Dependencies
 
-# Standalone test scripts (no pytest needed)
+```bash
+pip install pytest sacrebleu rouge-score bert-score librosa scipy
+```
+
+`sacrebleu`, `rouge-score`, `bert-score` are only needed for the corresponding metric — missing deps cause that one metric to silently skip. `librosa` is required by `scripts/plot_attention.py` for the spectrogram. `scipy` is required by `scripts/sfs_human_correlation.py` for Spearman/Pearson.
+
+### Full pytest suite
+
+```bash
+python -m pytest tests/ -v
+```
+
+Covers:
+
+| Test file | What it covers |
+|---|---|
+| `test_sfs.py` | `ClaimParser`, `TaggedClaimParser`, `HybridClaimParser`, `SFSScorer` |
+| `test_section_query.py` | `SectionQueryHead` static + dynamic modes, BEATs integration |
+| `test_compute_loss_b_full.py` | B-full dual-prompt loss with mocked LM |
+| `test_text_metrics.py` | BLEU / ROUGE / BERTScore fail-soft behavior |
+| `test_build_overlap_info.py` | overlap clamping and segment-merge invariants |
+| `test_refresh_overlap_info.py` | surgical `.pt` refresh keys-preserved invariants |
+| `test_feature_set.py` | canonical 8 SFS scalars + per-feature scales |
+| `test_feature_tags.py` | tag catalog + tag-token registration |
+| `test_film_init_diagnostic.py` | FiLM identity-init bug regression test |
+
+### Standalone test scripts (no pytest)
+
+Some tests are easier to run as plain scripts:
+
+```bash
 python scripts/test_fix_descriptions.py
 python scripts/test_fix_overlap_csv.py
 python scripts/test_build_descriptions_deterministic.py
-python -c "
-import sys; sys.path[:0]=['src','tests']
-import importlib
-m = importlib.import_module('test_build_overlap_info')
-n=ok=0
-for x in dir(m):
-    if x.startswith('test_'):
-        n += 1
-        try: getattr(m, x)(); ok += 1
-        except AssertionError as e: print(f'FAIL {x}: {e}')
-print(f'{ok}/{n} passed')
-"
 ```
 
-`sacrebleu`, `rouge-score`, `bert-score` are only needed for the corresponding metric — missing deps cause that one metric to silently skip.
-
-The BEATs integration test downloads a ~370 MB checkpoint on first run; gated behind an env var:
+### BEATs integration test (gated, downloads ~370 MB)
 
 ```bash
 RUN_BEATS_TEST=1 python -m pytest tests/test_section_query.py::TestBEATsIntegration -v
 ```
+
+### End-to-end smoke (validate the whole stack in ~5 minutes)
+
+```bash
+# 1. Build a 50-clip descriptions JSON for a smoke run
+python scripts/build_descriptions_deterministic.py --part 1 --untagged \
+  --no-overlap-segments --no-duration \
+  --features-dir $SHARED/data/features_pyannote \
+  --output       /tmp/smoke_descriptions.json
+
+# 2. 50-step training run (no wandb, no checkpoints flushed)
+WANDB_MODE=disabled python -u src/train.py \
+  --config configs/config.psc.emnlp.yaml \
+  --descriptions_path /tmp/smoke_descriptions.json \
+  --max_steps 50 \
+  --save_dir /tmp/smoke_ckpt
+
+# 3. 10-clip inference smoke (needs a real checkpoint — point at v8 if running)
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_lora_8b_nodur/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --start 0 --end 10 --top_k 1
+
+# 4. Analysis scripts work on the 10-clip output
+python scripts/per_feature_sfs.py \
+  --inference_results $SHARED/checkpoints/v8_lora_8b_nodur/inference_results.json
+python scripts/overlap_hedging_compare.py \
+  --inference_results $SHARED/checkpoints/v8_lora_8b_nodur/inference_results.json
+```
+
+If all four steps complete without errors, the full pipeline is wired correctly.
 
 ## Project layout
 
@@ -665,10 +770,27 @@ src/
 
 scripts/
   fix_overlap_csv.py                 — Adds *_vad columns from Silero-on-stems
-  build_descriptions_deterministic.py — Composes descriptions.json from CSV (no LLM)
+  build_descriptions_deterministic.py — Composes descriptions.json from CSV (no LLM).
+                                       Flags: --untagged / --no-overlap-segments / --no-duration
   refresh_overlap_info.py            — Surgical overlap_info refresh in existing .pt files
   preprocess_beats.py                — Caches BEATs patches into per-clip .pt files
-  plot_attention_spectrograms.py     — Renders per-clip attention overlays
+
+  # Post-inference analysis (consume inference_results.json):
+  per_feature_sfs.py                 — Per-feature P/R/F1 table + JSON
+  overlap_hedging_compare.py         — Hedge-rate × overlap-bucket contingency
+  zero_shot_baseline.py              — Bare-LM baseline (no adapter, no audio prefix)
+
+  # Attention figure (LoRA + 8B headline path, post-hoc):
+  extract_attention.py               — Per-section attention vectors via Qwen3 native attn
+  plot_attention.py                  — Spectrogram + per-section heatmap overlay PDFs
+
+  # Section-head ablation path (use_sections=true):
+  plot_attention_spectrograms.py     — Renders attention_maps embedded in inference_results.json
+
+  # Causal study + metric validity:
+  faithfulness_study.py              — Mask top-K attended frames → measure SFS drop
+  sfs_human_correlation.py           — Prepare/analyze SFS-vs-human ratings (Spearman + Pearson)
+
   test_*.py                          — Standalone test scripts
 
 configs/
@@ -694,4 +816,6 @@ descriptions.json                      — 19,900 GT entries (regenerated by bui
 - **`max_target_length: 512`** covers the full untagged-noseg description format (p99 ~380 tokens, max ~430). The earlier 224 cap was set for a trimmed catalog and silently truncated tails; 512 absorbs the longest clip with margin.
 - **`gradient_checkpointing` is required at 8B + LoRA** to stay under H100-80 memory at `batch_size: 6`. The 8B frozen weights alone are ~16 GB in bf16; activations need to be checkpointed.
 - **`--no-overlap-segments` is critical for SFS.** Without it, the model hallucinates a stereotyped 5-7-segment "tile-the-clip" pattern at the end of each description. The IoU≥0.8 SFS scorer rejects almost all of these → overlap_span recall craters to 0. Verified in v6 → v7 transition: dropping the segments sentence took overlap_span recall from 0.0 to ~0.65.
-- **Atomic writes everywhere except `last.pt`.** `preprocess_beats.py`, `refresh_overlap_info.py`, `fix_overlap_csv.py`, and `inference.py` all use `.tmp` + `os.replace` so a SIGKILL mid-write can't corrupt artifacts. `last.pt` from `train.py` does NOT yet use atomic write — if the session times out mid-save, `last.pt` is truncated and resume must use `best.pt` instead.
+- **Atomic writes everywhere.** `preprocess_beats.py`, `refresh_overlap_info.py`, `fix_overlap_csv.py`, `inference.py`, AND `train.py`'s `last.pt` / `best.pt` saves all use `.tmp` + `os.replace`. A SIGKILL / OOM / quota truncate / Lustre writeback failure during a save leaves an ignorable `.tmp` while the canonical path stays at either the previous full content or the new full content. (Pre-2026-05-17 builds did not have atomic save on the train-loop checkpoints — we lost v7-lora-8b's `best.pt` to a 0-byte truncation that the atomic save would have prevented.)
+- **Best.pt is mirrored to wandb as a versioned Artifact** (`upload_ckpt_to_wandb: true` by default). Each improvement uploads a new version named `best-<run_name>`. Off-site backup against local disk loss. Disable per-run with `--upload_ckpt_to_wandb false`. Download from another machine with `wandb.use_artifact("speech_quality_adapter/aqua-nl-emnlp/best-<run_name>:latest")`.
+- **Duration is metadata, not a quality claim.** `--no-duration` strips it from training targets; `src/inference.py` measures it from the wav header and stores it on the output JSON's `measured_duration_sec` sidecar. The `generated` field contains only the model's audio-quality prose. SFS no longer scores duration (`duration_sec` was removed from `TOLERANCES`).
