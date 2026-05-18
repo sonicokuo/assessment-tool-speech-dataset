@@ -168,7 +168,8 @@ def _strip_tags(s: str) -> str:
 
 def build_description(row: dict, fallback_warned: dict | None = None,
                       untagged: bool = False,
-                      drop_overlap_segments: bool = False) -> str:
+                      drop_overlap_segments: bool = False,
+                      drop_duration: bool = False) -> str:
     """Compose a description for one CSV row.
 
     By default emits the tagged section format. With ``untagged=True`` the
@@ -187,6 +188,14 @@ def build_description(row: dict, fallback_warned: dict | None = None,
     Matches the mamba-v2 description format which had no segment ranges and
     reached val_sfs_recall=0.88.
 
+    With ``drop_duration=True``, the leading "The recording is X s long."
+    sentence is omitted from the target. Duration is trivially measurable
+    from the wav file header (audio.shape[0] / sample_rate) and the model
+    was mode-collapsing on this feature (0/98 accuracy on the v7-lora-8b
+    clean control — always emitted ~7-11s regardless of actual length).
+    The publication-final description re-adds duration deterministically
+    at inference time (see src/inference.py).
+
     The trailing 'F0 and formant estimates are unreliable during overlap
     windows.' sentence is appended when overlap_ratio > 0.
     """
@@ -197,12 +206,13 @@ def build_description(row: dict, fallback_warned: dict | None = None,
         row["overlap_segments_vad"] = ""
     bodies = _build_section_bodies(row)
     intro = ""
-    dur = row.get("duration_sec")
-    if dur not in (None, "", "nan", "NaN"):
-        try:
-            intro = f"The recording is {float(dur):.3f} s long. "
-        except (TypeError, ValueError):
-            intro = ""
+    if not drop_duration:
+        dur = row.get("duration_sec")
+        if dur not in (None, "", "nan", "NaN"):
+            try:
+                intro = f"The recording is {float(dur):.3f} s long. "
+            except (TypeError, ValueError):
+                intro = ""
     sections = []
     for sec in SECTION_TAGS:
         body = bodies.get(sec.name)
@@ -273,6 +283,17 @@ def main() -> int:
                         "flag the LM tends to hallucinate a stereotyped "
                         "tile-the-clip pattern (5-7 evenly-spaced ranges) "
                         "that the IoU>=0.8 SFS scorer rejects.")
+    p.add_argument("--no-duration", action="store_true",
+                   dest="no_duration",
+                   help="Drop the leading 'The recording is X s long.' "
+                        "sentence from every target. Duration is trivially "
+                        "measurable from the wav header — the model was "
+                        "mode-collapsing (0/98 accuracy in v7-lora-8b, "
+                        "always emitted ~7-11s regardless of actual length). "
+                        "src/inference.py re-adds the measured duration to "
+                        "the publication-final output, so the user-visible "
+                        "description still includes it; only the training "
+                        "target is shortened.")
     args = p.parse_args()
 
     if not args.features_dir.is_dir():
@@ -309,7 +330,8 @@ def main() -> int:
             if not stem:
                 continue
             text = build_description(row, fallback_warned, untagged=args.untagged,
-                                     drop_overlap_segments=args.no_overlap_segments)
+                                     drop_overlap_segments=args.no_overlap_segments,
+                                     drop_duration=args.no_duration)
             out[stem] = text
             n_rows += 1
             if not text:
