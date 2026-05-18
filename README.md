@@ -301,44 +301,31 @@ wandb: 🚀 View run at https://wandb.ai/speech_quality_adapter/aqua-nl-emnlp/ru
 
 ### Main run
 
-Uses `configs/config.psc.emnlp.yaml` defaults: **Qwen3-8B + LoRA r=16**, `film-mamba` adapter, `use_sections: false`, `tagged_mode: false`, `beats_cached: false`, `batch_size: 6`, `epochs: 15`.
+Uses `configs/config.psc.emnlp.yaml` defaults: **Qwen3-8B + LoRA r=16**, `film-mamba` adapter, `use_sections: false`, `tagged_mode: false`, `beats_cached: false`, `batch_size: 6`, `epochs: 15`, `--no-duration` targets.
 
-Foreground (interactive shell visible — output streams to your terminal):
-
-```bash
-python src/train.py --config configs/config.psc.emnlp.yaml
-```
-
-Detached (survives SSH disconnect; output goes to a log file). Put `LOG=...` on its own line so the variable lands in your current shell — chaining it after `&&` in front of `nohup ... &` groups everything into a subshell and `$LOG` becomes empty in the outer shell:
+Foreground with log capture via `tee` (output streams to your terminal AND is written to `$LOG`):
 
 ```bash
-mkdir -p $SHARED/logs
-LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
+mkdir -p $SHARED/logs $SHARED/checkpoints/v8_lora_8b_nodur
+LOG=$SHARED/logs/v8-lora-8b-nodur_$(date +%Y%m%d_%H%M%S).log
 
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --wandb_run_name film-mamba \
-  --save_dir       $SHARED/checkpoints/film_mamba__v1 \
-  > "$LOG" 2>&1 &
-PID=$!
-echo "PID=$PID  log=$LOG"
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $SHARED/data/descriptions_untagged_noseg_nodur.json \
+  --wandb_run_name    v8-lora-8b-nodur \
+  --save_dir          $SHARED/checkpoints/v8_lora_8b_nodur \
+  2>&1 | tee "$LOG"
 ```
 
-~33 min / epoch × 15 epochs ≈ 8 hours on a single H100. (Roughly the same as the old Qwen3-1.7B + full FT timing — the larger 8B forward is offset by LoRA's smaller backward + optimizer-state footprint.)
+~33 min / epoch × 15 epochs ≈ 8 hours on a single H100. The launch keeps your shell occupied; if you need to detach without killing, wrap the command in `screen -S v8` or `tmux new -s v8` first (Ctrl+A D / Ctrl+B D to detach, re-attach later with `screen -r v8` / `tmux attach -t v8`).
 
-**Follow progress in real time while detached**:
-
-```bash
-tail -f $LOG          # ctrl-C to stop following (the run keeps going)
-```
-
-The `python -u` flag in the launch command above is **critical** — without it, when stdout is redirected to a file (as `nohup ... > $LOG` does), Python block-buffers stdout in ~8 KB chunks and the log file looks empty for minutes. `-u` forces unbuffered output so every print lands in `$LOG` immediately and `tail -f` shows real-time progress.
+The `python -u` flag is **critical** when piping through `tee` — it disables Python's stdout buffering so prints land in the terminal and the log file in real time, not in 8 KB chunks every few minutes.
 
 What you should see:
 - ~1 min in: model construction banner (`[LoRA] rank=16 alpha=32`, `Parameters — LM total: 8.23B | LoRA trainable: 43.6M | adapter trainable: 51.0M | grand total trainable: 94.7M (1.150% of LM)`), dataset load (`Loaded: train=13900, val=3000`), and the wandb URL.
 - After ~30 s of warmup: loss prints every `log_every` steps (default 10), starts near 9 and falls toward 1-3 over the first epoch.
-- After each epoch: a val pass with BLEU / ROUGE / SFS, then a checkpoint write to `<save_dir>`.
+- After each epoch: a val pass with BLEU / ROUGE / SFS, then a checkpoint write to `<save_dir>` (atomic — `.tmp` + `os.replace`). When val_sfs_f1 improves, `best.pt` is also uploaded to wandb as an Artifact (`upload_ckpt_to_wandb: true` default).
 
-If `tail -f` shows nothing changing for >5 min after the wandb URL appears, the loop is stalled — check `pgrep -af train.py` and the very tail of the log for a traceback.
+If output stops changing for >5 min after the wandb URL appears, the loop is stalled — check `pgrep -af train.py` and the very tail of the log for a traceback.
 
 ### Resuming
 
@@ -401,74 +388,111 @@ The paper's primary comparison table. Same data, same seed, same epochs, same se
 | `film-mamba-2L` | FiLM | Mamba SSM (2 layers) | Depth ablation for Mamba |
 | `qformer` | Q-Former cross-attention | (implicit) | Alternative architecture |
 
-Naming convention: `--wandb_run_name <variant>` and `--save_dir $SHARED/checkpoints/<variant>__v1`. Reading a path tells you the variant. Bump to `__v2`, `__v3` etc. when re-tuning hyperparams.
+Naming convention: `--wandb_run_name v8-<variant>` and `--save_dir $SHARED/checkpoints/v8_<variant>`. The `v8` prefix marks the recipe generation (LoRA + 8B + no-duration + no-overlap-segments). When you re-tune hyperparams within v8, append `__v2` etc. to the save_dir.
+
+**Scheduling**: each run takes ~8h on one H100. The 8 variants in sequence is ~64 h. To parallelize, allocate one H100 per variant in separate `interact` sessions (or `sbatch` jobs) — **never launch two trainings on the same GPU**, they OOM each other instantly. Each command below assumes you're inside a fresh `interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis260125p` session.
 
 ```bash
-# film-mamba (headline, this is the main config — no --adapter_variant needed)
-LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --save_dir       $SHARED/checkpoints/film_mamba__v1 \
-  --wandb_run_name film-mamba \
-  > "$LOG" 2>&1 &
+# Shared setup — set once per session before launching ANY variant
+DESC=$SHARED/data/descriptions_untagged_noseg_nodur.json
+mkdir -p $SHARED/logs
 
-# concat-only
-LOG=$SHARED/logs/concat_only_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant concat-only \
-  --save_dir        $SHARED/checkpoints/concat_only__v1 \
-  --wandb_run_name  concat-only \
-  > "$LOG" 2>&1 &
-
-# sigmoid-gate
-LOG=$SHARED/logs/sigmoid_gate_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant sigmoid-gate \
-  --save_dir        $SHARED/checkpoints/sigmoid_gate__v1 \
-  --wandb_run_name  sigmoid-gate \
-  > "$LOG" 2>&1 &
-
-# film (FiLM only, no temporal mixer)
-LOG=$SHARED/logs/film_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film \
-  --save_dir        $SHARED/checkpoints/film__v1 \
-  --wandb_run_name  film \
-  > "$LOG" 2>&1 &
-
-# film-attn
-LOG=$SHARED/logs/film_attn_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film-attn \
-  --save_dir        $SHARED/checkpoints/film_attn__v1 \
-  --wandb_run_name  film-attn \
-  > "$LOG" 2>&1 &
-
-# film-attn-2L
-LOG=$SHARED/logs/film_attn_2L_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film-attn-2L \
-  --save_dir        $SHARED/checkpoints/film_attn_2L__v1 \
-  --wandb_run_name  film-attn-2L \
-  > "$LOG" 2>&1 &
-
-# film-mamba-2L
-LOG=$SHARED/logs/film_mamba_2L_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film-mamba-2L \
-  --save_dir        $SHARED/checkpoints/film_mamba_2L__v1 \
-  --wandb_run_name  film-mamba-2L \
-  > "$LOG" 2>&1 &
-
-# qformer
-LOG=$SHARED/logs/qformer_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant qformer \
-  --save_dir        $SHARED/checkpoints/qformer__v1 \
-  --wandb_run_name  qformer \
-  > "$LOG" 2>&1 &
+# Pre-warm the 8B blobs (one-time per node — second run on same node is instant)
+time cat $SHARED/hf_cache/hub/models--Qwen--Qwen3-8B/blobs/* > /dev/null
 ```
 
-**Don't run more than one of these in parallel on the same GPU** — they'd OOM each other. Either sequence them (drop the `&`, run one at a time, ~8 h each = ~64 h end-to-end), or grab additional H100s in separate interact allocations.
+```bash
+# v8-film-mamba (headline, this is the main config — no --adapter_variant needed)
+LOG=$SHARED/logs/v8-film-mamba_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --save_dir          $SHARED/checkpoints/v8_film_mamba \
+  --wandb_run_name    v8-film-mamba \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v8-concat-only — baseline without FiLM or temporal mixer
+LOG=$SHARED/logs/v8-concat-only_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   concat-only \
+  --save_dir          $SHARED/checkpoints/v8_concat_only \
+  --wandb_run_name    v8-concat-only \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v8-sigmoid-gate — lighter gating than FiLM
+LOG=$SHARED/logs/v8-sigmoid-gate_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   sigmoid-gate \
+  --save_dir          $SHARED/checkpoints/v8_sigmoid_gate \
+  --wandb_run_name    v8-sigmoid-gate \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v8-film (FiLM only, no temporal mixer) — isolates the FiLM contribution
+LOG=$SHARED/logs/v8-film_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   film \
+  --save_dir          $SHARED/checkpoints/v8_film \
+  --wandb_run_name    v8-film \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v8-film-attn (FiLM + 1-layer self-attention mixer)
+LOG=$SHARED/logs/v8-film-attn_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   film-attn \
+  --save_dir          $SHARED/checkpoints/v8_film_attn \
+  --wandb_run_name    v8-film-attn \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v8-film-attn-2L — attention depth ablation
+LOG=$SHARED/logs/v8-film-attn-2L_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   film-attn-2L \
+  --save_dir          $SHARED/checkpoints/v8_film_attn_2L \
+  --wandb_run_name    v8-film-attn-2L \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v8-film-mamba-2L — Mamba depth ablation
+LOG=$SHARED/logs/v8-film-mamba-2L_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   film-mamba-2L \
+  --save_dir          $SHARED/checkpoints/v8_film_mamba_2L \
+  --wandb_run_name    v8-film-mamba-2L \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v8-qformer — Q-Former cross-attention alternative
+LOG=$SHARED/logs/v8-qformer_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   qformer \
+  --save_dir          $SHARED/checkpoints/v8_qformer \
+  --wandb_run_name    v8-qformer \
+  2>&1 | tee "$LOG"
+```
+
+To run multiple variants sequentially in one shell (~64h end-to-end), chain them with `&&` between the python commands so the next one only starts if the previous succeeded.
+
+Each command keeps your shell occupied for ~8h. To detach safely use `screen -S adapter` / `tmux new -s adapter` before launching, then Ctrl+A D / Ctrl+B D to detach (training continues), and `screen -r` / `tmux attach -t adapter` to re-attach.
+
+> **Note on the currently-running training:** if you launched the headline with `--wandb_run_name v8-lora-8b-nodur --save_dir $SHARED/checkpoints/v8_lora_8b_nodur` (older convention), that's fine — it's the equivalent of `v8-film-mamba` since `film-mamba` is the YAML default `adapter_variant`. Future ablation rows should use the `v8-<variant>` naming above so they line up cleanly in the wandb run list.
 
 ### Design ablations (orthogonal to the adapter sweep)
 
@@ -476,40 +500,50 @@ For probing the section-attention design itself. Note that since v7 the YAML def
 
 | Knob | Override (relative to YAML defaults) | Run name |
 |---|---|---|
-| Section-head ON + tagged-prose (legacy EMNLP-rework path) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json` | `section-head` |
-| Section-head ON, but static queries (learnable lookup, no LM-derived query) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json --section_query_mode static` | `static-queries` |
-| Full-FT comparison (Qwen3-1.7B, no LoRA) | `--lm_name Qwen/Qwen3-1.7B --lora_rank 0` | `fullft-1.7b` |
+| Section-head ON + tagged-prose (legacy EMNLP-rework path) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json` | `v8-section-head` |
+| Section-head ON, but static queries (learnable lookup, no LM-derived query) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json --section_query_mode static` | `v8-static-queries` |
+| Full-FT comparison (Qwen3-1.7B, no LoRA) | `--lm_name Qwen/Qwen3-1.7B --lora_rank 0` | `v8-fullft-1.7b` |
 
-Section-head rows require the tagged JSON — rebuild via `scripts/build_descriptions_deterministic.py --all` (without `--untagged`/`--no-overlap-segments`) into a separate output file.
+Section-head rows require the tagged JSON — rebuild via `scripts/build_descriptions_deterministic.py --all` (without `--untagged`/`--no-overlap-segments`/`--no-duration`) into a separate output file.
+
+Same scheduling rule applies: one variant at a time, foreground with `tee`. Use `screen` / `tmux` if you need to detach.
 
 ```bash
-# section-head (legacy EMNLP-rework path — needs descriptions_tagged.json)
-LOG=$SHARED/logs/section_head_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
+# v8-section-head (legacy EMNLP-rework path — needs descriptions_tagged.json)
+LOG=$SHARED/logs/v8-section-head_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections true --tagged_mode true --beats_cached true \
   --descriptions_path $SHARED/data/descriptions_tagged.json \
-  --save_dir          $SHARED/checkpoints/section_head__v1 \
-  --wandb_run_name    section-head \
-  > "$LOG" 2>&1 &
+  --save_dir          $SHARED/checkpoints/v8_section_head \
+  --wandb_run_name    v8-section-head \
+  2>&1 | tee "$LOG"
+```
 
-# static-queries (static section queries instead of LM-derived dynamic queries)
-LOG=$SHARED/logs/static_queries_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
+```bash
+# v8-static-queries (static section queries instead of LM-derived dynamic queries)
+LOG=$SHARED/logs/v8-static-queries_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections true --tagged_mode true --beats_cached true \
   --descriptions_path  $SHARED/data/descriptions_tagged.json \
   --section_query_mode static \
-  --save_dir           $SHARED/checkpoints/static_queries__v1 \
-  --wandb_run_name     static-queries \
-  > "$LOG" 2>&1 &
+  --save_dir           $SHARED/checkpoints/v8_static_queries \
+  --wandb_run_name     v8-static-queries \
+  2>&1 | tee "$LOG"
+```
 
-# fullft-1.7b (full FT comparison — the original v6 recipe before LoRA)
-LOG=$SHARED/logs/fullft_17b_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --lm_name    Qwen/Qwen3-1.7B \
-  --lora_rank  0 \
-  --save_dir   $SHARED/checkpoints/fullft_17b__v1 \
-  --wandb_run_name fullft-1.7b \
-  > "$LOG" 2>&1 &
+```bash
+# v8-fullft-1.7b (full FT comparison — the original v6 recipe before LoRA).
+# This one ALSO needs --descriptions_path explicit since v6 used a different
+# target format. Uses the same no-duration / no-overlap-segments JSON for fair
+# comparison; only the LM + LoRA-rank flip.
+LOG=$SHARED/logs/v8-fullft-1.7b_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $SHARED/data/descriptions_untagged_noseg_nodur.json \
+  --lm_name           Qwen/Qwen3-1.7B \
+  --lora_rank         0 \
+  --save_dir          $SHARED/checkpoints/v8_fullft_17b \
+  --wandb_run_name    v8-fullft-1.7b \
+  2>&1 | tee "$LOG"
 ```
 
 ### Compute budget
@@ -520,26 +554,99 @@ Each run is ~8 h on one H100. Adapter sweep is 8 runs = ~64 h sequential, ~8 h f
 
 Greedy decoding over the test set (`--top_k 1` is deterministic, matches paper-table numbers). No `--lm_name` / `--adapter_variant` flags — `inference.py` reads them from the checkpoint's embedded config.
 
+**Run one ablation at a time** — inference loads the 8B LM (~16 GB GPU memory), so two concurrent runs on the same GPU will OOM. ~30-90 min per ablation on H100.
+
 ```bash
+# Headline (v8-film-mamba)
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/a0__main__v1/best.pt \
+  --checkpoint $SHARED/checkpoints/v8_film_mamba/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
-Loop over all adapter ablations:
-
 ```bash
-for variant in film_mamba concat_only sigmoid_gate film \
-               film_attn film_attn_2L film_mamba_2L qformer; do
-  python src/inference.py --config configs/config.psc.emnlp.yaml \
-    --checkpoint $SHARED/checkpoints/${variant}__v1/best.pt \
-    --test_dir   $SHARED/data/processed_pyannote/test \
-    --top_k      1
-done
+# v8-concat-only
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_concat_only/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
 ```
 
-For the design-ablation checkpoints (`no_sections__v1`, `static_queries__v1`), same pattern.
+```bash
+# v8-sigmoid-gate
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_sigmoid_gate/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v8-film
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_film/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v8-film-attn
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_film_attn/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v8-film-attn-2L
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_film_attn_2L/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v8-film-mamba-2L
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_film_mamba_2L/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v8-qformer
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_qformer/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+**Design ablations:**
+
+```bash
+# v8-section-head
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_section_head/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v8-static-queries
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_static_queries/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v8-fullft-1.7b
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v8_fullft_17b/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+To save your shell session for ~8-12h of sequential inference across all 11 ablations, wrap each command in `screen` / `tmux` and detach.
 
 ### Outputs
 
