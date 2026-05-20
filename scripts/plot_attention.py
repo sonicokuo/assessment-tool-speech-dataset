@@ -98,59 +98,68 @@ def plot_clip(attention_data: dict, wav_path: Path, output_pdf: Path) -> None:
         return
 
     P = attention_data["n_prefix_tokens"]
-    stride = attention_data["prefix_token_stride_sec"]
     n = len(present_sections)
+    perhead = attention_data.get("section_attention_perhead")
 
-    # One panel PER section (CoLMbo Fig 2 — each attribute its own strip),
-    # each individually normalized so a low-attention section isn't washed out
-    # by a high-attention one on a shared color scale.
-    fig, axes = plt.subplots(
-        n, 1, figsize=(11, 0.95 * n + 1.2),
-        gridspec_kw={"hspace": 0.65},
-    )
+    # CoLMbo Fig 2 layout: one 2D panel PER section, arranged side-by-side.
+    # Each panel = per-head attention (heads on y, prefix tokens on x) at the
+    # most section-discriminative layer. Per-panel normalization so each reads
+    # on its own scale. This is the version that actually shows discrimination —
+    # the head-averaged 1D strip collapses to the speech envelope.
+    if perhead:
+        disc_layer = attention_data.get("discriminative_layer", "?")
+        fig, axes = plt.subplots(1, n, figsize=(2.4 * n, 3.4))
+        if n == 1:
+            axes = [axes]
+        for ax, section in zip(axes, present_sections):
+            M = np.asarray(perhead[section], dtype=float)     # (H, P)
+            M = M / np.clip(M.max(axis=1, keepdims=True), 1e-12, None)  # per-head norm
+            ax.imshow(M, aspect="auto", cmap="viridis", interpolation="nearest",
+                      vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xlabel(section, fontsize=12, fontweight="bold",
+                          color=SECTION_COLORS[section])
+        axes[0].set_ylabel("attention heads", fontsize=9)
+        fig.suptitle(
+            f"{wav_path.name} — per-section attention heads over audio prefix "
+            f"tokens (layer {disc_layer}, most discriminative)",
+            fontsize=10, y=1.02,
+        )
+        plt.figtext(
+            0.02, -0.04,
+            f"Generated: {attention_data['generated'][:200]}"
+            f"{'...' if len(attention_data['generated']) > 200 else ''}",
+            fontsize=7, ha="left", wrap=True, color="#444444",
+        )
+        output_pdf.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_pdf, bbox_inches="tight", dpi=200)
+        plt.close(fig)
+        print(f"  saved → {output_pdf}  (per-head, layer {disc_layer})")
+        return
+
+    # Fallback: legacy 1D strips (only when perhead data absent — old JSONs)
+    stride = attention_data["prefix_token_stride_sec"]
+    fig, axes = plt.subplots(n, 1, figsize=(11, 0.95 * n + 1.2),
+                             gridspec_kw={"hspace": 0.65})
     if n == 1:
         axes = [axes]
-
     for ax, section in zip(axes, present_sections):
         vec = np.asarray(sec_attn[section], dtype=float)
-        vec_norm = vec / max(vec.max(), 1e-12)          # own scale, 0..1
-        strip = vec_norm[None, :]                         # (1, P) heatmap row
-        im = ax.imshow(strip, aspect="auto", cmap="viridis",
-                       interpolation="nearest", vmin=0, vmax=1,
-                       extent=[0, P, 0, 1])
+        vec_norm = vec / max(vec.max(), 1e-12)
+        ax.imshow(vec_norm[None, :], aspect="auto", cmap="viridis",
+                  interpolation="nearest", vmin=0, vmax=1, extent=[0, P, 0, 1])
         ax.set_yticks([])
         ax.set_ylabel(section, rotation=0, ha="right", va="center",
-                      fontsize=11, fontweight="bold",
-                      color=SECTION_COLORS[section])
-        # Only the bottom panel gets the x label
-        if section is present_sections[-1]:
-            ax.set_xlabel("Audio prefix-token index")
-        else:
+                      fontsize=11, fontweight="bold", color=SECTION_COLORS[section])
+        if section is not present_sections[-1]:
             ax.set_xticklabels([])
-        # Per-panel colorbar so each section reads on its own scale
-        fig.colorbar(im, ax=ax, fraction=0.015, pad=0.01)
-
-    # Secondary time axis on the TOP panel only
-    secax = axes[0].secondary_xaxis(
-        "top", functions=(lambda x: x * stride, lambda t: t / stride))
-    secax.set_xlabel("≈ time (s)", fontsize=8)
-
-    fig.suptitle(
-        f"{wav_path.name} — per-section attention over audio prefix "
-        f"(P={P} tokens × {stride:.2f}s/token)",
-        fontsize=10, y=0.995,
-    )
-    plt.figtext(
-        0.02, 0.002,
-        f"Generated: {attention_data['generated'][:240]}"
-        f"{'...' if len(attention_data['generated']) > 240 else ''}",
-        fontsize=7, ha="left", wrap=True, color="#444444",
-    )
-
+    axes[-1].set_xlabel("Audio prefix-token index")
+    fig.suptitle(f"{wav_path.name} — per-section attention (head-averaged 1D)",
+                 fontsize=10)
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_pdf, bbox_inches="tight", dpi=200)
     plt.close(fig)
-    print(f"  saved → {output_pdf}")
+    print(f"  saved → {output_pdf}  (legacy 1D — re-run extract_attention for per-head)")
 
 
 def main() -> int:

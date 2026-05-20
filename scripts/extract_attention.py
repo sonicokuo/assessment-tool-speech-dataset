@@ -235,9 +235,11 @@ def extract_one_clip(
     else:
         raise ValueError(f"Unknown layer_selection={layer_selection!r}")
 
+    # attn_per_step[t] = (n_sel_layers, n_heads, P) — full per-head detail,
+    # NOT averaged. Averaging over heads was what collapsed every section to
+    # the speech envelope; the discriminative signal lives in individual heads.
     attn_per_step.append(
-        _avg_attention_to_prefix(outputs.attentions, P, selected,
-                                 query_idx=-1)
+        _perhead_attention_to_prefix(outputs.attentions, P, selected, query_idx=-1)
     )
 
     # Subsequent generation
@@ -254,40 +256,54 @@ def extract_one_clip(
         next_token_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         tok = next_token_id.item()
         generated_ids.append(tok)
-
-        # At subsequent steps the query is just the new token (length 1).
         attn_per_step.append(
-            _avg_attention_to_prefix(outputs.attentions, P, selected, query_idx=0)
+            _perhead_attention_to_prefix(outputs.attentions, P, selected, query_idx=0)
         )
-
         if tok == tokenizer.eos_token_id:
             break
 
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-    # Match section spans → token index ranges → average attention
-    section_attentions: dict[str, list[float]] = {}
+    # Per section: average the per-head maps over the section's tokens →
+    # (n_sel_layers, n_heads, P). Keep both the head-averaged 1D vector (legacy)
+    # and the full per-head 2D map per layer.
+    section_2d: dict[str, "torch.Tensor"] = {}   # (n_sel_layers, n_heads, P)
     for section_name, pattern in SECTION_PATTERNS.items():
         match = re.search(pattern, text, re.IGNORECASE)
         if not match:
             print(f"  [warn] no match for section={section_name}")
             continue
-        # Char range → token range. We re-encode the prose prefix because
-        # token boundaries inside the decoded text are not 1:1 with
-        # generated_ids (BPE merging can stitch token boundaries).
         prefix_text = text[:match.start()]
         full_text = text[:match.end()]
         n_pre = len(tokenizer.encode(prefix_text, add_special_tokens=False))
         n_full = len(tokenizer.encode(full_text, add_special_tokens=False))
-        # Clamp to attn_per_step length in case of off-by-one from BPE.
         start_tok = max(0, min(n_pre, len(attn_per_step) - 1))
         end_tok = max(start_tok + 1, min(n_full, len(attn_per_step)))
-        span_attns = attn_per_step[start_tok:end_tok]
-        if not span_attns:
+        span = attn_per_step[start_tok:end_tok]
+        if not span:
             continue
-        section_attentions[section_name] = (
-            torch.stack(span_attns).mean(dim=0).cpu().float().tolist()
-        )
+        section_2d[section_name] = torch.stack(span).mean(dim=0)  # (L, H, P)
+
+    # Auto-select the most section-discriminative layer: for each layer,
+    # measure how much its per-head maps vary ACROSS sections. The layer with
+    # the highest cross-section variance is where the heads best distinguish
+    # what the model is describing.
+    sections = list(section_2d.keys())
+    best_layer_pos = 0
+    if len(sections) >= 2:
+        stacked = torch.stack([section_2d[s] for s in sections])  # (S, L, H, P)
+        # variance across sections (dim 0), then mean over heads+prefix → per layer
+        per_layer_disc = stacked.var(dim=0).mean(dim=(1, 2))      # (L,)
+        best_layer_pos = int(per_layer_disc.argmax().item())
+    best_layer_global = selected[best_layer_pos]
+
+    # Head-averaged 1D (legacy, for the old strip plot) + per-head 2D at the
+    # discriminative layer (for the CoLMbo-style panel).
+    section_attentions: dict[str, list[float]] = {}
+    section_attention_perhead: dict[str, list[list[float]]] = {}
+    for s, m in section_2d.items():
+        section_attentions[s] = m.mean(dim=(0, 1)).cpu().float().tolist()   # (P,)
+        section_attention_perhead[s] = m[best_layer_pos].cpu().float().tolist()  # (H, P)
 
     wavlm_frame_rate_hz = 50.0
     audio_duration_sec = sample["audio_features"].shape[0] / wavlm_frame_rate_hz
@@ -299,23 +315,23 @@ def extract_one_clip(
         "audio_duration_sec": audio_duration_sec,
         "n_selected_layers": len(selected),
         "selected_layers": selected,
-        "section_attentions": section_attentions,
+        "discriminative_layer": best_layer_global,
+        "section_attentions": section_attentions,            # {section: (P,)}
+        "section_attention_perhead": section_attention_perhead,  # {section: (H, P)}
     }
 
 
-def _avg_attention_to_prefix(
+def _perhead_attention_to_prefix(
     layer_attentions, P: int, selected_layers: list[int], query_idx: int,
 ):
-    """Average attention across heads + selected layers, restricted to the
-    audio-prefix key positions [0:P]. Returns (P,) on the original device."""
+    """Per-head attention to the audio prefix for each selected layer.
+    Returns (n_sel_layers, n_heads, P) — heads NOT averaged."""
     import torch
     per_layer = []
     for layer_idx in selected_layers:
-        layer_attn = layer_attentions[layer_idx]   # (B=1, n_heads, query, key)
-        # query_idx: -1 (last) for prefill, 0 for incremental generation
-        attn_to_prefix = layer_attn[0, :, query_idx, :P]   # (n_heads, P)
-        per_layer.append(attn_to_prefix.mean(dim=0))       # (P,) avg over heads
-    return torch.stack(per_layer).mean(dim=0)              # (P,) avg over layers
+        layer_attn = layer_attentions[layer_idx]        # (B=1, n_heads, q, k)
+        per_layer.append(layer_attn[0, :, query_idx, :P])   # (n_heads, P)
+    return torch.stack(per_layer)                        # (L, n_heads, P)
 
 
 def main() -> int:
