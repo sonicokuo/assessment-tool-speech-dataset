@@ -99,51 +99,49 @@ def plot_clip(attention_data: dict, wav_path: Path, output_pdf: Path) -> None:
 
     P = attention_data["n_prefix_tokens"]
     stride = attention_data["prefix_token_stride_sec"]
+    n = len(present_sections)
 
-    # Build the (n_sections, P) attention matrix — CoLMbo Fig 2 layout:
-    # rows = sections, columns = audio prefix-token positions, color = attention.
-    M = np.array([np.asarray(sec_attn[s], dtype=float) for s in present_sections])  # (S, P)
-    # Row-normalize so each section's pattern is comparable (max=1 per row).
-    M_norm = M / np.clip(M.max(axis=1, keepdims=True), 1e-12, None)
-    # Mean-subtracted: cancels the shared speech-envelope component, surfacing
-    # the SECTION-SPECIFIC attention that distinguishes e.g. noise from pitch.
-    M_resid = M_norm - M_norm.mean(axis=0, keepdims=True)
-
-    # Two stacked heatmaps: raw (top) + section-specific residual (bottom).
-    fig, (ax_raw, ax_res) = plt.subplots(
-        2, 1, figsize=(12, 1.0 + 0.5 * len(present_sections) * 2),
-        gridspec_kw={"hspace": 0.45},
+    # One panel PER section (CoLMbo Fig 2 — each attribute its own strip),
+    # each individually normalized so a low-attention section isn't washed out
+    # by a high-attention one on a shared color scale.
+    fig, axes = plt.subplots(
+        n, 1, figsize=(11, 0.95 * n + 1.2),
+        gridspec_kw={"hspace": 0.65},
     )
+    if n == 1:
+        axes = [axes]
 
-    def _draw(ax, mat, title, cmap, center_zero):
-        kw = {}
-        if center_zero:
-            vmax = np.abs(mat).max() or 1e-12
-            kw = dict(vmin=-vmax, vmax=vmax)
-        im = ax.imshow(mat, aspect="auto", cmap=cmap, interpolation="nearest", **kw)
-        ax.set_yticks(range(len(present_sections)))
-        ax.set_yticklabels(present_sections)
-        for tick, s in zip(ax.get_yticklabels(), present_sections):
-            tick.set_color(SECTION_COLORS[s]); tick.set_fontweight("bold")
-        ax.set_xlabel("Audio prefix-token index")
-        ax.set_title(title, fontsize=10)
-        # Secondary x-axis in seconds (prefix token i ≈ i*stride seconds)
-        secax = ax.secondary_xaxis(
-            "top", functions=(lambda x: x * stride, lambda t: t / stride))
-        secax.set_xlabel("≈ time (s)", fontsize=8)
-        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    for ax, section in zip(axes, present_sections):
+        vec = np.asarray(sec_attn[section], dtype=float)
+        vec_norm = vec / max(vec.max(), 1e-12)          # own scale, 0..1
+        strip = vec_norm[None, :]                         # (1, P) heatmap row
+        im = ax.imshow(strip, aspect="auto", cmap="viridis",
+                       interpolation="nearest", vmin=0, vmax=1,
+                       extent=[0, P, 0, 1])
+        ax.set_yticks([])
+        ax.set_ylabel(section, rotation=0, ha="right", va="center",
+                      fontsize=11, fontweight="bold",
+                      color=SECTION_COLORS[section])
+        # Only the bottom panel gets the x label
+        if section is present_sections[-1]:
+            ax.set_xlabel("Audio prefix-token index")
+        else:
+            ax.set_xticklabels([])
+        # Per-panel colorbar so each section reads on its own scale
+        fig.colorbar(im, ax=ax, fraction=0.015, pad=0.01)
 
-    _draw(ax_raw, M_norm,
-          f"{wav_path.name} — per-section attention over audio prefix "
-          f"(P={P} tokens × {stride:.2f}s)  [row-normalized]",
-          cmap="viridis", center_zero=False)
-    _draw(ax_res, M_resid,
-          "Section-SPECIFIC attention (row-normalized minus across-section mean) "
-          "— positive = this section attends here MORE than average",
-          cmap="RdBu_r", center_zero=True)
+    # Secondary time axis on the TOP panel only
+    secax = axes[0].secondary_xaxis(
+        "top", functions=(lambda x: x * stride, lambda t: t / stride))
+    secax.set_xlabel("≈ time (s)", fontsize=8)
 
+    fig.suptitle(
+        f"{wav_path.name} — per-section attention over audio prefix "
+        f"(P={P} tokens × {stride:.2f}s/token)",
+        fontsize=10, y=0.995,
+    )
     plt.figtext(
-        0.02, 0.005,
+        0.02, 0.002,
         f"Generated: {attention_data['generated'][:240]}"
         f"{'...' if len(attention_data['generated']) > 240 else ''}",
         fontsize=7, ha="left", wrap=True, color="#444444",
