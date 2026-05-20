@@ -558,28 +558,56 @@ def train(config: dict) -> None:
     if full_ft:
         print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → training all LM weights")
     else:
-        # When tagged_mode added new tokens, the resized embed_tokens / lm_head
-        # rows for those tokens are randomly mean-initialized. Plain LoRA freezes
-        # the base model — including embeddings and lm_head — so those new rows
-        # would stay at init noise: the model could neither learn to EMIT the
-        # <sec_*> / <f_*> tokens (frozen lm_head) nor CONSUME them (frozen
-        # embed_tokens). modules_to_save makes those two layers fully trainable
-        # alongside the LoRA deltas, so the new tokens actually learn. Without
-        # this, section_head training cannot work on a LoRA base.
-        lora_kwargs = dict(
-            r=config["lora_rank"],
-            lora_alpha=config["lora_alpha"],
-            target_modules=config["lora_targets"],
-            lora_dropout=config["lora_dropout"],
-            bias="none",
-            task_type="CAUSAL_LM",
+        llm = get_peft_model(
+            llm,
+            LoraConfig(
+                r=config["lora_rank"],
+                lora_alpha=config["lora_alpha"],
+                target_modules=config["lora_targets"],
+                lora_dropout=config["lora_dropout"],
+                bias="none",
+                task_type="CAUSAL_LM",
+            ),
         )
-        if config.get("tagged_mode") and n_added_tokens > 0:
-            lora_kwargs["modules_to_save"] = ["embed_tokens", "lm_head"]
-            print("[LoRA] tagged_mode → embed_tokens + lm_head set trainable "
-                  "(modules_to_save) so new section/feature tokens can learn")
-        llm = get_peft_model(llm, LoraConfig(**lora_kwargs))
         print(f"[LoRA] rank={config['lora_rank']} alpha={config['lora_alpha']}")
+
+    # Row-masked new-token training (tagged_mode only).
+    #
+    # When tagged_mode adds the <sec_*>/<f_*> tokens, their embed_tokens/lm_head
+    # rows are random mean-init. They MUST train or the model can't emit/consume
+    # them. The naive fix (LoRA modules_to_save) makes the FULL 151,936-row
+    # embedding + output head trainable, and training the whole vocab on narrow
+    # speech-prose corrupts unrelated tokens — observed in v10 as Thai-token
+    # injection and malformed tags.
+    #
+    # Fix: unfreeze embed/lm_head but register a backward hook that ZEROES the
+    # gradient for every row except the new-token rows. Only the N new rows ever
+    # change; all pretrained rows stay byte-identical → no vocab corruption.
+    # These params get their own optimizer group (weight_decay=0) so decoupled
+    # weight decay can't drift the frozen rows either.
+    new_token_params: list = []
+    if config.get("tagged_mode") and n_added_tokens > 0:
+        old_vocab = len(tokenizer) - n_added_tokens
+        seen_ids: set[int] = set()
+        for module in (llm.get_input_embeddings(), llm.get_output_embeddings()):
+            if module is None or getattr(module, "weight", None) is None:
+                continue
+            w = module.weight
+            if id(w) in seen_ids:   # tied embed/lm_head → mask once
+                continue
+            seen_ids.add(id(w))
+            w.requires_grad_(True)
+
+            def _mask_old_rows(grad, ov=old_vocab):
+                g = grad.clone()
+                g[:ov] = 0.0
+                return g
+
+            w.register_hook(_mask_old_rows)
+            new_token_params.append(w)
+        print(f"[tagged-mode] row-masked embed/lm_head: only rows "
+              f"[{old_vocab}:{len(tokenizer)}] ({n_added_tokens} new tokens) trainable; "
+              f"{len(new_token_params)} weight tensor(s) hooked")
 
     if config["gradient_checkpointing"]:
         llm.gradient_checkpointing_enable()
@@ -740,10 +768,19 @@ def train(config: dict) -> None:
     # `lr_lm` is the canonical key going forward (covers both full-FT and LoRA).
     # `lr_lora` stays supported as a fallback so existing PSC configs keep working.
     lr_lm = float(config.get("lr_lm") or config.get("lr_lora"))
+    # New-token embed/lm_head rows go in their OWN group with weight_decay=0 so
+    # decoupled AdamW decay can't drift the (gradient-masked) frozen rows. They
+    # must also be excluded from the main LM group to avoid double-registration.
+    nt_ids = {id(p) for p in new_token_params}
     param_groups = [
         {"params": adapter.parameters(), "lr": config["lr_adapter"]},
-        {"params": [p for p in llm.parameters() if p.requires_grad], "lr": lr_lm},
+        {"params": [p for p in llm.parameters()
+                    if p.requires_grad and id(p) not in nt_ids], "lr": lr_lm},
     ]
+    if new_token_params:
+        param_groups.append({
+            "params": new_token_params, "lr": lr_lm, "weight_decay": 0.0,
+        })
     if section_head is not None:
         # Section-query head uses the adapter LR — it's a small new module similar
         # in size to the adapter and learns from CE gradient.
