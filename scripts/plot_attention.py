@@ -83,67 +83,69 @@ def compute_log_mel(wav_path: Path, sr_target: int = 16000,
 
 
 def plot_clip(attention_data: dict, wav_path: Path, output_pdf: Path) -> None:
-    """Render one clip's figure: spectrogram + per-section overlays."""
-    log_mel, mel_times, sr = compute_log_mel(wav_path)
+    """Render one clip's figure — CoLMbo Fig 2 style: per-section attention
+    over the audio prefix positions as a heatmap (rows=sections, cols=prefix
+    tokens), plus a section-specific (mean-subtracted) residual heatmap.
 
+    Does NOT use the spectrogram — CoLMbo's interpretability is over the
+    abstract prefix-token axis, which avoids the speech-envelope collapse
+    you get when mapping LM attention onto the spectrogram time axis.
+    wav_path is used only for the title."""
     sec_attn = attention_data["section_attentions"]
     present_sections = [s for s in SECTION_ORDER if s in sec_attn]
-    n_overlays = len(present_sections)
-
-    if n_overlays == 0:
+    if not present_sections:
         print(f"  [skip] no sections captured for {wav_path.name}")
         return
 
-    # Time axis for attention: each prefix token covers prefix_token_stride_sec
-    stride = attention_data["prefix_token_stride_sec"]
     P = attention_data["n_prefix_tokens"]
-    attn_times = np.arange(P) * stride + stride / 2
+    stride = attention_data["prefix_token_stride_sec"]
 
-    fig_height = 2.5 + 0.9 * n_overlays
-    fig, axes = plt.subplots(
-        n_overlays + 1, 1,
-        figsize=(10, fig_height),
-        sharex=True,
-        gridspec_kw={"height_ratios": [3] + [1] * n_overlays, "hspace": 0.15},
+    # Build the (n_sections, P) attention matrix — CoLMbo Fig 2 layout:
+    # rows = sections, columns = audio prefix-token positions, color = attention.
+    M = np.array([np.asarray(sec_attn[s], dtype=float) for s in present_sections])  # (S, P)
+    # Row-normalize so each section's pattern is comparable (max=1 per row).
+    M_norm = M / np.clip(M.max(axis=1, keepdims=True), 1e-12, None)
+    # Mean-subtracted: cancels the shared speech-envelope component, surfacing
+    # the SECTION-SPECIFIC attention that distinguishes e.g. noise from pitch.
+    M_resid = M_norm - M_norm.mean(axis=0, keepdims=True)
+
+    # Two stacked heatmaps: raw (top) + section-specific residual (bottom).
+    fig, (ax_raw, ax_res) = plt.subplots(
+        2, 1, figsize=(12, 1.0 + 0.5 * len(present_sections) * 2),
+        gridspec_kw={"hspace": 0.45},
     )
-    if n_overlays + 1 == 1:
-        axes = [axes]
 
-    # Spectrogram (top)
-    ax = axes[0]
-    extent = [mel_times[0], mel_times[-1], 0, log_mel.shape[0]]
-    ax.imshow(log_mel, aspect="auto", origin="lower", cmap="gray_r",
-              extent=extent, interpolation="nearest")
-    ax.set_ylabel("Mel bin")
-    ax.set_title(f"{wav_path.name}    (duration={attention_data['audio_duration_sec']:.2f}s, "
-                 f"P={P} prefix tokens × {stride:.2f}s stride)",
-                 fontsize=10)
+    def _draw(ax, mat, title, cmap, center_zero):
+        kw = {}
+        if center_zero:
+            vmax = np.abs(mat).max() or 1e-12
+            kw = dict(vmin=-vmax, vmax=vmax)
+        im = ax.imshow(mat, aspect="auto", cmap=cmap, interpolation="nearest", **kw)
+        ax.set_yticks(range(len(present_sections)))
+        ax.set_yticklabels(present_sections)
+        for tick, s in zip(ax.get_yticklabels(), present_sections):
+            tick.set_color(SECTION_COLORS[s]); tick.set_fontweight("bold")
+        ax.set_xlabel("Audio prefix-token index")
+        ax.set_title(title, fontsize=10)
+        # Secondary x-axis in seconds (prefix token i ≈ i*stride seconds)
+        secax = ax.secondary_xaxis(
+            "top", functions=(lambda x: x * stride, lambda t: t / stride))
+        secax.set_xlabel("≈ time (s)", fontsize=8)
+        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
 
-    # Per-section attention overlays
-    for i, section in enumerate(present_sections):
-        ax = axes[i + 1]
-        vec = np.array(sec_attn[section])
-        # Normalize for visual clarity (each row max=1)
-        vec_norm = vec / max(vec.max(), 1e-12)
-        ax.fill_between(attn_times, 0, vec_norm,
-                        color=SECTION_COLORS[section], alpha=0.45,
-                        edgecolor=SECTION_COLORS[section], linewidth=1.2)
-        ax.set_xlim(mel_times[0], mel_times[-1])
-        ax.set_ylim(0, 1.05)
-        ax.set_yticks([])
-        ax.set_ylabel(section, rotation=0, ha="right", va="center",
-                      fontsize=10, color=SECTION_COLORS[section],
-                      fontweight="bold")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+    _draw(ax_raw, M_norm,
+          f"{wav_path.name} — per-section attention over audio prefix "
+          f"(P={P} tokens × {stride:.2f}s)  [row-normalized]",
+          cmap="viridis", center_zero=False)
+    _draw(ax_res, M_resid,
+          "Section-SPECIFIC attention (row-normalized minus across-section mean) "
+          "— positive = this section attends here MORE than average",
+          cmap="RdBu_r", center_zero=True)
 
-    axes[-1].set_xlabel("Time (s)")
-
-    # Caption (generated text underneath)
-    fig.suptitle("Per-section attention attribution", fontsize=11, y=0.98)
     plt.figtext(
         0.02, 0.005,
-        f"Generated: {attention_data['generated'][:280]}{'...' if len(attention_data['generated']) > 280 else ''}",
+        f"Generated: {attention_data['generated'][:240]}"
+        f"{'...' if len(attention_data['generated']) > 240 else ''}",
         fontsize=7, ha="left", wrap=True, color="#444444",
     )
 
@@ -161,8 +163,10 @@ def main() -> int:
                      help="Single attention JSON to plot")
     grp.add_argument("--attention_dir", type=Path,
                      help="Directory containing many *_attention.json files")
-    p.add_argument("--audio_dir", type=Path, required=True,
-                   help="Directory containing the source .wav files (mix_clean/)")
+    p.add_argument("--audio_dir", type=Path, default=None,
+                   help="(Unused by the CoLMbo-style heatmap — kept for "
+                        "backward compat. The plot is over prefix-token index, "
+                        "not spectrogram time, so no .wav is needed.)")
     p.add_argument("--output_pdf", type=Path, default=None,
                    help="Output PDF path (only valid with --attention_json)")
     p.add_argument("--output_dir", type=Path, default=None,
@@ -173,10 +177,8 @@ def main() -> int:
 
     if args.attention_json:
         data = json.loads(args.attention_json.read_text())
-        wav_path = args.audio_dir / data["filename"]
-        if not wav_path.exists():
-            print(f"ERROR: wav not found at {wav_path}", file=sys.stderr)
-            return 2
+        # wav_path used only for the title; doesn't need to exist
+        wav_path = Path(data["filename"])
         out = args.output_pdf or args.attention_json.with_suffix(f".{args.format}")
         plot_clip(data, wav_path, out)
         return 0
@@ -190,10 +192,7 @@ def main() -> int:
     print(f"Found {len(jsons)} attention JSONs in {args.attention_dir}")
     for jp in jsons:
         data = json.loads(jp.read_text())
-        wav_path = args.audio_dir / data["filename"]
-        if not wav_path.exists():
-            print(f"  [skip] wav not found: {wav_path}")
-            continue
+        wav_path = Path(data["filename"])
         stem = jp.stem.replace("_attention", "")
         out = args.output_dir / f"{stem}.{args.format}"
         plot_clip(data, wav_path, out)
