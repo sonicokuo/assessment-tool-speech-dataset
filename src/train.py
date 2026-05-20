@@ -558,17 +558,27 @@ def train(config: dict) -> None:
     if full_ft:
         print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → training all LM weights")
     else:
-        llm = get_peft_model(
-            llm,
-            LoraConfig(
-                r=config["lora_rank"],
-                lora_alpha=config["lora_alpha"],
-                target_modules=config["lora_targets"],
-                lora_dropout=config["lora_dropout"],
-                bias="none",
-                task_type="CAUSAL_LM",
-            ),
+        # When tagged_mode added new tokens, the resized embed_tokens / lm_head
+        # rows for those tokens are randomly mean-initialized. Plain LoRA freezes
+        # the base model — including embeddings and lm_head — so those new rows
+        # would stay at init noise: the model could neither learn to EMIT the
+        # <sec_*> / <f_*> tokens (frozen lm_head) nor CONSUME them (frozen
+        # embed_tokens). modules_to_save makes those two layers fully trainable
+        # alongside the LoRA deltas, so the new tokens actually learn. Without
+        # this, section_head training cannot work on a LoRA base.
+        lora_kwargs = dict(
+            r=config["lora_rank"],
+            lora_alpha=config["lora_alpha"],
+            target_modules=config["lora_targets"],
+            lora_dropout=config["lora_dropout"],
+            bias="none",
+            task_type="CAUSAL_LM",
         )
+        if config.get("tagged_mode") and n_added_tokens > 0:
+            lora_kwargs["modules_to_save"] = ["embed_tokens", "lm_head"]
+            print("[LoRA] tagged_mode → embed_tokens + lm_head set trainable "
+                  "(modules_to_save) so new section/feature tokens can learn")
+        llm = get_peft_model(llm, LoraConfig(**lora_kwargs))
         print(f"[LoRA] rank={config['lora_rank']} alpha={config['lora_alpha']}")
 
     if config["gradient_checkpointing"]:
