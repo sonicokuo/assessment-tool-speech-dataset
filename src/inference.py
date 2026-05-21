@@ -321,6 +321,19 @@ _STRUCTURAL_KEYS = (
     "lora_targets",
     "lora_dropout",
     "tagged_mode",  # tags vs legacy untagged prose — determines tokenizer setup
+    # Section-query path. These MUST come from the checkpoint: the YAML default
+    # is use_sections=false, so without syncing these a section_head checkpoint
+    # would run inference WITHOUT loading section_head — a train/inference
+    # mismatch (no e_t injection at <sec_*> positions) that corrupts generation
+    # and produces no attention maps. This was the v11 garbage-output bug.
+    "use_sections",
+    "section_query_mode",
+    "beats_cached",
+    "spec_encoder_name",
+    "spec_checkpoint_name",
+    "spec_d_patch",
+    "section_d_k",
+    "section_d_v",
 )
 
 
