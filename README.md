@@ -169,7 +169,7 @@ CPU only. ~15 minutes total for all 19,900 clips.
 
 No LLM. Reads the VAD columns when present, falls back to pyannote columns with a one-shot warning. ~10 seconds end-to-end.
 
-**Default for the LoRA+8B pipeline (v8 recipe):**
+**Default for the LoRA+8B pipeline (v9 recipe):**
 
 ```bash
 python scripts/build_descriptions_deterministic.py --all --untagged \
@@ -306,17 +306,17 @@ Uses `configs/config.psc.emnlp.yaml` defaults: **Qwen3-8B + LoRA r=16**, `film-m
 Foreground with log capture via `tee` (output streams to your terminal AND is written to `$LOG`):
 
 ```bash
-mkdir -p $SHARED/logs $SHARED/checkpoints/v8_lora_8b_nodur
-LOG=$SHARED/logs/v8-lora-8b-nodur_$(date +%Y%m%d_%H%M%S).log
+mkdir -p $SHARED/logs $SHARED/checkpoints/v9_lora_8b_nodur
+LOG=$SHARED/logs/v9-lora-8b-nodur_$(date +%Y%m%d_%H%M%S).log
 
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $SHARED/data/descriptions_untagged_noseg_nodur.json \
-  --wandb_run_name    v8-lora-8b-nodur \
-  --save_dir          $SHARED/checkpoints/v8_lora_8b_nodur \
+  --wandb_run_name    v9-lora-8b-nodur \
+  --save_dir          $SHARED/checkpoints/v9_lora_8b_nodur \
   2>&1 | tee "$LOG"
 ```
 
-~33 min / epoch × 15 epochs ≈ 8 hours on a single H100. The launch keeps your shell occupied; if you need to detach without killing, wrap the command in `screen -S v8` or `tmux new -s v8` first (Ctrl+A D / Ctrl+B D to detach, re-attach later with `screen -r v8` / `tmux attach -t v8`).
+~33 min / epoch × 15 epochs ≈ 8 hours on a single H100. The launch keeps your shell occupied; if you need to detach without killing, wrap the command in `screen -S v9` or `tmux new -s v9` first (Ctrl+A D / Ctrl+B D to detach, re-attach later with `screen -r v9` / `tmux attach -t v9`).
 
 The `python -u` flag is **critical** when piping through `tee` — it disables Python's stdout buffering so prints land in the terminal and the log file in real time, not in 8 KB chunks every few minutes.
 
@@ -375,7 +375,7 @@ to any of the commands below. Save it under a separate `__fullft` suffix to keep
 
 ### Adapter-architecture sweep
 
-The paper's primary comparison table. Same data, same seed, same epochs, same section / BEATs / dynamic-query setup — **only `adapter_variant` changes**. Eight variants in `src/adapter.py::build_adapter`:
+The paper's primary comparison table. Same data, same seed, same epochs, same section / BEATs / dynamic-query setup — **only `adapter_variant` changes**. The six variants we compare:
 
 | adapter_variant | Conditioning | Temporal mixer | Notes |
 |---|---|---|---|
@@ -384,11 +384,9 @@ The paper's primary comparison table. Same data, same seed, same epochs, same se
 | `sigmoid-gate` | Sigmoid gate | None | Lighter gating alternative |
 | `film` | FiLM | None | Isolates the temporal-mixer contribution |
 | `film-attn` | FiLM | Self-attention (1 layer) | Argues Mamba vs attn |
-| `film-attn-2L` | FiLM | Self-attention (2 layers) | Depth ablation for attn |
-| `film-mamba-2L` | FiLM | Mamba SSM (2 layers) | Depth ablation for Mamba |
 | `qformer` | Q-Former cross-attention | (implicit) | Alternative architecture |
 
-Naming convention: `--wandb_run_name v8-<variant>` and `--save_dir $SHARED/checkpoints/v8_<variant>`. The `v8` prefix marks the recipe generation (LoRA + 8B + no-duration + no-overlap-segments). When you re-tune hyperparams within v8, append `__v2` etc. to the save_dir.
+Naming convention: `--wandb_run_name v9-<variant>` and `--save_dir $SHARED/checkpoints/v9_<variant>`. The `v9` prefix marks the recipe generation (LoRA + 8B + no-duration + no-overlap-segments). When you re-tune hyperparams within v9, append `__v2` etc. to the save_dir.
 
 **Scheduling**: each run takes ~8h on one H100. The 8 variants in sequence is ~64 h. To parallelize, allocate one H100 per variant in separate `interact` sessions (or `sbatch` jobs) — **never launch two trainings on the same GPU**, they OOM each other instantly. Each command below assumes you're inside a fresh `interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis260125p` session.
 
@@ -402,89 +400,67 @@ time cat $SHARED/hf_cache/hub/models--Qwen--Qwen3-8B/blobs/* > /dev/null
 ```
 
 ```bash
-# v8-film-mamba (headline, this is the main config — no --adapter_variant needed)
-LOG=$SHARED/logs/v8-film-mamba_$(date +%Y%m%d_%H%M%S).log
+# v9-film-mamba (headline, this is the main config — no --adapter_variant needed)
+LOG=$SHARED/logs/v9-film-mamba_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $DESC \
-  --save_dir          $SHARED/checkpoints/v8_film_mamba \
-  --wandb_run_name    v8-film-mamba \
+  --save_dir          $SHARED/checkpoints/v9_film_mamba \
+  --wandb_run_name    v9-film-mamba \
   2>&1 | tee "$LOG"
 ```
 
 ```bash
-# v8-concat-only — baseline without FiLM or temporal mixer
-LOG=$SHARED/logs/v8-concat-only_$(date +%Y%m%d_%H%M%S).log
+# v9-concat-only — baseline without FiLM or temporal mixer
+LOG=$SHARED/logs/v9-concat-only_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $DESC \
   --adapter_variant   concat-only \
-  --save_dir          $SHARED/checkpoints/v8_concat_only \
-  --wandb_run_name    v8-concat-only \
+  --save_dir          $SHARED/checkpoints/v9_concat_only \
+  --wandb_run_name    v9-concat-only \
   2>&1 | tee "$LOG"
 ```
 
 ```bash
-# v8-sigmoid-gate — lighter gating than FiLM
-LOG=$SHARED/logs/v8-sigmoid-gate_$(date +%Y%m%d_%H%M%S).log
+# v9-sigmoid-gate — lighter gating than FiLM
+LOG=$SHARED/logs/v9-sigmoid-gate_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $DESC \
   --adapter_variant   sigmoid-gate \
-  --save_dir          $SHARED/checkpoints/v8_sigmoid_gate \
-  --wandb_run_name    v8-sigmoid-gate \
+  --save_dir          $SHARED/checkpoints/v9_sigmoid_gate \
+  --wandb_run_name    v9-sigmoid-gate \
   2>&1 | tee "$LOG"
 ```
 
 ```bash
-# v8-film (FiLM only, no temporal mixer) — isolates the FiLM contribution
-LOG=$SHARED/logs/v8-film_$(date +%Y%m%d_%H%M%S).log
+# v9-film (FiLM only, no temporal mixer) — isolates the FiLM contribution
+LOG=$SHARED/logs/v9-film_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $DESC \
   --adapter_variant   film \
-  --save_dir          $SHARED/checkpoints/v8_film \
-  --wandb_run_name    v8-film \
+  --save_dir          $SHARED/checkpoints/v9_film \
+  --wandb_run_name    v9-film \
   2>&1 | tee "$LOG"
 ```
 
 ```bash
-# v8-film-attn (FiLM + 1-layer self-attention mixer)
-LOG=$SHARED/logs/v8-film-attn_$(date +%Y%m%d_%H%M%S).log
+# v9-film-attn (FiLM + 1-layer self-attention mixer)
+LOG=$SHARED/logs/v9-film-attn_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $DESC \
   --adapter_variant   film-attn \
-  --save_dir          $SHARED/checkpoints/v8_film_attn \
-  --wandb_run_name    v8-film-attn \
+  --save_dir          $SHARED/checkpoints/v9_film_attn \
+  --wandb_run_name    v9-film-attn \
   2>&1 | tee "$LOG"
 ```
 
 ```bash
-# v8-film-attn-2L — attention depth ablation
-LOG=$SHARED/logs/v8-film-attn-2L_$(date +%Y%m%d_%H%M%S).log
-python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --descriptions_path $DESC \
-  --adapter_variant   film-attn-2L \
-  --save_dir          $SHARED/checkpoints/v8_film_attn_2L \
-  --wandb_run_name    v8-film-attn-2L \
-  2>&1 | tee "$LOG"
-```
-
-```bash
-# v8-film-mamba-2L — Mamba depth ablation
-LOG=$SHARED/logs/v8-film-mamba-2L_$(date +%Y%m%d_%H%M%S).log
-python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --descriptions_path $DESC \
-  --adapter_variant   film-mamba-2L \
-  --save_dir          $SHARED/checkpoints/v8_film_mamba_2L \
-  --wandb_run_name    v8-film-mamba-2L \
-  2>&1 | tee "$LOG"
-```
-
-```bash
-# v8-qformer — Q-Former cross-attention alternative
-LOG=$SHARED/logs/v8-qformer_$(date +%Y%m%d_%H%M%S).log
+# v9-qformer — Q-Former cross-attention alternative
+LOG=$SHARED/logs/v9-qformer_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $DESC \
   --adapter_variant   qformer \
-  --save_dir          $SHARED/checkpoints/v8_qformer \
-  --wandb_run_name    v8-qformer \
+  --save_dir          $SHARED/checkpoints/v9_qformer \
+  --wandb_run_name    v9-qformer \
   2>&1 | tee "$LOG"
 ```
 
@@ -492,7 +468,7 @@ To run multiple variants sequentially in one shell (~64h end-to-end), chain them
 
 Each command keeps your shell occupied for ~8h. To detach safely use `screen -S adapter` / `tmux new -s adapter` before launching, then Ctrl+A D / Ctrl+B D to detach (training continues), and `screen -r` / `tmux attach -t adapter` to re-attach.
 
-> **Note on the currently-running training:** if you launched the headline with `--wandb_run_name v8-lora-8b-nodur --save_dir $SHARED/checkpoints/v8_lora_8b_nodur` (older convention), that's fine — it's the equivalent of `v8-film-mamba` since `film-mamba` is the YAML default `adapter_variant`. Future ablation rows should use the `v8-<variant>` naming above so they line up cleanly in the wandb run list.
+> **Note on the currently-running training:** if you launched the headline with `--wandb_run_name v9-lora-8b-nodur --save_dir $SHARED/checkpoints/v9_lora_8b_nodur` (older convention), that's fine — it's the equivalent of `v9-film-mamba` since `film-mamba` is the YAML default `adapter_variant`. Future ablation rows should use the `v9-<variant>` naming above so they line up cleanly in the wandb run list.
 
 ### Design ablations (orthogonal to the adapter sweep)
 
@@ -500,49 +476,49 @@ For probing the section-attention design itself. Note that since v7 the YAML def
 
 | Knob | Override (relative to YAML defaults) | Run name |
 |---|---|---|
-| Section-head ON + tagged-prose (legacy EMNLP-rework path) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json` | `v8-section-head` |
-| Section-head ON, but static queries (learnable lookup, no LM-derived query) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json --section_query_mode static` | `v8-static-queries` |
-| Full-FT comparison (Qwen3-1.7B, no LoRA) | `--lm_name Qwen/Qwen3-1.7B --lora_rank 0` | `v8-fullft-1.7b` |
+| Section-head ON + tagged-prose (legacy EMNLP-rework path) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json` | `v9-section-head` |
+| Section-head ON, but static queries (learnable lookup, no LM-derived query) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json --section_query_mode static` | `v9-static-queries` |
+| Full-FT comparison (Qwen3-1.7B, no LoRA) | `--lm_name Qwen/Qwen3-1.7B --lora_rank 0` | `v9-fullft-1.7b` |
 
 Section-head rows require the tagged JSON — rebuild via `scripts/build_descriptions_deterministic.py --all` (without `--untagged`/`--no-overlap-segments`/`--no-duration`) into a separate output file.
 
 Same scheduling rule applies: one variant at a time, foreground with `tee`. Use `screen` / `tmux` if you need to detach.
 
 ```bash
-# v8-section-head (legacy EMNLP-rework path — needs descriptions_tagged.json)
-LOG=$SHARED/logs/v8-section-head_$(date +%Y%m%d_%H%M%S).log
+# v9-section-head (legacy EMNLP-rework path — needs descriptions_tagged.json)
+LOG=$SHARED/logs/v9-section-head_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections true --tagged_mode true --beats_cached true \
   --descriptions_path $SHARED/data/descriptions_tagged.json \
-  --save_dir          $SHARED/checkpoints/v8_section_head \
-  --wandb_run_name    v8-section-head \
+  --save_dir          $SHARED/checkpoints/v9_section_head \
+  --wandb_run_name    v9-section-head \
   2>&1 | tee "$LOG"
 ```
 
 ```bash
-# v8-static-queries (static section queries instead of LM-derived dynamic queries)
-LOG=$SHARED/logs/v8-static-queries_$(date +%Y%m%d_%H%M%S).log
+# v9-static-queries (static section queries instead of LM-derived dynamic queries)
+LOG=$SHARED/logs/v9-static-queries_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections true --tagged_mode true --beats_cached true \
   --descriptions_path  $SHARED/data/descriptions_tagged.json \
   --section_query_mode static \
-  --save_dir           $SHARED/checkpoints/v8_static_queries \
-  --wandb_run_name     v8-static-queries \
+  --save_dir           $SHARED/checkpoints/v9_static_queries \
+  --wandb_run_name     v9-static-queries \
   2>&1 | tee "$LOG"
 ```
 
 ```bash
-# v8-fullft-1.7b (full FT comparison — the original v6 recipe before LoRA).
+# v9-fullft-1.7b (full FT comparison — the original v6 recipe before LoRA).
 # This one ALSO needs --descriptions_path explicit since v6 used a different
 # target format. Uses the same no-duration / no-overlap-segments JSON for fair
 # comparison; only the LM + LoRA-rank flip.
-LOG=$SHARED/logs/v8-fullft-1.7b_$(date +%Y%m%d_%H%M%S).log
+LOG=$SHARED/logs/v9-fullft-1.7b_$(date +%Y%m%d_%H%M%S).log
 python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --descriptions_path $SHARED/data/descriptions_untagged_noseg_nodur.json \
   --lm_name           Qwen/Qwen3-1.7B \
   --lora_rank         0 \
-  --save_dir          $SHARED/checkpoints/v8_fullft_17b \
-  --wandb_run_name    v8-fullft-1.7b \
+  --save_dir          $SHARED/checkpoints/v9_fullft_17b \
+  --wandb_run_name    v9-fullft-1.7b \
   2>&1 | tee "$LOG"
 ```
 
@@ -557,65 +533,49 @@ Greedy decoding over the test set (`--top_k 1` is deterministic, matches paper-t
 **Run one ablation at a time** — inference loads the 8B LM (~16 GB GPU memory), so two concurrent runs on the same GPU will OOM. ~30-90 min per ablation on H100.
 
 ```bash
-# Headline (v8-film-mamba)
+# Headline (v9-film-mamba)
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_film_mamba/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_film_mamba/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
 ```bash
-# v8-concat-only
+# v9-concat-only
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_concat_only/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_concat_only/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
 ```bash
-# v8-sigmoid-gate
+# v9-sigmoid-gate
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_sigmoid_gate/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_sigmoid_gate/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
 ```bash
-# v8-film
+# v9-film
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_film/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_film/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
 ```bash
-# v8-film-attn
+# v9-film-attn
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_film_attn/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_film_attn/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
 ```bash
-# v8-film-attn-2L
+# v9-qformer
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_film_attn_2L/best.pt \
-  --test_dir   $SHARED/data/processed_pyannote/test \
-  --top_k      1
-```
-
-```bash
-# v8-film-mamba-2L
-python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_film_mamba_2L/best.pt \
-  --test_dir   $SHARED/data/processed_pyannote/test \
-  --top_k      1
-```
-
-```bash
-# v8-qformer
-python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_qformer/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_qformer/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
@@ -623,25 +583,25 @@ python src/inference.py --config configs/config.psc.emnlp.yaml \
 **Design ablations:**
 
 ```bash
-# v8-section-head
+# v9-section-head
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_section_head/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_section_head/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
 ```bash
-# v8-static-queries
+# v9-static-queries
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_static_queries/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_static_queries/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
 ```bash
-# v8-fullft-1.7b
+# v9-fullft-1.7b
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_fullft_17b/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_fullft_17b/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
@@ -663,13 +623,40 @@ Written **next to the checkpoint** (`dirname(--checkpoint)`):
 
 The same wandb run page used at training time gets `test/sfs_*` and `test/{bleu,rouge_l,bertscore_f1}` (because the checkpoint embeds `wandb_run_id`).
 
+### Performance table (collate the adapter sweep)
+
+Each variant's `inference_summary.json` is one row of the paper's performance table. After running inference for every variant, collate them into the table (SFS-F1 / P / R / BLEU / ROUGE-L / BERTScore):
+
+```bash
+python3 - <<'PY'
+import json, glob, os
+pat = os.path.expandvars("$SHARED/checkpoints/v9_*/inference_summary.json")
+print(f"{'variant':22}{'SFS-F1':>8}{'P':>7}{'R':>7}{'BLEU':>7}{'ROUGE':>7}{'BERT':>7}")
+for f in sorted(glob.glob(pat)):
+    d = json.load(open(f)); g = d.get("gen_metrics", {})
+    n = os.path.basename(os.path.dirname(f))
+    print(f"{n:22}{d['sfs_f1']:8.3f}{d['sfs_precision']:7.3f}{d['sfs_recall']:7.3f}"
+          f"{(g.get('bleu') or 0):7.2f}{(g.get('rouge_l') or 0):7.3f}{(g.get('bertscore_f1') or 0):7.3f}")
+PY
+```
+
+The adapter variants (`v9_concat_only`, `v9_sigmoid_gate`, `v9_film`, `v9_film_attn`, `v9_qformer`, `v9_film_mamba`) are the rows of the adapter-comparison table. The design-ablation dirs (`v9_section_head`, `v9_static_queries`, `v9_fullft_1.7b`) are reported separately, not in that table. Add the no-audio baseline row with `scripts/zero_shot_baseline.py` (see below).
+
+### Run the tests
+
+```bash
+python -m pytest tests/ -v        # full suite (SFS, text metrics, feature set, section-query, FiLM init, overlap-info)
+```
+
+See the [Testing](#testing) section for dependencies, standalone scripts, and the 5-minute end-to-end smoke.
+
 ### Analysis scripts (run after inference)
 
 All read `inference_results.json` and produce paper-ready outputs alongside it.
 
 ```bash
-RES=$SHARED/checkpoints/v8_lora_8b_nodur/inference_results.json
-CKPT=$SHARED/checkpoints/v8_lora_8b_nodur/best.pt
+RES=$SHARED/checkpoints/v9_lora_8b_nodur/inference_results.json
+CKPT=$SHARED/checkpoints/v9_lora_8b_nodur/best.pt
 
 # Per-feature SFS table — P/R/F1 per feature, sorted by F1.
 # Surfaces which features are strong (pause_count, overlap_ratio) vs weak
@@ -841,17 +828,17 @@ WANDB_MODE=disabled python -u src/train.py \
   --max_steps 50 \
   --save_dir /tmp/smoke_ckpt
 
-# 3. 10-clip inference smoke (needs a real checkpoint — point at v8 if running)
+# 3. 10-clip inference smoke (needs a real checkpoint — point at v9 if running)
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/v8_lora_8b_nodur/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_lora_8b_nodur/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --start 0 --end 10 --top_k 1
 
 # 4. Analysis scripts work on the 10-clip output
 python scripts/per_feature_sfs.py \
-  --inference_results $SHARED/checkpoints/v8_lora_8b_nodur/inference_results.json
+  --inference_results $SHARED/checkpoints/v9_lora_8b_nodur/inference_results.json
 python scripts/overlap_hedging_compare.py \
-  --inference_results $SHARED/checkpoints/v8_lora_8b_nodur/inference_results.json
+  --inference_results $SHARED/checkpoints/v9_lora_8b_nodur/inference_results.json
 ```
 
 If all four steps complete without errors, the full pipeline is wired correctly.
