@@ -468,7 +468,13 @@ class SFSScorer:
             precision = 0.0
 
         # Recall: how many ground-truth features were mentioned at all?
-        gt_features = set(ground_truth.keys()) - {"overlap_segments"}
+        # Restrict the denominator to features SFS can actually score (those
+        # with a tolerance). GT keys without a tolerance — duration_sec and
+        # sample_rate, which are measured deterministically at inference rather
+        # than predicted — must not inflate the denominator, or they silently
+        # cap recall for every model. This also makes scoring robust to a target
+        # that still contains a duration sentence (train/inference target skew).
+        gt_features = set(ground_truth.keys()) & set(self.TOLERANCES.keys())
         if gt_segments:
             gt_features.add("overlap_span")
 

@@ -1,0 +1,78 @@
+# AMI SDM cross-domain test config (NODUR targets — for the v9 adapter sweep). Identical to
+# config.psc.emnlp.yaml except the data paths point at the AMI namespace.
+# Model/adapter structural keys are synced from the checkpoint at inference time
+# (see inference.py::_sync_config_with_checkpoint), so only the data section matters.
+
+# ── Model ──────────────────────────────────────────────
+lm_name: "Qwen/Qwen3-8B"
+adapter_variant: "film-mamba"
+lora_rank: 16
+lora_alpha: 32
+lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_dropout: 0.05
+tagged_mode: false
+use_sections: false
+spec_encoder_name: "beats"
+spec_checkpoint_name: "BEATs_iter3_plus_AS2M.pt"
+spec_d_patch: 768
+spec_freeze: true
+section_d_k: 256
+section_d_v: 256
+section_query_mode: "dynamic"
+beats_cached: false
+
+# ── Optimizer (unused at inference) ──────────────────────────────────────────────
+optimizer: "adamw"
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+lr_adapter: 1.0e-4
+lr_lm: 1.0e-5
+weight_decay: 0.01
+grad_clip: 1.0
+lr_scheduler: "cosine"
+warmup_ratio: 0.03
+min_lr_ratio: 0.0
+
+# ── Training (unused at inference) ──────────────────────────────────────────────
+bf16: true
+batch_size: 6
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+epochs: 15
+seed: 73
+max_target_length: 512
+max_nums_length: 64
+resume_from: null
+
+# ── Data (AMI gate namespace) ──────────────────────────────────────────────
+data_dir: "/ocean/projects/cis260125p/shared/data/processed_ami"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_ami.json"
+# AMI has no Libri2Mix-style structured SFS GT json; SFS ground truth is parsed
+# from the deterministic AMI target prose instead.
+features_path: null
+num_workers: 4
+pin_memory: true
+
+# ── Loss weights (unused at inference) ──────────────
+lambda_prose: 1.0
+lambda_nums:  0.3
+lambda_mse:   0.3
+
+# ── Evaluation ──────────────────────────────────────────────
+eval_every_epoch: 1
+prompt: "Describe the quality of this recording."
+prompt_prose: "Describe the quality of this recording."
+prompt_nums:  "List the numerical features of this recording:"
+val_sfs_n: 32
+
+# ── Generation ──────────────────────────────────────────────
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+
+# ── Logging ──────────────────────────────────────────────
+wandb_entity: "speech_quality_adapter"
+wandb_project: "aqua-nl-emnlp"
+wandb_run_name: null
+log_every: 10

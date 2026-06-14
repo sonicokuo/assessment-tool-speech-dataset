@@ -635,9 +635,24 @@ python scripts/overlap_hedging_compare.py \
 
 The same wandb run page used at training time gets `test/sfs_*` and `test/{bleu,rouge_l,bertscore_f1}` (because the checkpoint embeds `wandb_run_id`).
 
+### Re-score against the no-duration target
+
+`inference.py` reads its target / SFS ground truth from `descriptions_path`. Any run scored against a target that still carries a leading duration sentence (the old `descriptions_untagged_noseg.json`) is depressed two ways: `duration_sec` lands in the SFS recall denominator where it can never be matched, and the duration sentence sits unmatched in the BLEU/ROUGE/BERTScore reference. Generation is greedy and target-independent, so you do **not** re-run the model — re-score the saved `inference_results.json` against the no-duration target:
+
+```bash
+for V in v9_film_mamba v9_film_attn v9_concat_only v9_sigmoid_gate v9_film v9_qformer; do
+  python scripts/rescore_nodur.py \
+    --inference_results $SHARED/checkpoints/$V/inference_results.json \
+    --descriptions      $SHARED/data/descriptions_untagged_noseg_nodur.json
+done
+# writes inference_summary_rescored.json next to each inference_results.json
+```
+
+Only needed for runs inferred **before** `descriptions_path` was pointed at the no-duration target; runs done after are already correct (the scorer also now drops any GT feature without a tolerance, so duration cannot inflate recall regardless). To collate the corrected numbers, point the snippet below at `inference_summary_rescored.json`.
+
 ### Performance table (collate the adapter sweep)
 
-Each variant's `inference_summary.json` is one row of the paper's performance table. After running inference for every variant, collate them into the table (SFS-F1 / P / R / BLEU / ROUGE-L / BERTScore):
+Each variant's `inference_summary.json` (or `inference_summary_rescored.json`, see above) is one row of the paper's performance table. After running inference for every variant, collate them into the table (SFS-F1 / P / R / BLEU / ROUGE-L / BERTScore):
 
 ```bash
 python3 - <<'PY'
