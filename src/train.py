@@ -34,6 +34,12 @@ from section_tags import (
     section_open_token_ids,
 )
 from section_query import SectionQueryHead
+# [section_readout] training-only regression head that grounds section attention.
+from section_readout import (
+    SectionReadoutHead,
+    section_readout_loss,
+    query_section_indices,
+)
 from spec_encoder import SpecEncoder
 
 
@@ -162,6 +168,7 @@ def _build_section_ctx(
     device: torch.device,
     mode: str = "static",
     range_open_id: int | None = None,
+    readout_head: "SectionReadoutHead | None" = None,  # [section_readout]
 ) -> dict | None:
     """Compute the per-batch section context: K/V (+ e_all in static mode).
 
@@ -210,14 +217,22 @@ def _build_section_ctx(
             "key_padding_mask": key_padding_mask,
             "section_id_to_idx": section_id_to_idx,
             "range_open_id": range_open_id,
+            # [section_readout] head + per-fired-query alpha get stashed in by
+            # _inject_section_summaries_dynamic during pass 1.
+            "readout_head": readout_head,
         }
 
     # Static mode: compute per-section summaries up front.
-    e_all, _alpha = section_head.forward_all_sections(K, V, key_padding_mask=key_padding_mask)
+    e_all, alpha = section_head.forward_all_sections(K, V, key_padding_mask=key_padding_mask)
     return {
         "mode": "static",
         "e_all": e_all,
         "section_id_to_idx": section_id_to_idx,
+        # [section_readout] keep alpha (B, S, P) + V (B, P, d_v) so the grounding
+        # loss can recompute z = alpha · V.detach() for every section every step.
+        "readout_head": readout_head,
+        "readout_alpha": alpha,
+        "V": V,
     }
 
 
@@ -281,11 +296,23 @@ def _inject_section_summaries_dynamic(
     # Cross-attend with per-position queries. Pass the padding mask so the
     # softmax over patches ignores padded BEATs slots.
     key_padding_mask = section_ctx.get("key_padding_mask")
-    e_t, _alpha = head.forward_dynamic(
+    e_t, alpha = head.forward_dynamic(
         h_t, K, V,
         batch_idx=batch_idx,
         key_padding_mask=key_padding_mask,
-    )       # (N, d_lm)
+    )       # (N, d_lm), alpha (N, P)
+
+    # [section_readout] Stash the per-fired-query attention + routing so the
+    # grounding loss (computed back in compute_loss) can recompute
+    # z = alpha · V.detach(). <r> opens fire a query too but have no scalar →
+    # query_section_indices maps them to -1 so loss_dynamic drops them.
+    if section_ctx.get("readout_head") is not None:
+        fired_ids = target_ids[batch_idx, local_pos]                # (N,)
+        section_ctx["readout_alpha"] = alpha
+        section_ctx["readout_batch_idx"] = batch_idx
+        section_ctx["readout_query_section_idx"] = query_section_indices(
+            fired_ids, id_to_idx,
+        )
 
     # Inject e_t at the corresponding (b, l) in target_embeds.
     # Build a sparse additive: scatter e_t into a (B, L, d_lm) zero tensor.
@@ -466,6 +493,26 @@ def compute_loss(
     )
     metrics["loss_lm_prose"] = float(lm_loss_prose.detach().item())
 
+    # [section_readout] Grounding loss. Regresses each section's acoustic scalar
+    # out of z = alpha · V.detach() (the attention output), pushing alpha onto
+    # evidence-bearing patches. Computed right after the prose forward, which is
+    # what stashes alpha/V into section_ctx (the nums forward below carries no
+    # section_ctx, so nothing clobbers it). No-op when lambda_readout == 0,
+    # there's no readout head, or no GT scalars.
+    readout_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    lambda_readout = float(config.get("lambda_readout", 0.0))
+    if lambda_readout > 0.0:
+        r_loss, r_mae = section_readout_loss(section_ctx, gt_scalars, gt_mask)
+        if r_loss is not None:
+            readout_loss = r_loss.to(lm_loss_prose.dtype)
+            metrics["loss_readout"] = float(r_loss.detach().item())
+            for fname, val in r_mae.items():
+                metrics[f"readout_mae/{fname}"] = val
+        else:
+            metrics["loss_readout"] = 0.0
+    else:
+        metrics["loss_readout"] = 0.0
+
     # Numbers CE loss (B-full forward A, optional)
     lm_loss_nums = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
     has_nums = (target_nums is not None
@@ -523,6 +570,8 @@ def compute_loss(
     lambda_mse = float(config.get("lambda_mse", 0.0))
 
     total = lambda_prose * lm_loss_prose + lambda_nums * lm_loss_nums + lambda_mse * mse_loss
+    # [section_readout] add the grounding term (readout_loss is 0 when disabled).
+    total = total + lambda_readout * readout_loss
     metrics["loss_total"] = float(total.detach().item())
     return total, metrics
 
@@ -627,6 +676,7 @@ def train(config: dict) -> None:
     use_sections = bool(config.get("use_sections"))
     spec_encoder: SpecEncoder | None = None
     section_head: SectionQueryHead | None = None
+    readout_head: "SectionReadoutHead | None" = None  # [section_readout]
     section_id_to_idx: dict[int, int] = {}
     if use_sections:
         # Spec encoder is only needed if patches aren't precomputed in the .pt files.
@@ -652,6 +702,19 @@ def train(config: dict) -> None:
             d_k=int(config.get("section_d_k", 256)),
             d_v=int(config.get("section_d_v", 256)),
         ).to(device).to(torch.bfloat16)
+
+        # [section_readout] Optional grounding head. Reads each section's acoustic
+        # scalar out of z = alpha · V (V detached) and regresses it against Praat
+        # GT, applying a gradient that forces alpha onto evidence-bearing patches.
+        # Kept in float32 (NOT bf16) for regression precision; off when
+        # lambda_readout == 0 (default), so zero overhead on legacy runs.
+        if float(config.get("lambda_readout", 0.0)) > 0.0:
+            readout_head = SectionReadoutHead(
+                d_v=int(config.get("section_d_v", 256)),
+                huber_delta=float(config.get("readout_huber_delta", 1.0)),
+            ).to(device)
+            print(f"[section_readout] enabled: lambda_readout="
+                  f"{config.get('lambda_readout')}, d_v={config.get('section_d_v', 256)}")
 
         # Build the section_id → section_idx mapping. Must run AFTER the tokenizer
         # has section tokens registered — done in _register_feature_tags above
@@ -785,6 +848,9 @@ def train(config: dict) -> None:
         # Section-query head uses the adapter LR — it's a small new module similar
         # in size to the adapter and learns from CE gradient.
         param_groups.append({"params": section_head.parameters(), "lr": config["lr_adapter"]})
+    if readout_head is not None:
+        # [section_readout] grounding head, also at adapter LR.
+        param_groups.append({"params": readout_head.parameters(), "lr": config["lr_adapter"]})
     optimizer = torch.optim.AdamW(
         param_groups,
         weight_decay=config["weight_decay"],
@@ -832,6 +898,8 @@ def train(config: dict) -> None:
         llm.load_state_dict(llm_sd)
         if section_head is not None and "section_head_state_dict" in checkpoint:
             section_head.load_state_dict(checkpoint["section_head_state_dict"])
+        if readout_head is not None and "readout_head_state_dict" in checkpoint:  # [section_readout]
+            readout_head.load_state_dict(checkpoint["readout_head_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -891,6 +959,7 @@ def train(config: dict) -> None:
             section_ctx = _build_section_ctx(
                 section_head, spec_encoder, section_id_to_idx, batch, device,
                 mode=sq_mode, range_open_id=range_open_id_train,
+                readout_head=readout_head,  # [section_readout]
             ) if section_head is not None else None
 
             loss, loss_metrics = compute_loss(
@@ -938,6 +1007,8 @@ def train(config: dict) -> None:
                 # drops smoothly while every val metric regresses by epoch 4.
                 if section_head is not None:
                     torch.nn.utils.clip_grad_norm_(section_head.parameters(), config["grad_clip"])
+                if readout_head is not None:  # [section_readout]
+                    torch.nn.utils.clip_grad_norm_(readout_head.parameters(), config["grad_clip"])
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -992,6 +1063,7 @@ def train(config: dict) -> None:
                     section_ctx = _build_section_ctx(
                         section_head, spec_encoder, section_id_to_idx, batch, device,
                         mode=sq_mode, range_open_id=range_open_id_train,
+                        readout_head=readout_head,  # [section_readout]
                     ) if section_head is not None else None
 
                     loss, loss_metrics = compute_loss(
@@ -1207,6 +1279,8 @@ def train(config: dict) -> None:
             }
             if section_head is not None:
                 payload["section_head_state_dict"] = section_head.state_dict()
+            if readout_head is not None:  # [section_readout]
+                payload["readout_head_state_dict"] = readout_head.state_dict()
             return payload
 
         # Atomic save: write to .tmp then os.replace (POSIX atomic). Without
