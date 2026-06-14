@@ -321,6 +321,19 @@ _STRUCTURAL_KEYS = (
     "lora_targets",
     "lora_dropout",
     "tagged_mode",  # tags vs legacy untagged prose — determines tokenizer setup
+    # Section-query path. These MUST come from the checkpoint: the YAML default
+    # is use_sections=false, so without syncing these a section_head checkpoint
+    # would run inference WITHOUT loading section_head — a train/inference
+    # mismatch (no e_t injection at <sec_*> positions) that corrupts generation
+    # and produces no attention maps. This was the v11 garbage-output bug.
+    "use_sections",
+    "section_query_mode",
+    "beats_cached",
+    "spec_encoder_name",
+    "spec_checkpoint_name",
+    "spec_d_patch",
+    "section_d_k",
+    "section_d_v",
 )
 
 
@@ -559,10 +572,20 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             section_ctx=clip_section_ctx,
         )
 
+        # Measure duration from the WavLM frame count (50 Hz frame rate from
+        # the encoder's 320-sample stride at 16 kHz). Stored as a sidecar
+        # metadata field, NOT prepended to the generated prose — duration is
+        # an audio property, not a quality claim, and SFS no longer scores it.
+        # Downstream tools that need duration alongside the quality assessment
+        # read this field directly from inference_results.json.
+        wavlm_frame_rate_hz = 50.0
+        measured_duration_sec = sample["audio_features"].shape[0] / wavlm_frame_rate_hz
+
         output_entry = {
             "filename": sample["filename"],
             "generated": generated,
             "generated_clean": strip_all_tags(generated),
+            "measured_duration_sec": measured_duration_sec,
         }
         if attention_maps:
             # Save as plain lists in JSON (per-clip); the plotting script reshapes

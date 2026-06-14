@@ -571,6 +571,44 @@ def train(config: dict) -> None:
         )
         print(f"[LoRA] rank={config['lora_rank']} alpha={config['lora_alpha']}")
 
+    # Row-masked new-token training (tagged_mode only).
+    #
+    # When tagged_mode adds the <sec_*>/<f_*> tokens, their embed_tokens/lm_head
+    # rows are random mean-init. They MUST train or the model can't emit/consume
+    # them. The naive fix (LoRA modules_to_save) makes the FULL 151,936-row
+    # embedding + output head trainable, and training the whole vocab on narrow
+    # speech-prose corrupts unrelated tokens — observed in v10 as Thai-token
+    # injection and malformed tags.
+    #
+    # Fix: unfreeze embed/lm_head but register a backward hook that ZEROES the
+    # gradient for every row except the new-token rows. Only the N new rows ever
+    # change; all pretrained rows stay byte-identical → no vocab corruption.
+    # These params get their own optimizer group (weight_decay=0) so decoupled
+    # weight decay can't drift the frozen rows either.
+    new_token_params: list = []
+    if config.get("tagged_mode") and n_added_tokens > 0:
+        old_vocab = len(tokenizer) - n_added_tokens
+        seen_ids: set[int] = set()
+        for module in (llm.get_input_embeddings(), llm.get_output_embeddings()):
+            if module is None or getattr(module, "weight", None) is None:
+                continue
+            w = module.weight
+            if id(w) in seen_ids:   # tied embed/lm_head → mask once
+                continue
+            seen_ids.add(id(w))
+            w.requires_grad_(True)
+
+            def _mask_old_rows(grad, ov=old_vocab):
+                g = grad.clone()
+                g[:ov] = 0.0
+                return g
+
+            w.register_hook(_mask_old_rows)
+            new_token_params.append(w)
+        print(f"[tagged-mode] row-masked embed/lm_head: only rows "
+              f"[{old_vocab}:{len(tokenizer)}] ({n_added_tokens} new tokens) trainable; "
+              f"{len(new_token_params)} weight tensor(s) hooked")
+
     if config["gradient_checkpointing"]:
         llm.gradient_checkpointing_enable()
 
@@ -730,10 +768,19 @@ def train(config: dict) -> None:
     # `lr_lm` is the canonical key going forward (covers both full-FT and LoRA).
     # `lr_lora` stays supported as a fallback so existing PSC configs keep working.
     lr_lm = float(config.get("lr_lm") or config.get("lr_lora"))
+    # New-token embed/lm_head rows go in their OWN group with weight_decay=0 so
+    # decoupled AdamW decay can't drift the (gradient-masked) frozen rows. They
+    # must also be excluded from the main LM group to avoid double-registration.
+    nt_ids = {id(p) for p in new_token_params}
     param_groups = [
         {"params": adapter.parameters(), "lr": config["lr_adapter"]},
-        {"params": [p for p in llm.parameters() if p.requires_grad], "lr": lr_lm},
+        {"params": [p for p in llm.parameters()
+                    if p.requires_grad and id(p) not in nt_ids], "lr": lr_lm},
     ]
+    if new_token_params:
+        param_groups.append({
+            "params": new_token_params, "lr": lr_lm, "weight_decay": 0.0,
+        })
     if section_head is not None:
         # Section-query head uses the adapter LR — it's a small new module similar
         # in size to the adapter and learns from CE gradient.
@@ -1162,13 +1209,45 @@ def train(config: dict) -> None:
                 payload["section_head_state_dict"] = section_head.state_dict()
             return payload
 
+        # Atomic save: write to .tmp then os.replace (POSIX atomic). Without
+        # this, a SIGKILL / OOM / quota-truncate during torch.save leaves a
+        # partially-written file at the target path, corrupting the checkpoint.
+        # Lost v7-lora-8b's best.pt to exactly this kind of partial-write event.
+        def _atomic_save(payload, path):
+            tmp = path + ".tmp"
+            torch.save(payload, tmp)
+            os.replace(tmp, path)
+
+        # Upload best.pt to wandb as a versioned Artifact — off-site backup so
+        # local file loss (quota truncation, Lustre OST failure, accidental
+        # deletion, etc.) doesn't kill the training run. Failures here do NOT
+        # interrupt training — wandb upload is best-effort.
+        def _upload_to_wandb_artifact(path: str, name: str, metadata: dict) -> None:
+            try:
+                artifact = wandb.Artifact(name=name, type="model", metadata=metadata)
+                artifact.add_file(path)
+                wandb.log_artifact(artifact)
+                print(f"  [wandb-artifact] uploaded {os.path.basename(path)} "
+                      f"as {name}  (metadata={metadata})")
+            except Exception as e:
+                print(f"  [wandb-artifact] WARNING upload of {path} failed: "
+                      f"{type(e).__name__}: {e}")
+
         if avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
             best_val_sfs_f1 = avg_sfs_f1
-            torch.save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "best.pt"))
+            best_path = os.path.join(config["save_dir"], "best.pt")
+            _atomic_save(_ckpt_payload(epoch), best_path)
             print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
+            if config.get("upload_ckpt_to_wandb", True):
+                run_name = (wandb.run.name if wandb.run is not None else None) or "run"
+                _upload_to_wandb_artifact(
+                    best_path,
+                    name=f"best-{run_name}",
+                    metadata={"epoch": epoch, "val_sfs_f1": best_val_sfs_f1},
+                )
 
         # Save last (for resuming)
-        torch.save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "last.pt"))
+        _atomic_save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "last.pt"))
         print("Saved epoch model")
 
     wandb.finish()

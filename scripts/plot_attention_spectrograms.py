@@ -88,6 +88,7 @@ def plot_one_clip(
     audio_dir: str,
     output_path: str,
     section_order: list[str],
+    overlap_gt: list[tuple[float, float]] | None = None,
 ) -> None:
     """Render the attention-overlay figure for one clip."""
     filename = entry["filename"]
@@ -165,6 +166,16 @@ def plot_one_clip(
         ax_row.set_ylabel(f"<sec_{section_name}>", fontsize=9)
         ax_row.set_yticks([])
 
+        # Ground-truth overlap windows: draw as cyan bands on the overlap row so
+        # the reader can SEE whether the overlap query attends inside them.
+        if section_name == "overlap" and overlap_gt:
+            for (s0, s1) in overlap_gt:
+                ax_row.axvspan(s0, s1, ymin=0.0, ymax=1.0,
+                               facecolor="cyan", alpha=0.18, zorder=3)
+                ax_row.axvline(s0, color="cyan", lw=0.6, alpha=0.6)
+                ax_row.axvline(s1, color="cyan", lw=0.6, alpha=0.6)
+            ax_row.set_ylabel("<sec_overlap>\n(cyan = GT overlap)", fontsize=8)
+
     axes[-1, 0].set_xlabel("time (s)")
     fig.suptitle(filename, fontsize=10, y=0.995)
     fig.tight_layout(rect=[0, 0, 1, 0.985])
@@ -186,10 +197,37 @@ def main():
                         help="If --clips is empty, render up to this many clips.")
     parser.add_argument("--format", default="pdf", choices=["pdf", "png", "svg"],
                         help="Output figure format.")
+    parser.add_argument("--features_csv", default="",
+                        help="Optional per-split feature CSV with overlap_segments_vad. "
+                             "When given, GT overlap windows are drawn (cyan) on the "
+                             "<sec_overlap> row so attention-vs-GT alignment is visible.")
     args = parser.parse_args()
 
     with open(args.results) as f:
         results = json.load(f)
+
+    # Optional GT overlap segments for the visual alignment overlay.
+    overlap_gt_map: dict = {}
+    if args.features_csv:
+        import csv as _csv
+        with open(args.features_csv) as f:
+            for row in _csv.DictReader(f):
+                fn = (row.get("filename") or "").strip()
+                raw = row.get("overlap_segments_vad") or row.get("overlap_segments") or ""
+                segs = []
+                for seg in raw.split(";"):
+                    seg = seg.strip()
+                    if not seg:
+                        continue
+                    try:
+                        a, b = seg.split("-", 1)
+                        s0, s1 = int(a) / SAMPLE_RATE, int(b) / SAMPLE_RATE
+                        if s1 > s0:
+                            segs.append((s0, s1))
+                    except (ValueError, IndexError):
+                        continue
+                overlap_gt_map[fn] = segs
+        print(f"[plot] loaded GT overlap for {len(overlap_gt_map)} clips")
 
     target_clips = [c.strip() for c in args.clips.split(",") if c.strip()]
     if target_clips:
@@ -210,7 +248,8 @@ def main():
     for entry in entries:
         stem = os.path.splitext(entry["filename"])[0]
         out_path = os.path.join(args.output, f"{stem}_attention.{args.format}")
-        plot_one_clip(entry, args.audio_dir, out_path, section_order)
+        plot_one_clip(entry, args.audio_dir, out_path, section_order,
+                      overlap_gt=overlap_gt_map.get(entry["filename"]))
         print(f"  wrote {out_path}")
 
 

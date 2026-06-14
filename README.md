@@ -169,23 +169,27 @@ CPU only. ~15 minutes total for all 19,900 clips.
 
 No LLM. Reads the VAD columns when present, falls back to pyannote columns with a one-shot warning. ~10 seconds end-to-end.
 
-**Default for the LoRA+8B pipeline** (matches what `configs/config.psc.emnlp.yaml::descriptions_path` points at):
+**Default for the LoRA+8B pipeline (v9 recipe):**
 
 ```bash
-python scripts/build_descriptions_deterministic.py --all --untagged --no-overlap-segments \
+python scripts/build_descriptions_deterministic.py --all --untagged \
+  --no-overlap-segments --no-duration \
   --features-dir $SHARED/data/features_pyannote \
-  --output       $SHARED/data/descriptions_untagged_noseg.json
+  --output       $SHARED/data/descriptions_untagged_noseg_nodur.json
 ```
 
-Sample entry (untagged + no overlap segments):
+Sample entry (8 SFS-scored features, no duration / no overlap segments):
 
 ```
-The recording is 3.920 s long. The signal-to-noise ratio SNR is 13.17 dB. The SRMR is 5.3646. The F0 mean is 152.48 Hz and the F0 standard deviation SD is 62.88 Hz. The speaking rate is 6.888 syl/sec. The pause count is 1 and the pause rate is 15.306 per min. The overlap ratio is 0.7908. F0 and formant estimates are unreliable during overlap windows.
+The signal-to-noise ratio SNR is 13.17 dB. The SRMR is 5.3646. The F0 mean is 152.48 Hz and the F0 standard deviation SD is 62.88 Hz. The speaking rate is 6.888 syl/sec. The pause count is 1 and the pause rate is 15.306 per min. The overlap ratio is 0.7908. F0 and formant estimates are unreliable during overlap windows.
 ```
 
 Flag rationale:
 - **`--untagged`** strips the `<sec_*>`, `<f_*>`, `<r>` special-token wrappers from the prose. The LoRA path doesn't register them in the tokenizer (`tagged_mode: false`), and post-hoc attention extraction parses the prose directly for section spans.
 - **`--no-overlap-segments`** drops the "overlap segments are present at 0.5-3.6s, ..." sentence. WavLM features are temporally pooled and the LM cannot learn precise time-stamp emission, so without this flag it hallucinates a stereotyped tile-the-clip pattern that the IoU≥0.8 SFS scorer rejects. The scalar `overlap_ratio` is still emitted.
+- **`--no-duration`** drops the leading "The recording is X s long." sentence. Duration is trivially measurable from the wav header (`audio.shape[0] / sample_rate`) — the model has no genuine learning task there, and including it as a scored claim would either inflate SFS for models that emit a correct auto-prepend or penalize honest abstention. SFS now scores audio-QUALITY features only. Duration is stored as a separate `measured_duration_sec` sidecar field at inference time and can be rendered alongside the quality prose by downstream UIs.
+
+> **Note:** the YAML's `descriptions_path` should point at the file you just built. If you're using a different name, override via `--descriptions_path $SHARED/data/<your>.json` on the train CLI.
 
 **Tagged variant** (for the `use_sections=true` ablation row only — registers the 19 special tokens):
 
@@ -297,44 +301,31 @@ wandb: 🚀 View run at https://wandb.ai/speech_quality_adapter/aqua-nl-emnlp/ru
 
 ### Main run
 
-Uses `configs/config.psc.emnlp.yaml` defaults: **Qwen3-8B + LoRA r=16**, `film-mamba` adapter, `use_sections: false`, `tagged_mode: false`, `beats_cached: false`, `batch_size: 6`, `epochs: 15`.
+Uses `configs/config.psc.emnlp.yaml` defaults: **Qwen3-8B + LoRA r=16**, `film-mamba` adapter, `use_sections: false`, `tagged_mode: false`, `beats_cached: false`, `batch_size: 6`, `epochs: 15`, `--no-duration` targets.
 
-Foreground (interactive shell visible — output streams to your terminal):
-
-```bash
-python src/train.py --config configs/config.psc.emnlp.yaml
-```
-
-Detached (survives SSH disconnect; output goes to a log file). Put `LOG=...` on its own line so the variable lands in your current shell — chaining it after `&&` in front of `nohup ... &` groups everything into a subshell and `$LOG` becomes empty in the outer shell:
+Foreground with log capture via `tee` (output streams to your terminal AND is written to `$LOG`):
 
 ```bash
-mkdir -p $SHARED/logs
-LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
+mkdir -p $SHARED/logs $SHARED/checkpoints/v9_lora_8b_nodur
+LOG=$SHARED/logs/v9-lora-8b-nodur_$(date +%Y%m%d_%H%M%S).log
 
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --wandb_run_name film-mamba \
-  --save_dir       $SHARED/checkpoints/film_mamba__v1 \
-  > "$LOG" 2>&1 &
-PID=$!
-echo "PID=$PID  log=$LOG"
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $SHARED/data/descriptions_untagged_noseg_nodur.json \
+  --wandb_run_name    v9-lora-8b-nodur \
+  --save_dir          $SHARED/checkpoints/v9_lora_8b_nodur \
+  2>&1 | tee "$LOG"
 ```
 
-~33 min / epoch × 15 epochs ≈ 8 hours on a single H100. (Roughly the same as the old Qwen3-1.7B + full FT timing — the larger 8B forward is offset by LoRA's smaller backward + optimizer-state footprint.)
+~33 min / epoch × 15 epochs ≈ 8 hours on a single H100. The launch keeps your shell occupied; if you need to detach without killing, wrap the command in `screen -S v9` or `tmux new -s v9` first (Ctrl+A D / Ctrl+B D to detach, re-attach later with `screen -r v9` / `tmux attach -t v9`).
 
-**Follow progress in real time while detached**:
-
-```bash
-tail -f $LOG          # ctrl-C to stop following (the run keeps going)
-```
-
-The `python -u` flag in the launch command above is **critical** — without it, when stdout is redirected to a file (as `nohup ... > $LOG` does), Python block-buffers stdout in ~8 KB chunks and the log file looks empty for minutes. `-u` forces unbuffered output so every print lands in `$LOG` immediately and `tail -f` shows real-time progress.
+The `python -u` flag is **critical** when piping through `tee` — it disables Python's stdout buffering so prints land in the terminal and the log file in real time, not in 8 KB chunks every few minutes.
 
 What you should see:
 - ~1 min in: model construction banner (`[LoRA] rank=16 alpha=32`, `Parameters — LM total: 8.23B | LoRA trainable: 43.6M | adapter trainable: 51.0M | grand total trainable: 94.7M (1.150% of LM)`), dataset load (`Loaded: train=13900, val=3000`), and the wandb URL.
 - After ~30 s of warmup: loss prints every `log_every` steps (default 10), starts near 9 and falls toward 1-3 over the first epoch.
-- After each epoch: a val pass with BLEU / ROUGE / SFS, then a checkpoint write to `<save_dir>`.
+- After each epoch: a val pass with BLEU / ROUGE / SFS, then a checkpoint write to `<save_dir>` (atomic — `.tmp` + `os.replace`). When val_sfs_f1 improves, `best.pt` is also uploaded to wandb as an Artifact (`upload_ckpt_to_wandb: true` default).
 
-If `tail -f` shows nothing changing for >5 min after the wandb URL appears, the loop is stalled — check `pgrep -af train.py` and the very tail of the log for a traceback.
+If output stops changing for >5 min after the wandb URL appears, the loop is stalled — check `pgrep -af train.py` and the very tail of the log for a traceback.
 
 ### Resuming
 
@@ -384,7 +375,7 @@ to any of the commands below. Save it under a separate `__fullft` suffix to keep
 
 ### Adapter-architecture sweep
 
-The paper's primary comparison table. Same data, same seed, same epochs, same section / BEATs / dynamic-query setup — **only `adapter_variant` changes**. Eight variants in `src/adapter.py::build_adapter`:
+The paper's primary comparison table. Same data, same seed, same epochs, same section / BEATs / dynamic-query setup — **only `adapter_variant` changes**. The six variants we compare:
 
 | adapter_variant | Conditioning | Temporal mixer | Notes |
 |---|---|---|---|
@@ -393,78 +384,91 @@ The paper's primary comparison table. Same data, same seed, same epochs, same se
 | `sigmoid-gate` | Sigmoid gate | None | Lighter gating alternative |
 | `film` | FiLM | None | Isolates the temporal-mixer contribution |
 | `film-attn` | FiLM | Self-attention (1 layer) | Argues Mamba vs attn |
-| `film-attn-2L` | FiLM | Self-attention (2 layers) | Depth ablation for attn |
-| `film-mamba-2L` | FiLM | Mamba SSM (2 layers) | Depth ablation for Mamba |
 | `qformer` | Q-Former cross-attention | (implicit) | Alternative architecture |
 
-Naming convention: `--wandb_run_name <variant>` and `--save_dir $SHARED/checkpoints/<variant>__v1`. Reading a path tells you the variant. Bump to `__v2`, `__v3` etc. when re-tuning hyperparams.
+Naming convention: `--wandb_run_name v9-<variant>` and `--save_dir $SHARED/checkpoints/v9_<variant>`. The `v9` prefix marks the recipe generation (LoRA + 8B + no-duration + no-overlap-segments). When you re-tune hyperparams within v9, append `__v2` etc. to the save_dir.
+
+**Scheduling**: each run takes ~8h on one H100. The 8 variants in sequence is ~64 h. To parallelize, allocate one H100 per variant in separate `interact` sessions (or `sbatch` jobs) — **never launch two trainings on the same GPU**, they OOM each other instantly. Each command below assumes you're inside a fresh `interact -p GPU-shared --gres=gpu:h100-80:1 -t 8:00:00 -A cis260125p` session.
 
 ```bash
-# film-mamba (headline, this is the main config — no --adapter_variant needed)
-LOG=$SHARED/logs/film_mamba_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --save_dir       $SHARED/checkpoints/film_mamba__v1 \
-  --wandb_run_name film-mamba \
-  > "$LOG" 2>&1 &
+# Shared setup — set once per session before launching ANY variant
+DESC=$SHARED/data/descriptions_untagged_noseg_nodur.json
+mkdir -p $SHARED/logs
 
-# concat-only
-LOG=$SHARED/logs/concat_only_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant concat-only \
-  --save_dir        $SHARED/checkpoints/concat_only__v1 \
-  --wandb_run_name  concat-only \
-  > "$LOG" 2>&1 &
-
-# sigmoid-gate
-LOG=$SHARED/logs/sigmoid_gate_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant sigmoid-gate \
-  --save_dir        $SHARED/checkpoints/sigmoid_gate__v1 \
-  --wandb_run_name  sigmoid-gate \
-  > "$LOG" 2>&1 &
-
-# film (FiLM only, no temporal mixer)
-LOG=$SHARED/logs/film_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film \
-  --save_dir        $SHARED/checkpoints/film__v1 \
-  --wandb_run_name  film \
-  > "$LOG" 2>&1 &
-
-# film-attn
-LOG=$SHARED/logs/film_attn_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film-attn \
-  --save_dir        $SHARED/checkpoints/film_attn__v1 \
-  --wandb_run_name  film-attn \
-  > "$LOG" 2>&1 &
-
-# film-attn-2L
-LOG=$SHARED/logs/film_attn_2L_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film-attn-2L \
-  --save_dir        $SHARED/checkpoints/film_attn_2L__v1 \
-  --wandb_run_name  film-attn-2L \
-  > "$LOG" 2>&1 &
-
-# film-mamba-2L
-LOG=$SHARED/logs/film_mamba_2L_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant film-mamba-2L \
-  --save_dir        $SHARED/checkpoints/film_mamba_2L__v1 \
-  --wandb_run_name  film-mamba-2L \
-  > "$LOG" 2>&1 &
-
-# qformer
-LOG=$SHARED/logs/qformer_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --adapter_variant qformer \
-  --save_dir        $SHARED/checkpoints/qformer__v1 \
-  --wandb_run_name  qformer \
-  > "$LOG" 2>&1 &
+# Pre-warm the 8B blobs (one-time per node — second run on same node is instant)
+time cat $SHARED/hf_cache/hub/models--Qwen--Qwen3-8B/blobs/* > /dev/null
 ```
 
-**Don't run more than one of these in parallel on the same GPU** — they'd OOM each other. Either sequence them (drop the `&`, run one at a time, ~8 h each = ~64 h end-to-end), or grab additional H100s in separate interact allocations.
+```bash
+# v9-film-mamba (headline, this is the main config — no --adapter_variant needed)
+LOG=$SHARED/logs/v9-film-mamba_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --save_dir          $SHARED/checkpoints/v9_film_mamba \
+  --wandb_run_name    v9-film-mamba \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v9-concat-only — baseline without FiLM or temporal mixer
+LOG=$SHARED/logs/v9-concat-only_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   concat-only \
+  --save_dir          $SHARED/checkpoints/v9_concat_only \
+  --wandb_run_name    v9-concat-only \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v9-sigmoid-gate — lighter gating than FiLM
+LOG=$SHARED/logs/v9-sigmoid-gate_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   sigmoid-gate \
+  --save_dir          $SHARED/checkpoints/v9_sigmoid_gate \
+  --wandb_run_name    v9-sigmoid-gate \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v9-film (FiLM only, no temporal mixer) — isolates the FiLM contribution
+LOG=$SHARED/logs/v9-film_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   film \
+  --save_dir          $SHARED/checkpoints/v9_film \
+  --wandb_run_name    v9-film \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v9-film-attn (FiLM + 1-layer self-attention mixer)
+LOG=$SHARED/logs/v9-film-attn_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   film-attn \
+  --save_dir          $SHARED/checkpoints/v9_film_attn \
+  --wandb_run_name    v9-film-attn \
+  2>&1 | tee "$LOG"
+```
+
+```bash
+# v9-qformer — Q-Former cross-attention alternative
+LOG=$SHARED/logs/v9-qformer_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $DESC \
+  --adapter_variant   qformer \
+  --save_dir          $SHARED/checkpoints/v9_qformer \
+  --wandb_run_name    v9-qformer \
+  2>&1 | tee "$LOG"
+```
+
+To run multiple variants sequentially in one shell (~64h end-to-end), chain them with `&&` between the python commands so the next one only starts if the previous succeeded.
+
+Each command keeps your shell occupied for ~8h. To detach safely use `screen -S adapter` / `tmux new -s adapter` before launching, then Ctrl+A D / Ctrl+B D to detach (training continues), and `screen -r` / `tmux attach -t adapter` to re-attach.
+
+> **Note on the currently-running training:** if you launched the headline with `--wandb_run_name v9-lora-8b-nodur --save_dir $SHARED/checkpoints/v9_lora_8b_nodur` (older convention), that's fine — it's the equivalent of `v9-film-mamba` since `film-mamba` is the YAML default `adapter_variant`. Future ablation rows should use the `v9-<variant>` naming above so they line up cleanly in the wandb run list.
 
 ### Design ablations (orthogonal to the adapter sweep)
 
@@ -472,40 +476,50 @@ For probing the section-attention design itself. Note that since v7 the YAML def
 
 | Knob | Override (relative to YAML defaults) | Run name |
 |---|---|---|
-| Section-head ON + tagged-prose (legacy EMNLP-rework path) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json` | `section-head` |
-| Section-head ON, but static queries (learnable lookup, no LM-derived query) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json --section_query_mode static` | `static-queries` |
-| Full-FT comparison (Qwen3-1.7B, no LoRA) | `--lm_name Qwen/Qwen3-1.7B --lora_rank 0` | `fullft-1.7b` |
+| Section-head ON + tagged-prose (legacy EMNLP-rework path) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json` | `v9-section-head` |
+| Section-head ON, but static queries (learnable lookup, no LM-derived query) | `--use_sections true --tagged_mode true --beats_cached true --descriptions_path $SHARED/data/descriptions_tagged.json --section_query_mode static` | `v9-static-queries` |
+| Full-FT comparison (Qwen3-1.7B, no LoRA) | `--lm_name Qwen/Qwen3-1.7B --lora_rank 0` | `v9-fullft-1.7b` |
 
-Section-head rows require the tagged JSON — rebuild via `scripts/build_descriptions_deterministic.py --all` (without `--untagged`/`--no-overlap-segments`) into a separate output file.
+Section-head rows require the tagged JSON — rebuild via `scripts/build_descriptions_deterministic.py --all` (without `--untagged`/`--no-overlap-segments`/`--no-duration`) into a separate output file.
+
+Same scheduling rule applies: one variant at a time, foreground with `tee`. Use `screen` / `tmux` if you need to detach.
 
 ```bash
-# section-head (legacy EMNLP-rework path — needs descriptions_tagged.json)
-LOG=$SHARED/logs/section_head_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
+# v9-section-head (legacy EMNLP-rework path — needs descriptions_tagged.json)
+LOG=$SHARED/logs/v9-section-head_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections true --tagged_mode true --beats_cached true \
   --descriptions_path $SHARED/data/descriptions_tagged.json \
-  --save_dir          $SHARED/checkpoints/section_head__v1 \
-  --wandb_run_name    section-head \
-  > "$LOG" 2>&1 &
+  --save_dir          $SHARED/checkpoints/v9_section_head \
+  --wandb_run_name    v9-section-head \
+  2>&1 | tee "$LOG"
+```
 
-# static-queries (static section queries instead of LM-derived dynamic queries)
-LOG=$SHARED/logs/static_queries_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
+```bash
+# v9-static-queries (static section queries instead of LM-derived dynamic queries)
+LOG=$SHARED/logs/v9-static-queries_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
   --use_sections true --tagged_mode true --beats_cached true \
   --descriptions_path  $SHARED/data/descriptions_tagged.json \
   --section_query_mode static \
-  --save_dir           $SHARED/checkpoints/static_queries__v1 \
-  --wandb_run_name     static-queries \
-  > "$LOG" 2>&1 &
+  --save_dir           $SHARED/checkpoints/v9_static_queries \
+  --wandb_run_name     v9-static-queries \
+  2>&1 | tee "$LOG"
+```
 
-# fullft-1.7b (full FT comparison — the original v6 recipe before LoRA)
-LOG=$SHARED/logs/fullft_17b_$(date +%Y%m%d_%H%M%S).log
-nohup python -u src/train.py --config configs/config.psc.emnlp.yaml \
-  --lm_name    Qwen/Qwen3-1.7B \
-  --lora_rank  0 \
-  --save_dir   $SHARED/checkpoints/fullft_17b__v1 \
-  --wandb_run_name fullft-1.7b \
-  > "$LOG" 2>&1 &
+```bash
+# v9-fullft-1.7b (full FT comparison — the original v6 recipe before LoRA).
+# This one ALSO needs --descriptions_path explicit since v6 used a different
+# target format. Uses the same no-duration / no-overlap-segments JSON for fair
+# comparison; only the LM + LoRA-rank flip.
+LOG=$SHARED/logs/v9-fullft-1.7b_$(date +%Y%m%d_%H%M%S).log
+python -u src/train.py --config configs/config.psc.emnlp.yaml \
+  --descriptions_path $SHARED/data/descriptions_untagged_noseg_nodur.json \
+  --lm_name           Qwen/Qwen3-1.7B \
+  --lora_rank         0 \
+  --save_dir          $SHARED/checkpoints/v9_fullft_17b \
+  --wandb_run_name    v9-fullft-1.7b \
+  2>&1 | tee "$LOG"
 ```
 
 ### Compute budget
@@ -516,33 +530,93 @@ Each run is ~8 h on one H100. Adapter sweep is 8 runs = ~64 h sequential, ~8 h f
 
 Greedy decoding over the test set (`--top_k 1` is deterministic, matches paper-table numbers). No `--lm_name` / `--adapter_variant` flags — `inference.py` reads them from the checkpoint's embedded config.
 
+**Run one ablation at a time** — inference loads the 8B LM (~16 GB GPU memory), so two concurrent runs on the same GPU will OOM. ~30-90 min per ablation on H100.
+
 ```bash
+# Headline (v9-film-mamba)
 python src/inference.py --config configs/config.psc.emnlp.yaml \
-  --checkpoint $SHARED/checkpoints/a0__main__v1/best.pt \
+  --checkpoint $SHARED/checkpoints/v9_film_mamba/best.pt \
   --test_dir   $SHARED/data/processed_pyannote/test \
   --top_k      1
 ```
 
-Loop over all adapter ablations:
-
 ```bash
-for variant in film_mamba concat_only sigmoid_gate film \
-               film_attn film_attn_2L film_mamba_2L qformer; do
-  python src/inference.py --config configs/config.psc.emnlp.yaml \
-    --checkpoint $SHARED/checkpoints/${variant}__v1/best.pt \
-    --test_dir   $SHARED/data/processed_pyannote/test \
-    --top_k      1
-done
+# v9-concat-only
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_concat_only/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
 ```
 
-For the design-ablation checkpoints (`no_sections__v1`, `static_queries__v1`), same pattern.
+```bash
+# v9-sigmoid-gate
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_sigmoid_gate/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v9-film
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_film/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v9-film-attn
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_film_attn/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v9-qformer
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_qformer/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+**Design ablations:**
+
+```bash
+# v9-section-head
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_section_head/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v9-static-queries
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_static_queries/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+```bash
+# v9-fullft-1.7b
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_fullft_17b/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --top_k      1
+```
+
+To save your shell session for ~8-12h of sequential inference across all 11 ablations, wrap each command in `screen` / `tmux` and detach.
 
 ### Outputs
 
 Written **next to the checkpoint** (`dirname(--checkpoint)`):
 
 - `inference_results.json` — per-clip records flushed every 50 clips via atomic tmp+rename. Keys per clip:
-  - `generated`, `target`, `claims` (parsed `(feature, value)` pairs)
+  - `filename`
+  - `generated` — model's audio-quality prose (no duration, no overlap segments)
+  - `measured_duration_sec` — sidecar metadata, computed from `audio_features.shape[0] / 50` Hz. Downstream renderers can join with `generated` if they want a duration-headed display
+  - `target`, `claims` (parsed `(feature, value)` pairs)
   - `sfs_precision / sfs_recall / sfs_f1`, `per_feature` breakdown
   - `attention_maps` — **only populated when `use_sections=true`** (the section-head ablation row). The headline LoRA + 8B path uses post-hoc attention extraction (see `scripts/extract_attention.py` — separate run after inference).
 - `inference_summary.json` — aggregate `sfs_precision / recall / f1`, `per_feature_accuracy`, `gen_metrics: {bleu, rouge_l, bertscore_f1}`.
@@ -561,6 +635,93 @@ python scripts/overlap_hedging_compare.py \
 
 The same wandb run page used at training time gets `test/sfs_*` and `test/{bleu,rouge_l,bertscore_f1}` (because the checkpoint embeds `wandb_run_id`).
 
+### Performance table (collate the adapter sweep)
+
+Each variant's `inference_summary.json` is one row of the paper's performance table. After running inference for every variant, collate them into the table (SFS-F1 / P / R / BLEU / ROUGE-L / BERTScore):
+
+```bash
+python3 - <<'PY'
+import json, glob, os
+pat = os.path.expandvars("$SHARED/checkpoints/v9_*/inference_summary.json")
+print(f"{'variant':22}{'SFS-F1':>8}{'P':>7}{'R':>7}{'BLEU':>7}{'ROUGE':>7}{'BERT':>7}")
+for f in sorted(glob.glob(pat)):
+    d = json.load(open(f)); g = d.get("gen_metrics", {})
+    n = os.path.basename(os.path.dirname(f))
+    print(f"{n:22}{d['sfs_f1']:8.3f}{d['sfs_precision']:7.3f}{d['sfs_recall']:7.3f}"
+          f"{(g.get('bleu') or 0):7.2f}{(g.get('rouge_l') or 0):7.3f}{(g.get('bertscore_f1') or 0):7.3f}")
+PY
+```
+
+The adapter variants (`v9_concat_only`, `v9_sigmoid_gate`, `v9_film`, `v9_film_attn`, `v9_qformer`, `v9_film_mamba`) are the rows of the adapter-comparison table. The design-ablation dirs (`v9_section_head`, `v9_static_queries`, `v9_fullft_1.7b`) are reported separately, not in that table. Add the no-audio baseline row with `scripts/zero_shot_baseline.py` (see below).
+
+### Run the tests
+
+```bash
+python -m pytest tests/ -v        # full suite (SFS, text metrics, feature set, section-query, FiLM init, overlap-info)
+```
+
+See the [Testing](#testing) section for dependencies, standalone scripts, and the 5-minute end-to-end smoke.
+
+### Analysis scripts (run after inference)
+
+All read `inference_results.json` and produce paper-ready outputs alongside it.
+
+```bash
+RES=$SHARED/checkpoints/v9_lora_8b_nodur/inference_results.json
+CKPT=$SHARED/checkpoints/v9_lora_8b_nodur/best.pt
+
+# Per-feature SFS table — P/R/F1 per feature, sorted by F1.
+# Surfaces which features are strong (pause_count, overlap_ratio) vs weak
+# (f0_mean, f0_sd). Writes per_feature_sfs.md + .json next to the input.
+python scripts/per_feature_sfs.py --inference_results $RES
+
+# Overlap-aware hedging contingency table.
+# Buckets clips by ground-truth overlap_ratio (none / low / mid / high / v_high)
+# and reports the rate at which the model emits the unreliability hedge.
+# Use --features_csv as a fallback when targets lack overlap_ratio (e.g., the
+# clean-speech control set).
+python scripts/overlap_hedging_compare.py --inference_results $RES
+
+# Zero-shot baseline — bare Qwen3-8B (no adapter, no LoRA, no audio prefix).
+# Establishes the floor that any audio-conditioned model must beat.
+python scripts/zero_shot_baseline.py --config configs/config.psc.emnlp.yaml \
+  --test_dir $SHARED/data/processed_pyannote/test \
+  --output_dir $SHARED/checkpoints/zero_shot_baseline \
+  --start 0 --end 100
+
+# Post-hoc per-section attention extraction (paper figure).
+mkdir -p $(dirname $RES)/attention
+python scripts/extract_attention.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $CKPT \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --filenames  "<clip1>.wav,<clip2>.wav,<clip3>.wav" \
+  --output_dir $(dirname $RES)/attention
+
+# Spectrogram + per-section heatmap overlay PDFs.
+python scripts/plot_attention.py \
+  --attention_dir $(dirname $RES)/attention \
+  --audio_dir     $SHARED/data/Libri2Mix/Libri2Mix/wav16k/min/test/mix_clean \
+  --output_dir    docs/figures/
+
+# Faithfulness study — mask top-K attended frames, re-run inference, measure
+# SFS drop per section vs random masking. Proves attention is CAUSAL.
+python scripts/faithfulness_study.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $CKPT \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --attention_dir $(dirname $RES)/attention \
+  --output     $(dirname $RES)/faithfulness.json --top_k_mask 5
+
+# SFS-vs-human correlation — validates that SFS tracks human judgement.
+# Two phases:
+python scripts/sfs_human_correlation.py --mode prepare \
+  --inference_results $RES \
+  --output_csv $(dirname $RES)/human_ratings.csv --n 50
+# (open the CSV, fill the `human_rating` column 1-5, then:)
+python scripts/sfs_human_correlation.py --mode analyze \
+  --rated_csv  $(dirname $RES)/human_ratings.csv \
+  --output_md  $(dirname $RES)/sfs_human_correlation.md
+```
+
 ### Range / resume / parallelism
 
 Three thousand test clips → ~60-90 min on Qwen3-1.7B. The script auto-resumes (`inference_results.json` is consulted before each clip).
@@ -575,7 +736,16 @@ Three thousand test clips → ~60-90 min on Qwen3-1.7B. The script auto-resumes 
 
 Different `save_dir` ↔ independent `inference_results.json` files, so range-parallel across ablations is fine. **Don't** range-parallel on the same checkpoint — both shards flush to one file and the later flush overwrites work in flight.
 
-### Attention figures
+### Attention figures (paper centerpiece)
+
+Two paths produce per-section attention maps:
+
+| Path | Used when | Script |
+|---|---|---|
+| **Post-hoc** (default) | LoRA + 8B headline run (no section_head) | `scripts/extract_attention.py` + `scripts/plot_attention.py` |
+| **Built-in attention_maps** | Section-head ablation row (`use_sections=true`) | `scripts/plot_attention_spectrograms.py` reads from `inference_results.json::attention_maps` |
+
+The post-hoc path is shown above in "Analysis scripts". For the section-head ablation:
 
 **Section-head ablation row only** (`use_sections=true`). `scripts/plot_attention_spectrograms.py` reads the `attention_maps` field from `inference_results.json`, which is only populated when section_head fired during inference:
 
@@ -588,7 +758,7 @@ python scripts/plot_attention_spectrograms.py \
   --format    pdf
 ```
 
-Each PDF has one row per emitted section + one per `<r>` range, log-mel in greyscale + attention map overlaid as a hot heatmap. `PatchGrid.reshape_attention` reshapes the flat per-section vector back to the 2D `(T_p, F_p)` grid before plotting.
+Each PDF row corresponds to an emitted section + one per `<r>` range, log-mel in greyscale + attention map overlaid as a hot heatmap.
 
 **For the headline LoRA + 8B run** (no section_head), per-section attention maps are recovered post-hoc from the LM's native attention layers. `scripts/extract_attention.py` + `scripts/plot_attention.py` (in progress — task #59 / #60) do this without the section_head path. Same paper figure, no training-time coupling.
 
@@ -614,35 +784,80 @@ Checkpoint selection is on `val_loss` only — saving-best on a similarity metri
 
 ## Testing
 
-```bash
-pip install pytest sacrebleu rouge-score bert-score
-python -m pytest tests/ -v                           # full unit suite
+### Dependencies
 
-# Standalone test scripts (no pytest needed)
+```bash
+pip install pytest sacrebleu rouge-score bert-score librosa scipy
+```
+
+`sacrebleu`, `rouge-score`, `bert-score` are only needed for the corresponding metric — missing deps cause that one metric to silently skip. `librosa` is required by `scripts/plot_attention.py` for the spectrogram. `scipy` is required by `scripts/sfs_human_correlation.py` for Spearman/Pearson.
+
+### Full pytest suite
+
+```bash
+python -m pytest tests/ -v
+```
+
+Covers:
+
+| Test file | What it covers |
+|---|---|
+| `test_sfs.py` | `ClaimParser`, `TaggedClaimParser`, `HybridClaimParser`, `SFSScorer` |
+| `test_section_query.py` | `SectionQueryHead` static + dynamic modes, BEATs integration |
+| `test_compute_loss_b_full.py` | B-full dual-prompt loss with mocked LM |
+| `test_text_metrics.py` | BLEU / ROUGE / BERTScore fail-soft behavior |
+| `test_build_overlap_info.py` | overlap clamping and segment-merge invariants |
+| `test_refresh_overlap_info.py` | surgical `.pt` refresh keys-preserved invariants |
+| `test_feature_set.py` | canonical 8 SFS scalars + per-feature scales |
+| `test_feature_tags.py` | tag catalog + tag-token registration |
+| `test_film_init_diagnostic.py` | FiLM identity-init bug regression test |
+
+### Standalone test scripts (no pytest)
+
+Some tests are easier to run as plain scripts:
+
+```bash
 python scripts/test_fix_descriptions.py
 python scripts/test_fix_overlap_csv.py
 python scripts/test_build_descriptions_deterministic.py
-python -c "
-import sys; sys.path[:0]=['src','tests']
-import importlib
-m = importlib.import_module('test_build_overlap_info')
-n=ok=0
-for x in dir(m):
-    if x.startswith('test_'):
-        n += 1
-        try: getattr(m, x)(); ok += 1
-        except AssertionError as e: print(f'FAIL {x}: {e}')
-print(f'{ok}/{n} passed')
-"
 ```
 
-`sacrebleu`, `rouge-score`, `bert-score` are only needed for the corresponding metric — missing deps cause that one metric to silently skip.
-
-The BEATs integration test downloads a ~370 MB checkpoint on first run; gated behind an env var:
+### BEATs integration test (gated, downloads ~370 MB)
 
 ```bash
 RUN_BEATS_TEST=1 python -m pytest tests/test_section_query.py::TestBEATsIntegration -v
 ```
+
+### End-to-end smoke (validate the whole stack in ~5 minutes)
+
+```bash
+# 1. Build a 50-clip descriptions JSON for a smoke run
+python scripts/build_descriptions_deterministic.py --part 1 --untagged \
+  --no-overlap-segments --no-duration \
+  --features-dir $SHARED/data/features_pyannote \
+  --output       /tmp/smoke_descriptions.json
+
+# 2. 50-step training run (no wandb, no checkpoints flushed)
+WANDB_MODE=disabled python -u src/train.py \
+  --config configs/config.psc.emnlp.yaml \
+  --descriptions_path /tmp/smoke_descriptions.json \
+  --max_steps 50 \
+  --save_dir /tmp/smoke_ckpt
+
+# 3. 10-clip inference smoke (needs a real checkpoint — point at v9 if running)
+python src/inference.py --config configs/config.psc.emnlp.yaml \
+  --checkpoint $SHARED/checkpoints/v9_lora_8b_nodur/best.pt \
+  --test_dir   $SHARED/data/processed_pyannote/test \
+  --start 0 --end 10 --top_k 1
+
+# 4. Analysis scripts work on the 10-clip output
+python scripts/per_feature_sfs.py \
+  --inference_results $SHARED/checkpoints/v9_lora_8b_nodur/inference_results.json
+python scripts/overlap_hedging_compare.py \
+  --inference_results $SHARED/checkpoints/v9_lora_8b_nodur/inference_results.json
+```
+
+If all four steps complete without errors, the full pipeline is wired correctly.
 
 ## Project layout
 
@@ -665,10 +880,27 @@ src/
 
 scripts/
   fix_overlap_csv.py                 — Adds *_vad columns from Silero-on-stems
-  build_descriptions_deterministic.py — Composes descriptions.json from CSV (no LLM)
+  build_descriptions_deterministic.py — Composes descriptions.json from CSV (no LLM).
+                                       Flags: --untagged / --no-overlap-segments / --no-duration
   refresh_overlap_info.py            — Surgical overlap_info refresh in existing .pt files
   preprocess_beats.py                — Caches BEATs patches into per-clip .pt files
-  plot_attention_spectrograms.py     — Renders per-clip attention overlays
+
+  # Post-inference analysis (consume inference_results.json):
+  per_feature_sfs.py                 — Per-feature P/R/F1 table + JSON
+  overlap_hedging_compare.py         — Hedge-rate × overlap-bucket contingency
+  zero_shot_baseline.py              — Bare-LM baseline (no adapter, no audio prefix)
+
+  # Attention figure (LoRA + 8B headline path, post-hoc):
+  extract_attention.py               — Per-section attention vectors via Qwen3 native attn
+  plot_attention.py                  — Spectrogram + per-section heatmap overlay PDFs
+
+  # Section-head ablation path (use_sections=true):
+  plot_attention_spectrograms.py     — Renders attention_maps embedded in inference_results.json
+
+  # Causal study + metric validity:
+  faithfulness_study.py              — Mask top-K attended frames → measure SFS drop
+  sfs_human_correlation.py           — Prepare/analyze SFS-vs-human ratings (Spearman + Pearson)
+
   test_*.py                          — Standalone test scripts
 
 configs/
@@ -694,4 +926,6 @@ descriptions.json                      — 19,900 GT entries (regenerated by bui
 - **`max_target_length: 512`** covers the full untagged-noseg description format (p99 ~380 tokens, max ~430). The earlier 224 cap was set for a trimmed catalog and silently truncated tails; 512 absorbs the longest clip with margin.
 - **`gradient_checkpointing` is required at 8B + LoRA** to stay under H100-80 memory at `batch_size: 6`. The 8B frozen weights alone are ~16 GB in bf16; activations need to be checkpointed.
 - **`--no-overlap-segments` is critical for SFS.** Without it, the model hallucinates a stereotyped 5-7-segment "tile-the-clip" pattern at the end of each description. The IoU≥0.8 SFS scorer rejects almost all of these → overlap_span recall craters to 0. Verified in v6 → v7 transition: dropping the segments sentence took overlap_span recall from 0.0 to ~0.65.
-- **Atomic writes everywhere except `last.pt`.** `preprocess_beats.py`, `refresh_overlap_info.py`, `fix_overlap_csv.py`, and `inference.py` all use `.tmp` + `os.replace` so a SIGKILL mid-write can't corrupt artifacts. `last.pt` from `train.py` does NOT yet use atomic write — if the session times out mid-save, `last.pt` is truncated and resume must use `best.pt` instead.
+- **Atomic writes everywhere.** `preprocess_beats.py`, `refresh_overlap_info.py`, `fix_overlap_csv.py`, `inference.py`, AND `train.py`'s `last.pt` / `best.pt` saves all use `.tmp` + `os.replace`. A SIGKILL / OOM / quota truncate / Lustre writeback failure during a save leaves an ignorable `.tmp` while the canonical path stays at either the previous full content or the new full content. (Pre-2026-05-17 builds did not have atomic save on the train-loop checkpoints — we lost v7-lora-8b's `best.pt` to a 0-byte truncation that the atomic save would have prevented.)
+- **Best.pt is mirrored to wandb as a versioned Artifact** (`upload_ckpt_to_wandb: true` by default). Each improvement uploads a new version named `best-<run_name>`. Off-site backup against local disk loss. Disable per-run with `--upload_ckpt_to_wandb false`. Download from another machine with `wandb.use_artifact("speech_quality_adapter/aqua-nl-emnlp/best-<run_name>:latest")`.
+- **Duration is metadata, not a quality claim.** `--no-duration` strips it from training targets; `src/inference.py` measures it from the wav header and stores it on the output JSON's `measured_duration_sec` sidecar. The `generated` field contains only the model's audio-quality prose. SFS no longer scores duration (`duration_sec` was removed from `TOLERANCES`).

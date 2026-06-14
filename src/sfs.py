@@ -340,7 +340,16 @@ class SFSScorer:
     """
 
     # Tolerance thresholds per feature
-    # These come from typical within-measurement variability of SP tools
+    # These come from typical within-measurement variability of SP tools.
+    #
+    # NOTE: duration_sec and sample_rate are intentionally NOT included even
+    # though the ClaimParser will still extract them from text. Reason: they
+    # are deterministically measurable from the wav file (duration =
+    # audio.shape[0] / sr; sample_rate = file header) — the model has no
+    # genuine learning task there, and including them either (a) inflates
+    # SFS for models that emit a correct deterministic duration auto-prepend
+    # at inference, or (b) penalizes models that correctly choose not to
+    # emit a useless claim. SFS scores audio-QUALITY features only.
     TOLERANCES = {
         "f0_mean": 5.0,  # ±5 Hz
         "f0_std": 5.0,  # ±5 Hz
@@ -359,8 +368,6 @@ class SFSScorer:
         "shimmer": 0.5,  # ±0.5%
         "vot": 8.0,  # ±8 ms
         "srmr": 0.5,  # ±0.5
-        "sample_rate": 0.0,  # exact match (it's an integer)
-        "duration_sec": 0.1,  # ±0.1 s (verbalizer rounds to 3 decimals, tolerance absorbs that)
         "overlap_ratio": 0.05,  # ±0.05 (unitless 0-1)
         "pause_count": 1.0,  # ±1 — discrete count is sensitive to min-pause threshold (200 vs 300 ms VAD configs); off-by-one is annotation noise, not error
         "pause_rate": 2.0,  # ±2 per min
