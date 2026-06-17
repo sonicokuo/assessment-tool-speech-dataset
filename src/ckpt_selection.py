@@ -75,14 +75,21 @@ def degeneration_stats(texts: list[str], n: int = 4) -> dict:
     """
     texts = [t or "" for t in texts]
     if not texts:
-        return {"rep_n_mean": 0.0, "rep_n_max": 0.0, "nonascii_frac": 0.0}
+        return {"rep_n_mean": 0.0, "rep_n_max": 0.0, "nonascii_frac": 0.0,
+                "frac_clips_nonascii": 0.0}
     reps = [rep_n(t, n) for t in texts]
     total_chars = sum(len(t) for t in texts)
     nonascii = sum(1 for t in texts for ch in t if ord(ch) > 127)
+    # Fraction of CLIPS containing any non-ASCII char. The aggregate
+    # nonascii_frac (chars) misses the section-path failure where foreign tokens
+    # are injected into many clips but are a tiny fraction of total characters
+    # (v12 epoch 2: ~1% of chars but 34% of clips). This per-clip rate catches it.
+    n_nonascii_clips = sum(1 for t in texts if any(ord(ch) > 127 for ch in t))
     return {
         "rep_n_mean": sum(reps) / len(reps),
         "rep_n_max": max(reps),
         "nonascii_frac": (nonascii / total_chars) if total_chars else 0.0,
+        "frac_clips_nonascii": n_nonascii_clips / len(texts),
     }
 
 
@@ -92,10 +99,12 @@ def passes_degeneration_guard(
     best_bleu: float | None,
     rep_n_max: float,
     nonascii_frac_val: float,
+    frac_clips_nonascii: float = 0.0,
     *,
     bleu_rel_floor: float = 0.6,
     rep_n_thresh: float = 0.5,
     nonascii_thresh: float = 0.05,
+    clip_nonascii_thresh: float = 0.15,
 ) -> tuple[bool, str]:
     """Return (is_clean, reason).
 
@@ -122,6 +131,9 @@ def passes_degeneration_guard(
         return False, f"rep_n_max {rep_n_max:.3f} > {rep_n_thresh:.2f} (repetition/tag-spam)"
     if nonascii_frac_val > nonascii_thresh:
         return False, f"nonascii_frac {nonascii_frac_val:.4f} > {nonascii_thresh:.3f}"
+    if frac_clips_nonascii > clip_nonascii_thresh:
+        return False, (f"frac_clips_nonascii {frac_clips_nonascii:.3f} > "
+                       f"{clip_nonascii_thresh:.2f} (foreign-token injection in many clips)")
     return True, "clean"
 
 
@@ -145,6 +157,7 @@ def should_save_best(
     stats = degeneration_stats(gen_texts, n=n_gram)
     ok, reason = passes_degeneration_guard(
         bleu, best_bleu, stats["rep_n_max"], stats["nonascii_frac"],
+        stats["frac_clips_nonascii"],
         bleu_rel_floor=bleu_rel_floor,
         rep_n_thresh=rep_n_thresh,
         nonascii_thresh=nonascii_thresh,

@@ -82,6 +82,32 @@ def test_guard_rejects_nonascii():
     assert not ok and "nonascii" in reason
 
 
+def test_stats_report_frac_clips_nonascii():
+    # 1 of 3 clips has a foreign char
+    s = degeneration_stats([CLEAN, CLEAN, "The SNR is 8 dB 网络"], n=4)
+    assert abs(s["frac_clips_nonascii"] - 1 / 3) < 1e-9
+
+
+def test_guard_rejects_many_clips_with_few_foreign_chars():
+    # The v12 epoch-2 case: foreign tokens in 34% of clips but <1% of all chars,
+    # not repetitive. The char-fraction guard MISSES it; the clip-fraction guard
+    # must catch it. (Simulate: low nonascii_frac, high frac_clips_nonascii.)
+    ok, reason = passes_degeneration_guard(
+        bleu=20.0, best_bleu=20.0, rep_n_max=0.1,
+        nonascii_frac_val=0.01,          # under the 0.05 char threshold
+        frac_clips_nonascii=0.34,        # over the 0.15 clip threshold
+    )
+    assert not ok and "frac_clips_nonascii" in reason
+
+
+def test_save_rejects_epoch2_style_foreign_injection():
+    # Build a 32-clip batch: 11 with a foreign token, 21 clean. Aggregate char
+    # fraction is tiny; per-clip fraction is 11/32 = 0.34 -> must be withheld.
+    batch = [CLEAN] * 21 + [CLEAN + " 网络"] * 11
+    save, reason = should_save_best(0.30, 0.22, bleu=8.0, best_bleu=31.5, gen_texts=batch)
+    assert not save and "degenerate" in reason
+
+
 def test_guard_relative_floor_not_absolute():
     # A genuinely lower-BLEU-but-clean config must NOT be rejected just for low BLEU.
     ok, _ = passes_degeneration_guard(bleu=12.0, best_bleu=15.0, rep_n_max=0.0, nonascii_frac_val=0.0)
