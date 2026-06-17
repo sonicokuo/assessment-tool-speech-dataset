@@ -312,3 +312,17 @@ def query_section_indices(
     for tok_id, s_idx in section_id_to_idx.items():
         out[fired_token_ids == tok_id] = s_idx
     return out
+
+
+def warmup_lambda(target: float, epoch: int, warmup_epochs: int) -> float:
+    """Linear warmup of the readout weight: 0 at epoch 0 -> target at warmup_epochs.
+
+    In DYNAMIC query mode the readout gradient flows into the LM hidden state (the
+    query), competing with prose generation. A large readout weight from step 0
+    destabilizes generation (v12: lambda 0.5 -> 31% degenerate vs v11 no-readout
+    3%). Warming up lets the LM stabilize its generation first, then ramps the
+    grounding pressure in. warmup_epochs <= 0 disables warmup (returns target).
+    """
+    if warmup_epochs is None or warmup_epochs <= 0:
+        return target
+    return target * min(1.0, max(0, epoch) / warmup_epochs)

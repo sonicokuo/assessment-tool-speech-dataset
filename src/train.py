@@ -39,6 +39,7 @@ from section_readout import (
     SectionReadoutHead,
     section_readout_loss,
     query_section_indices,
+    warmup_lambda,
 )
 # Degeneration-aware, lower-variance best-checkpoint selection.
 from ckpt_selection import seeded_val_indices, should_save_best
@@ -964,7 +965,19 @@ def train(config: dict) -> None:
 
     max_steps = int(config["max_steps"]) if config.get("max_steps") else None
 
+    # Readout-grounding warmup: the readout gradient destabilizes generation in
+    # dynamic mode (v12: lambda 0.5 -> 31% degenerate). Ramp it in over the first
+    # few epochs so the LM stabilizes first. Target stored once; the effective
+    # lambda_readout is overwritten per-epoch below.
+    _readout_target = float(config.get("lambda_readout", 0.0))
+    _readout_warmup = int(config.get("lambda_readout_warmup_epochs", 0))
+
     for epoch in range(start_epoch, config["epochs"]):
+        if _readout_target > 0.0:
+            config["lambda_readout"] = warmup_lambda(_readout_target, epoch, _readout_warmup)
+            print(f"[section_readout] epoch {epoch+1}: effective lambda_readout="
+                  f"{config['lambda_readout']:.4f} (target {_readout_target}, "
+                  f"warmup {_readout_warmup} epochs)")
         print("\nEpoch: {}/{}".format(epoch + 1, config["epochs"]))
 
         curr_lr = float(optimizer.param_groups[0]["lr"])

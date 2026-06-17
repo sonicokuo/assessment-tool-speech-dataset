@@ -21,7 +21,22 @@ from section_readout import (  # noqa: E402
     build_section_feature_mask,
     section_readout_loss,
     query_section_indices,
+    warmup_lambda,
 )
+
+
+def test_warmup_lambda_ramps_then_holds():
+    # warmup over 3 epochs: 0 at epoch 0, target at epoch 3, holds after.
+    assert warmup_lambda(0.05, 0, 3) == 0.0
+    assert abs(warmup_lambda(0.05, 1, 3) - 0.05 / 3) < 1e-9
+    assert abs(warmup_lambda(0.05, 2, 3) - 0.05 * 2 / 3) < 1e-9
+    assert warmup_lambda(0.05, 3, 3) == 0.05
+    assert warmup_lambda(0.05, 9, 3) == 0.05      # held at target after warmup
+
+
+def test_warmup_lambda_disabled_returns_target():
+    assert warmup_lambda(0.5, 0, 0) == 0.5        # no warmup -> target immediately
+    assert warmup_lambda(0.5, 0, -1) == 0.5
 from feature_set import N_FEATURES, SUPERVISED_FEATURES  # noqa: E402
 from section_tags import N_SECTIONS, SECTION_TAGS  # noqa: E402
 
