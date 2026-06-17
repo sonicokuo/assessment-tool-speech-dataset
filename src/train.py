@@ -40,6 +40,8 @@ from section_readout import (
     section_readout_loss,
     query_section_indices,
 )
+# Degeneration-aware, lower-variance best-checkpoint selection.
+from ckpt_selection import seeded_val_indices, should_save_best
 from spec_encoder import SpecEncoder
 
 
@@ -888,6 +890,9 @@ def train(config: dict) -> None:
     # — using val_loss for early stopping cuts off digit grounding prematurely.
     start_epoch = 0
     best_val_sfs_f1 = float("-inf")
+    # Running max of clean-epoch BLEU; the degeneration guard uses it as a
+    # RELATIVE floor so a fluency collapse (high SFS, low BLEU) can't be selected.
+    best_val_bleu = None
     wandb_run_id = None
 
     if config.get("resume_from"):
@@ -1043,6 +1048,8 @@ def train(config: dict) -> None:
         # ── Validate ──
         avg_val_loss = None
         avg_sfs_f1 = None  # in scope for best-checkpoint check below; None on non-eval epochs
+        val_gen_texts: list = []   # this epoch's val generations, for the degeneration guard
+        val_bleu = None            # BLEU on those generations (None if not computed)
         if (epoch + 1) % config["eval_every_epoch"] == 0:
             adapter.eval()
             llm.eval()
@@ -1111,7 +1118,14 @@ def train(config: dict) -> None:
             # val_sfs_n controls the val-time generation sample count. Default 32 (was 8) —
             # 8 was too noisy to read F1 trends across epochs; 32 cuts noise floor in half
             # for ~2 minutes additional generation time per epoch.
-            n_samples = min(config.get("val_sfs_n", 32), len(val_set))
+            # Seeded RANDOM subset (stable across epochs), not the biased first-N
+            # prefix slice — see ckpt_selection.seeded_val_indices.
+            val_idx = seeded_val_indices(
+                len(val_set),
+                config.get("val_sfs_n", 32),
+                seed=config.get("val_sfs_seed", 1234),
+            )
+            n_samples = len(val_idx)
 
             # If use_sections=true, route val-time generation through inference.generate
             # so the section hook fires and attention maps are produced (they're
@@ -1122,7 +1136,7 @@ def train(config: dict) -> None:
                 from inference import generate as inference_generate
 
             with torch.no_grad():
-                for i in range(n_samples):
+                for i in val_idx:
                     sample = val_set[i]
 
                     if inference_generate is not None and "beats_patches" in sample:
@@ -1224,6 +1238,9 @@ def train(config: dict) -> None:
                 hyps, refs,
                 use_bertscore=config.get("use_bertscore", False),
             )
+            # Hand the generations + BLEU to the degeneration-aware selector below.
+            val_gen_texts = list(hyps)
+            val_bleu = gen_metrics.get("bleu")
 
             # Per-epoch averages of B-full's three loss terms — diagnostic curves so you
             # can see whether the prose CE, the nums CE, and the aux-head MSE are each
@@ -1307,7 +1324,18 @@ def train(config: dict) -> None:
                 print(f"  [wandb-artifact] WARNING upload of {path} failed: "
                       f"{type(e).__name__}: {e}")
 
-        if avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
+        # Degeneration-aware selection: SFS only parses numbers, so it is blind to
+        # fluency/structural collapse (tag-spam, repetition, foreign-token runs) —
+        # an SFS argmax can select a degenerate checkpoint. Gate it on a BLEU /
+        # rep-n / non-ASCII guard over this epoch's generations (ckpt_selection.py).
+        _save_best, _save_reason = should_save_best(
+            avg_sfs_f1, best_val_sfs_f1, val_bleu, best_val_bleu, val_gen_texts,
+        )
+        if val_bleu is not None:
+            best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
+        if (not _save_best) and avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
+            print(f"  [select] withheld best.pt despite val_sfs_f1={avg_sfs_f1:.4f}: {_save_reason}")
+        if _save_best:
             best_val_sfs_f1 = avg_sfs_f1
             best_path = os.path.join(config["save_dir"], "best.pt")
             _atomic_save(_ckpt_payload(epoch), best_path)
