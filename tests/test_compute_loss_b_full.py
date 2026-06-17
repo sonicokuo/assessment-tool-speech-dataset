@@ -39,19 +39,36 @@ from feature_set import N_FEATURES
 # ─── Mocks ─────────────────────────────────────────────────────────
 
 class MockTokenizer:
-    """Tiny tokenizer: each character → ord() token id, padded to max_length."""
-    pad_token_id = 0
+    """Char-level tokenizer emulating the slice of the HF tokenizer API that
+    train.py actually uses.
 
-    def __call__(self, text, return_tensors=None, padding=None, truncation=None, max_length=None):
-        if isinstance(text, str):
-            text = [text]
-        max_len = max_length or max(len(s) for s in text)
-        ids = []
-        for s in text:
-            row = [ord(c) % 1000 + 1 for c in s][:max_len]   # +1 to avoid pad_id collision
-            row += [self.pad_token_id] * (max_len - len(row))
-            ids.append(row)
-        return types.SimpleNamespace(input_ids=torch.tensor(ids, dtype=torch.long))
+    `_tokenize_with_eos` (train.py) reads `tokenizer.eos_token_id`, then calls
+    the tokenizer per single string with `add_special_tokens=False` and consumes
+    `.input_ids` as a 1-D list of ints (`list(enc.input_ids)`) before appending
+    eos itself. So this mock must (a) expose `eos_token_id`, (b) accept the
+    `add_special_tokens` kwarg, and (c) return a 1-D `input_ids` for a single
+    string (real HF semantics), not a padded 2-D tensor. Batched / tensor calls
+    still return a padded 2-D tensor for backward compatibility."""
+    pad_token_id = 0
+    eos_token_id = 1001   # distinct from pad (0) and content ids (1..1000)
+
+    def __call__(self, text, return_tensors=None, padding=None,
+                 truncation=None, max_length=None, add_special_tokens=True):
+        single = isinstance(text, str)
+        texts = [text] if single else list(text)
+        rows = []
+        for s in texts:
+            row = [ord(c) % 1000 + 1 for c in s]   # +1 to avoid pad-id collision
+            if max_length is not None:
+                row = row[:max_length]
+            rows.append(row)
+        if return_tensors == "pt" or padding:
+            max_len = max((len(r) for r in rows), default=0)
+            padded = [r + [self.pad_token_id] * (max_len - len(r)) for r in rows]
+            return types.SimpleNamespace(input_ids=torch.tensor(padded, dtype=torch.long))
+        # No tensor/padding requested: HF returns a 1-D python list for a single
+        # string (what _tokenize_with_eos consumes) or list-of-lists for a batch.
+        return types.SimpleNamespace(input_ids=(rows[0] if single else rows))
 
 
 class MockLM(nn.Module):
