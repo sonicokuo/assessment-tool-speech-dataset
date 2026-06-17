@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import sys
@@ -294,7 +295,24 @@ def main() -> int:
                         "the publication-final output, so the user-visible "
                         "description still includes it; only the training "
                         "target is shortened.")
+    p.add_argument("--clean_f0", type=Path, action="append", default=None,
+                   help="Path(s) to clean-frame F0 JSON {filename: {f0_mean_hz, "
+                        "f0_sd_hz}} from scripts/compute_clean_f0.py (repeatable, "
+                        "merged across splits). Substitutes the well-posed clean-"
+                        "frame F0 for the ill-posed mixture F0 (R4). On clips "
+                        "whose clean F0 is UNDEFINED (no non-overlap voiced "
+                        "frames — heavily overlapped), the F0 sentence is OMITTED "
+                        "so the target carries only the overlap hedge: this is "
+                        "the training signal for calibrated F0 hedging.")
     args = p.parse_args()
+
+    # Merge any clean-F0 lookups (one per split) into one filename->stats map.
+    clean_f0: dict | None = None
+    if args.clean_f0:
+        clean_f0 = {}
+        for cf_path in args.clean_f0:
+            clean_f0.update(json.loads(Path(cf_path).read_text()))
+        print(f"[clean_f0] loaded {len(clean_f0)} clips of clean-frame F0")
 
     if not args.features_dir.is_dir():
         print(f"ERROR: features dir {args.features_dir} not found", file=sys.stderr)
@@ -329,6 +347,21 @@ def main() -> int:
             stem = os.path.splitext(fname)[0]
             if not stem:
                 continue
+            # [R4] Substitute well-posed clean-frame F0 for the mixture F0.
+            if clean_f0 is not None:
+                cf = clean_f0.get(fname)
+                if cf is not None:
+                    cm = cf.get("f0_mean_hz")
+                    undefined = cm is None or (isinstance(cm, float) and math.isnan(cm))
+                    if undefined:
+                        # F0 unmeasurable here -> omit it; the overlap hedge stands.
+                        row["f0_mean_hz"] = ""
+                        row["f0_sd_hz"] = ""
+                    else:
+                        row["f0_mean_hz"] = str(cm)
+                        cs = cf.get("f0_sd_hz")
+                        row["f0_sd_hz"] = ("" if (cs is None or (isinstance(cs, float)
+                                          and math.isnan(cs))) else str(cs))
             text = build_description(row, fallback_warned, untagged=args.untagged,
                                      drop_overlap_segments=args.no_overlap_segments,
                                      drop_duration=args.no_duration)
