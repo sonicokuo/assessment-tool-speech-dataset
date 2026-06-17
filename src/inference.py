@@ -320,6 +320,8 @@ _STRUCTURAL_KEYS = (
     "lora_alpha",
     "lora_targets",
     "lora_dropout",
+    "use_dora",            # DoRA must match train/inference or the delta won't load
+    "init_lora_weights",   # PiSSA/standard init must match (see peft_config.py)
     "tagged_mode",  # tags vs legacy untagged prose — determines tokenizer setup
     # Section-query path. These MUST come from the checkpoint: the YAML default
     # is use_sections=false, so without syncing these a section_head checkpoint
@@ -408,17 +410,12 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     # the LM weights directly under llm_state_dict / lora_state_dict.
     full_ft = not bool(config.get("lora_rank"))
     if not full_ft:
-        llm = get_peft_model(
-            llm,
-            LoraConfig(
-                r=config["lora_rank"],
-                lora_alpha=config["lora_alpha"],
-                target_modules=config["lora_targets"],
-                lora_dropout=config["lora_dropout"],
-                bias="none",
-                task_type="CAUSAL_LM",
-            ),
-        )
+        from peft_config import lora_config_kwargs, uses_pissa
+        llm = get_peft_model(llm, LoraConfig(**lora_config_kwargs(config)))
+        if uses_pissa(config):
+            print("[LoRA] WARNING: PiSSA init requested but inference rebuilds from the "
+                  "vanilla HF base; without a saved pissa-residual base the adapter loads "
+                  "against the wrong weights. Use DoRA, or implement the base-restore.")
         print(f"[LoRA] rank={config['lora_rank']} (legacy ckpt path)")
     else:
         print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → loading LM weights directly")

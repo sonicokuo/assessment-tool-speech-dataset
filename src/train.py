@@ -629,18 +629,15 @@ def train(config: dict) -> None:
     if full_ft:
         print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → training all LM weights")
     else:
-        llm = get_peft_model(
-            llm,
-            LoraConfig(
-                r=config["lora_rank"],
-                lora_alpha=config["lora_alpha"],
-                target_modules=config["lora_targets"],
-                lora_dropout=config["lora_dropout"],
-                bias="none",
-                task_type="CAUSAL_LM",
-            ),
-        )
-        print(f"[LoRA] rank={config['lora_rank']} alpha={config['lora_alpha']}")
+        from peft_config import lora_config_kwargs, uses_pissa
+        llm = get_peft_model(llm, LoraConfig(**lora_config_kwargs(config)))
+        _extra = []
+        if config.get("use_dora"):
+            _extra.append("DoRA")
+        if uses_pissa(config):
+            _extra.append(f"PiSSA({config['init_lora_weights']})")
+        print(f"[LoRA] rank={config['lora_rank']} alpha={config['lora_alpha']}"
+              + (f" + {'+'.join(_extra)}" if _extra else ""))
 
     # Row-masked new-token training (tagged_mode only).
     #
