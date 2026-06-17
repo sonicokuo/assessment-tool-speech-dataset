@@ -86,6 +86,26 @@ def _register_feature_tags(tokenizer: PreTrainedTokenizerBase, llm: nn.Module) -
             mean_out = out_emb.weight[:old_vocab_size].mean(dim=0)
             out_emb.weight[old_vocab_size:].copy_(mean_out.to(out_emb.weight.dtype))
 
+        # [R10] Semantic warm-start: overwrite the just-mean-filled OPEN <sec_*>/
+        # <f_*> rows with the mean of their descriptive-word subwords, so the
+        # tokens start differentiated (mean-init makes all 19 identical, which
+        # the small/section path struggles to break apart -> degeneration).
+        # Closing/range markers (</sec>, </f>, <r>, </r>) have no phrase and keep
+        # the mean-init above. Safe: falls back to mean-init on any error.
+        try:
+            from token_init import build_semantic_tag_init, semantic_init_new_rows
+            _out_w = (out_emb.weight if (out_emb is not None
+                      and out_emb.weight.shape[0] > old_vocab_size) else None)
+            _n_sem = semantic_init_new_rows(
+                in_emb, _out_w, old_vocab_size,
+                build_semantic_tag_init(tokenizer, old_vocab_size),
+            )
+            print(f"[tagged-mode] semantic warm-start: {_n_sem} open tags "
+                  f"initialized from their display names")
+        except Exception as e:
+            print(f"[tagged-mode] semantic init skipped ({type(e).__name__}: {e}); "
+                  f"keeping mean-init")
+
     return added
 
 
