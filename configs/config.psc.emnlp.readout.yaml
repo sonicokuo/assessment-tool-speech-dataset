@@ -127,7 +127,7 @@ resume_from: null
 # a stereotyped "tile-the-clip" pattern that the IoU>=0.8 SFS scorer rejects.
 # Confirmed via per_feature_sfs.py: overlap_span recall went from 0 → 0.65 in v7.
 data_dir: "/ocean/projects/cis260125p/shared/data/processed_pyannote"
-descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_tagged.json"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_tagged_nodur.json"
 features_path: "/ocean/projects/cis260125p/shared/data/features.json"
 features_csv:
   train: "/ocean/projects/cis260125p/shared/data/features_pyannote/train-100.csv"
