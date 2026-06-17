@@ -549,6 +549,25 @@ def extract_features(wav_path: str, overlap_handle, srmr_model) -> dict:
 
     result['srmr']        = compute_srmr(wav_path, srmr_model)
     result.update(compute_f0_variation(wav_path))
+    # [R4] Additive, non-destructive: F0 over VOICED frames OUTSIDE the VAD
+    # overlap windows. compute_f0_variation above runs Praat on the 2-speaker
+    # MIXTURE, which is ill-posed under overlap (octave / track-switch errors,
+    # measured 10-96 Hz off the non-overlap estimate on real clips). These
+    # *_clean columns restrict to the single active speaker so the F0 reference
+    # is well-posed. Both are written so the GT change stays auditable.
+    try:
+        from f0_clean import compute_f0_variation_clean, parse_overlap_windows_samples
+        _ovl = result.get('overlap_segments')
+        _ovl = '' if (_ovl is None or isinstance(_ovl, float)) else str(_ovl)
+        _cf0 = compute_f0_variation_clean(wav_path, parse_overlap_windows_samples(_ovl, int(sr)))
+        result['f0_mean_hz_clean']     = _cf0['f0_mean_hz']
+        result['f0_sd_hz_clean']       = _cf0['f0_sd_hz']
+        result['f0_clean_voiced_frac'] = _cf0['clean_voiced_frac']
+    except Exception as e:
+        print(f'  [WARNING] clean F0 failed on {wav_path}: {e}')
+        result['f0_mean_hz_clean']     = float('nan')
+        result['f0_sd_hz_clean']       = float('nan')
+        result['f0_clean_voiced_frac'] = float('nan')
     result['hnr_db']      = compute_hnr(wav_path)
     result['shimmer_pct'] = compute_shimmer(wav_path)
     result.update(compute_jitter(wav_path))
