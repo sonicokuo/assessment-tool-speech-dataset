@@ -1,0 +1,167 @@
+# EMNLP rework: Qwen3-8B + LoRA r=16 (default — proven recipe from v7).
+#
+# Recipe history:
+#   - v1-v5: Qwen3-1.7B + full FT + tagged_mode=true + section_head — collapsed
+#     val_sfs_f1 to 0 by epoch 4 every time (catastrophic forgetting + tag-token
+#     destabilization). Off-topic-ramble mode-split confirmed by sample audits.
+#   - v6: Qwen3-1.7B + full FT + untagged — peaked at val_sfs_f1=0.24 E4, drifted
+#     down by E8. Better than v1-v5 but still mode-split on short clips.
+#   - v7 (current): Qwen3-8B + LoRA r=16 + untagged + no-overlap-segments.
+#     Matches the q3_8b-film-mamba-v2 baseline (val_sfs_f1=0.61, recall=0.88)
+#     and is what all ablation runs now inherit.
+#
+# To run the old full-FT ablation row instead:
+#     python src/train.py --config configs/config.psc.emnlp.yaml \
+#       --lm_name Qwen/Qwen3-1.7B --lora_rank 0
+#
+# See scratch/EMNLP_REWORK_PLAN_20260511.md for the decision rationale.
+
+# ── Model ──────────────────────────────────────────────
+lm_name: "Qwen/Qwen3-8B"
+adapter_variant: "film-mamba"
+
+# LoRA on q/k/v/o + MLP projections. ~45M trainable on top of 8B frozen
+# pretrained weights → preserves the LM's instruction-following prior
+# (the lack of which caused v6's mode-collapse into off-topic ramble).
+lora_rank: 16
+lora_alpha: 32
+lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_dropout: 0.05
+
+# Tagged-prose mode: when true, registers per-section + per-feature special
+# tokens (19 new tokens) via tokenizer.add_tokens(special_tokens=False).
+# DEFAULT FALSE since v7: tagged_mode=true + full FT destabilized training
+# (new-token embeddings get noisy gradient → catastrophic forgetting). The
+# untagged prose path with post-hoc attention extraction (scripts/extract_
+# attention.py) replaces it cleanly.
+tagged_mode: true
+
+# Section-query design (Path 3 of the EMNLP rework). When use_sections=true,
+# SectionQueryHead injects per-section cross-attention residuals at <sec_X>
+# positions. DEFAULT FALSE since v7: the section_head path collapsed val_sfs_f1
+# to 0 by epoch 4 across v3/v4/v5 (bf16 instability + zero-grad init + tagged-
+# mode coupling). The post-hoc attention extraction route gets the same paper
+# figure without touching the LM input distribution. To re-enable for ablation
+# rows, set use_sections=true on the CLI.
+use_sections: true
+
+# Spec encoder configuration. Default is BEATs (vendored under src/beats/);
+# AST is available via spec_encoder_name="ast" — see src/spec_encoder.py.
+spec_encoder_name: "beats"
+spec_checkpoint_name: "BEATs_iter3_plus_AS2M.pt"   # on lpepino/beats_ckpts (HF Hub)
+spec_d_patch: 768            # BEATs encoder_embed_dim; AST hidden_size is also 768
+spec_freeze: true            # frozen pretrained — only the cross-attention learns
+
+# Section cross-attention dims (internal). Small relative to d_lm; ~1M params total.
+section_d_k: 256
+section_d_v: 256
+
+# Section query source:
+#   "static"  — per-section learnable query embedding. Single LM forward per
+#               step. Cheap, doesn't depend on prior text — recommended on
+#               40-GB GPUs.
+#   "dynamic" — query is the LM's hidden state at the <sec_X> position,
+#               projected through W_q. Two-pass forward (pass 1 extracts h_t,
+#               pass 2 computes the CE loss with e_t injected). LM learns to
+#               produce query-friendly hidden states; matches the professor's
+#               "the model generates a query vector" framing literally. ~1.5×
+#               training compute and memory; fits H100 80 GB.
+section_query_mode: "dynamic"
+
+# Whether BEATs patches are precomputed and cached into the .pt files.
+# DEFAULT FALSE since v7: BEATs is only needed by section_head (use_sections=true).
+# With use_sections=false, the dataloader skips loading the beats_patches key
+# even when it's present in the .pt — saves ~10% step time. Re-enable when
+# turning on use_sections for an ablation row.
+beats_cached: true
+
+# ── Optimizer ──────────────────────────────────────────────
+optimizer: "adamw"
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+lr_adapter: 1.0e-4   # unchanged from Phase-2
+lr_lm: 1.0e-5        # LR for the LM trainables. With lora_rank=16 (default)
+                     # this is the LR on the LoRA delta only — the 8B frozen
+                     # backbone never updates. With --lora_rank 0 it would be
+                     # the full-FT LR, which is fine because v6 already proved
+                     # 1e-5 is safe at this scale.
+weight_decay: 0.01
+grad_clip: 1.0
+
+# ── Scheduler ──────────────────────────────────────────────
+lr_scheduler: "cosine"
+warmup_ratio: 0.03
+min_lr_ratio: 0.0
+
+# ── Training ──────────────────────────────────────────────
+bf16: true
+batch_size: 6                  # 8B + LoRA r=16 + gradient_checkpointing fits on
+                               # H100-80 at batch_size=6. Verified by v7-lora-8b
+                               # (~9 epochs before timeout, no OOMs).
+gradient_accumulation_steps: 1
+gradient_checkpointing: true   # required at 8B + LoRA to stay under H100-80 memory
+epochs: 15                     # same trajectory shape as the Phase-2 v2 config
+seed: 73
+# max_target_length must exceed the longest tokenized description, otherwise
+# src/train.py::_tokenize_with_eos truncates the tail BEFORE appending EOS.
+# Measured on the merged descriptions.json (19,900 entries) with the Qwen3
+# tokenizer: min=242, p50=288, p99=379, max=452. 512 covers every entry with
+# margin; if memory becomes an issue, drop batch_size to 4 with
+# gradient_accumulation_steps=2 rather than truncating real training signal.
+max_target_length: 512
+max_nums_length: 64            # bare-nums target is 7 slots ≈ 50 tokens
+resume_from: null
+
+# ── Data ──────────────────────────────────────────────
+# IMPORTANT: descriptions_untagged_noseg.json is the v7-proven target format.
+# Generated by:
+#   python scripts/build_descriptions_deterministic.py --all \
+#     --untagged --no-overlap-segments \
+#     --features-dir $SHARED/data/features_pyannote \
+#     --output       $SHARED/data/descriptions_untagged_noseg.json
+#
+# The --no-overlap-segments flag drops the "overlap segments are present at
+# 0.5-3.6s, ..." sentence — WavLM features are temporally pooled and the LM
+# cannot learn precise time-stamp emission, so without this flag it hallucinates
+# a stereotyped "tile-the-clip" pattern that the IoU>=0.8 SFS scorer rejects.
+# Confirmed via per_feature_sfs.py: overlap_span recall went from 0 → 0.65 in v7.
+data_dir: "/ocean/projects/cis260125p/shared/data/processed_pyannote"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_tagged.json"
+features_path: "/ocean/projects/cis260125p/shared/data/features.json"
+features_csv:
+  train: "/ocean/projects/cis260125p/shared/data/features_pyannote/train-100.csv"
+  val:   "/ocean/projects/cis260125p/shared/data/features_pyannote/dev.csv"
+num_workers: 4
+pin_memory: true
+
+# ── B-full multi-task loss weights (same as Phase-2 v2) ──────────────
+lambda_prose: 1.0
+lambda_nums:  0.3
+lambda_mse:   0.3
+lambda_readout: 0.5    # [R2] enable the attention-grounding readout loss (de-risk run)
+
+# ── Evaluation ──────────────────────────────────────────────
+eval_every_epoch: 1
+prompt: "Describe the quality of this recording."
+prompt_prose: "Describe the quality of this recording."
+prompt_nums:  "List the numerical features of this recording:"
+val_sfs_n: 32
+
+# ── Generation ──────────────────────────────────────────────
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+
+# ── Saving ──────────────────────────────────────────────
+# Override per-ablation with --save_dir $SHARED/checkpoints/<variant>__v1
+save_dir: "/ocean/projects/cis260125p/shared/checkpoints/v12_readout_derisk"
+
+# ── Logging ──────────────────────────────────────────────
+# wandb_entity pins the team account so contributors don't need to export
+# WANDB_ENTITY each session. Override with --wandb_entity <other> on the CLI
+# if you want to send a run somewhere else.
+wandb_entity: "speech_quality_adapter"
+wandb_project: "aqua-nl-emnlp"
+wandb_run_name: "v12-readout-derisk"
+log_every: 10
