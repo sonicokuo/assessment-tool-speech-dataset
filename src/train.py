@@ -1067,16 +1067,24 @@ def train(config: dict) -> None:
                 sys.exit(0)
 
             if n_steps % config["log_every"] == 0:
-                wandb.log(
-                    {
-                        "train_loss": loss.item() * accum_steps,
-                        "train_loss_lm_prose": loss_metrics["loss_lm_prose"],
-                        "train_loss_lm_nums": loss_metrics["loss_lm_nums"],
-                        "train_loss_mse": loss_metrics["loss_mse"],
-                        "lr": scheduler.get_last_lr()[0],
-                        "step": n_steps + epoch * len(train_loader),
-                    }
-                )
+                log_payload = {
+                    "train_loss": loss.item() * accum_steps,
+                    "train_loss_lm_prose": loss_metrics["loss_lm_prose"],
+                    "train_loss_lm_nums": loss_metrics["loss_lm_nums"],
+                    "train_loss_mse": loss_metrics["loss_mse"],
+                    "lr": scheduler.get_last_lr()[0],
+                    "step": n_steps + epoch * len(train_loader),
+                }
+                # [section_readout] surface the grounding loss + per-feature MAE
+                # (computed in compute_loss but otherwise discarded). These are
+                # THE signal for whether attention is becoming grounded.
+                if "loss_readout" in loss_metrics:
+                    log_payload["train_loss_readout"] = loss_metrics["loss_readout"]
+                    log_payload["lambda_readout"] = float(config.get("lambda_readout", 0.0))
+                    for k, v in loss_metrics.items():
+                        if k.startswith("readout_mae/"):
+                            log_payload[f"train_{k}"] = v
+                wandb.log(log_payload)
 
             batch_bar.set_postfix(
                 loss="{:.04f}".format(float(train_loss / n_steps)),
@@ -1100,6 +1108,10 @@ def train(config: dict) -> None:
             batch_bar = tqdm(total=len(val_loader), dynamic_ncols=True, leave=False, position=0, desc='Val')
 
             val_metrics_sum = {"loss_lm_prose": 0.0, "loss_lm_nums": 0.0, "loss_mse": 0.0}
+            # [section_readout] held-out grounding signal: loss + per-feature MAE.
+            val_readout_loss_sum = 0.0
+            val_readout_mae_sum: dict[str, float] = {}
+            val_readout_n = 0
             with torch.no_grad():
                 for batch in val_loader:
                     # Match the training forward path exactly: pass `mode=sq_mode`
@@ -1138,6 +1150,14 @@ def train(config: dict) -> None:
                     for k in val_metrics_sum:
                         val_metrics_sum[k] += loss_metrics[k]
                     n_val += 1
+
+                    # [section_readout] accumulate grounding metrics when present.
+                    if "loss_readout" in loss_metrics:
+                        val_readout_loss_sum += loss_metrics["loss_readout"]
+                        for k, v in loss_metrics.items():
+                            if k.startswith("readout_mae/"):
+                                val_readout_mae_sum[k] = val_readout_mae_sum.get(k, 0.0) + v
+                        val_readout_n += 1
 
                     batch_bar.set_postfix(
                         loss="{:.04f}".format(float(val_loss / n_val)))
@@ -1302,6 +1322,13 @@ def train(config: dict) -> None:
                 "val_sfs_recall": avg_sfs_r,
                 "val_sfs_f1": avg_sfs_f1,
             }
+            # [section_readout] held-out grounding loss + per-feature MAE. Watch
+            # val_readout_mae/f0_mean, .../overlap_ratio — falling means the
+            # section's z (hence its attention) is learning to find that evidence.
+            if val_readout_n > 0:
+                log_dict["val_loss_readout"] = val_readout_loss_sum / val_readout_n
+                for k, v in val_readout_mae_sum.items():
+                    log_dict[f"val_{k}"] = v / val_readout_n
             if gen_metrics["bleu"] is not None:
                 log_dict["val_bleu"] = gen_metrics["bleu"]
             if gen_metrics["rouge_l"] is not None:
@@ -1314,6 +1341,15 @@ def train(config: dict) -> None:
         print("\tTrain Loss {:.04f}".format(avg_train_loss))
         if avg_val_loss is not None:
             print("\tVal Loss {:.04f}".format(avg_val_loss))
+        # [section_readout] echo grounding metrics to stdout so they're visible
+        # in the tee'd log even when wandb is disabled (smoke runs).
+        if avg_val_loss is not None and val_readout_n > 0:
+            mae_str = "  ".join(
+                f"{k.split('/')[-1]}={v / val_readout_n:.3f}"
+                for k, v in sorted(val_readout_mae_sum.items())
+            )
+            print("\tVal Readout Loss {:.04f}".format(val_readout_loss_sum / val_readout_n))
+            print("\tVal Readout MAE (normalized): {}".format(mae_str))
         print("\tLearning Rate {:.07f}".format(curr_lr))
 
         # Save best — selected on val_sfs_f1 (higher = better). avg_sfs_f1 is set
