@@ -122,7 +122,7 @@ def collate_fn(batch):
     # True at padded positions; SectionQueryHead's cross-attention uses that
     # mask to fill those positions with -inf before the softmax, so attention
     # never lands on padding.
-    if "beats_patches" in batch[0]:
+    if all("beats_patches" in item for item in batch):
         patches_list = [item["beats_patches"] for item in batch]
         d_patch = patches_list[0].shape[1]
         max_len = max(p.shape[0] for p in patches_list)
