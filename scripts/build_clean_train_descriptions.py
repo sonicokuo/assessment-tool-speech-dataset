@@ -33,6 +33,9 @@ def main() -> int:
                     help="optional suffix appended to each stem key to avoid "
                          "collisions with Libri2Mix stems (usually unneeded — "
                          "clean s1 names are unique)")
+    ap.add_argument("--tagged", action="store_true",
+                    help="emit tagged (<sec_*>/<f_*>) descriptions for the "
+                         "section/2D-map path (default: untagged plain prose)")
     args = ap.parse_args()
 
     out = {}
@@ -42,7 +45,7 @@ def main() -> int:
         stem = os.path.splitext(fname)[0]
         if not stem:
             continue
-        text = build_description(row, None, untagged=True,
+        text = build_description(row, None, untagged=not args.tagged,
                                  drop_overlap_segments=True, drop_duration=True)
         if not text:
             n_empty += 1
