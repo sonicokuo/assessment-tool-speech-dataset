@@ -35,6 +35,12 @@ from __future__ import annotations
 import random
 from collections import Counter
 
+# Per-clip repetition threshold: a single generation whose rep-n exceeds this is
+# considered a degenerate repetition loop. A realistic clean templated quality
+# description ("The <feature> is <value>." x N) scores rep_n(n=4) ~ 0.01, while a
+# looping clip scores ~ 0.83, so 0.5 cleanly separates the two.
+REP_CLIP_THRESH: float = 0.5
+
 
 # ── Degeneration statistics over a batch of generated strings ────────────────
 def _word_ngrams(tokens: list[str], n: int) -> list[tuple]:
@@ -66,17 +72,21 @@ def nonascii_frac(text: str) -> float:
     return sum(1 for ch in text if ord(ch) > 127) / len(text)
 
 
-def degeneration_stats(texts: list[str], n: int = 4) -> dict:
+def degeneration_stats(texts: list[str], n: int = 4,
+                       rep_clip_thresh: float = REP_CLIP_THRESH) -> dict:
     """Aggregate degeneration signals over a batch of generations.
 
     Returns mean rep-n (per text), the overall non-ASCII character fraction
-    (concatenated), and the worst single-text rep-n (so one degenerate clip in
-    an otherwise clean batch is still visible).
+    (concatenated), the worst single-text rep-n (kept for telemetry), and the
+    FRACTION of clips whose per-clip rep-n exceeds `rep_clip_thresh` (the
+    repetition analogue of `frac_clips_nonascii`). The fraction is what the guard
+    gates on, so a few looping clips in an otherwise clean batch (the v14 case)
+    do not discard the whole checkpoint while a mostly-looping batch still does.
     """
     texts = [t or "" for t in texts]
     if not texts:
-        return {"rep_n_mean": 0.0, "rep_n_max": 0.0, "nonascii_frac": 0.0,
-                "frac_clips_nonascii": 0.0}
+        return {"rep_n_mean": 0.0, "rep_n_max": 0.0, "frac_clips_high_rep": 0.0,
+                "nonascii_frac": 0.0, "frac_clips_nonascii": 0.0}
     reps = [rep_n(t, n) for t in texts]
     total_chars = sum(len(t) for t in texts)
     nonascii = sum(1 for t in texts for ch in t if ord(ch) > 127)
@@ -85,9 +95,14 @@ def degeneration_stats(texts: list[str], n: int = 4) -> dict:
     # are injected into many clips but are a tiny fraction of total characters
     # (v12 epoch 2: ~1% of chars but 34% of clips). This per-clip rate catches it.
     n_nonascii_clips = sum(1 for t in texts if any(ord(ch) > 127 for ch in t))
+    # Fraction of CLIPS that are individually repetition-degenerate. The
+    # rep_n_max gate was too strict (v14: 3/32 looping clips, max 0.62, withheld
+    # an otherwise-clean checkpoint every epoch). This per-clip rate gates instead.
+    n_high_rep_clips = sum(1 for r in reps if r > rep_clip_thresh)
     return {
         "rep_n_mean": sum(reps) / len(reps),
         "rep_n_max": max(reps),
+        "frac_clips_high_rep": n_high_rep_clips / len(texts),
         "nonascii_frac": (nonascii / total_chars) if total_chars else 0.0,
         "frac_clips_nonascii": n_nonascii_clips / len(texts),
     }
@@ -100,11 +115,13 @@ def passes_degeneration_guard(
     rep_n_max: float,
     nonascii_frac_val: float,
     frac_clips_nonascii: float = 0.0,
+    frac_clips_high_rep: float = 0.0,
     *,
     bleu_rel_floor: float = 0.6,
-    rep_n_thresh: float = 0.5,
+    rep_n_thresh: float = 0.95,
     nonascii_thresh: float = 0.05,
     clip_nonascii_thresh: float = 0.15,
+    clip_rep_thresh: float = 0.15,
 ) -> tuple[bool, str]:
     """Return (is_clean, reason).
 
@@ -113,7 +130,17 @@ def passes_degeneration_guard(
       - BLEU collapsed RELATIVE to the best clean BLEU seen so far
         (bleu < bleu_rel_floor * best_bleu). Relative, not absolute, so a config
         that is simply less fluent is not penalised — only a collapse is.
-      - worst-clip rep-n exceeds rep_n_thresh (repetition / tag-spam loop).
+      - the FRACTION of clips that are individually repetition-degenerate
+        exceeds clip_rep_thresh. The per-clip-fraction gate (not the single
+        worst clip) is the fix for v14: a 32-clip batch with median rep-n 0.0
+        but 3 looping clips (max 0.62) used to be withheld EVERY epoch under the
+        old `rep_n_max > 0.5` gate, so no best.pt was ever saved. A few bad clips
+        are tolerated; a mostly-looping batch is still withheld. Mirrors the
+        `frac_clips_nonascii` design.
+      - rep_n_max is kept ONLY as a catastrophic backstop at a HIGH threshold
+        (0.95): a single clip that is essentially one token repeated is so
+        broken it is worth rejecting even if it is alone, but normal looping
+        clips (~0.6-0.85) no longer trip it.
       - non-ASCII character fraction exceeds nonascii_thresh (foreign-token
         injection).
 
@@ -127,8 +154,12 @@ def passes_degeneration_guard(
         and bleu < bleu_rel_floor * best_bleu
     ):
         return False, f"bleu {bleu:.2f} < {bleu_rel_floor:.2f}*best {best_bleu:.2f}"
+    if frac_clips_high_rep > clip_rep_thresh:
+        return False, (f"frac_clips_high_rep {frac_clips_high_rep:.3f} > "
+                       f"{clip_rep_thresh:.2f} (repetition/tag-spam in many clips)")
     if rep_n_max > rep_n_thresh:
-        return False, f"rep_n_max {rep_n_max:.3f} > {rep_n_thresh:.2f} (repetition/tag-spam)"
+        return False, (f"rep_n_max {rep_n_max:.3f} > {rep_n_thresh:.2f} "
+                       f"(catastrophic single-clip repetition)")
     if nonascii_frac_val > nonascii_thresh:
         return False, f"nonascii_frac {nonascii_frac_val:.4f} > {nonascii_thresh:.3f}"
     if frac_clips_nonascii > clip_nonascii_thresh:
@@ -145,8 +176,9 @@ def should_save_best(
     gen_texts: list[str],
     *,
     bleu_rel_floor: float = 0.6,
-    rep_n_thresh: float = 0.5,
+    rep_n_thresh: float = 0.95,
     nonascii_thresh: float = 0.05,
+    clip_rep_thresh: float = 0.15,
     n_gram: int = 4,
 ) -> tuple[bool, str]:
     """Top-level decision: save best.pt iff SFS improved AND the generations are
@@ -157,10 +189,11 @@ def should_save_best(
     stats = degeneration_stats(gen_texts, n=n_gram)
     ok, reason = passes_degeneration_guard(
         bleu, best_bleu, stats["rep_n_max"], stats["nonascii_frac"],
-        stats["frac_clips_nonascii"],
+        stats["frac_clips_nonascii"], stats["frac_clips_high_rep"],
         bleu_rel_floor=bleu_rel_floor,
         rep_n_thresh=rep_n_thresh,
         nonascii_thresh=nonascii_thresh,
+        clip_rep_thresh=clip_rep_thresh,
     )
     if not ok:
         return False, f"sfs improved but degenerate ({reason})"
