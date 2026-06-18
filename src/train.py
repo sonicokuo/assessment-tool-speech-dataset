@@ -95,11 +95,22 @@ def _register_feature_tags(tokenizer: PreTrainedTokenizerBase, llm: nn.Module) -
         # the mean-init above. Safe: falls back to mean-init on any error.
         try:
             from token_init import build_semantic_tag_init, semantic_init_new_rows
+            # IMPORTANT: the "new token" boundary for semantic init is the
+            # tokenizer length BEFORE the add (= the id of the first new token),
+            # NOT `old_vocab_size` (the embedding matrix row count). Qwen3-8B pads
+            # its embedding matrix to 151936 rows while the tokenizer only has
+            # 151669 real tokens, so add_tokens assigns the new <sec_*>/<f_*> ids
+            # in [151669, 151687] — all of which are < old_vocab_size (151936).
+            # Using old_vocab_size as the threshold rejects every open tag and
+            # the warm-start matches 0 (the R10 bug). The pre-add tokenizer length
+            # is the correct boundary for both the source-row guard and the
+            # new-row guard inside semantic_init_new_rows.
+            new_token_start = len(tokenizer) - added
             _out_w = (out_emb.weight if (out_emb is not None
                       and out_emb.weight.shape[0] > old_vocab_size) else None)
             _n_sem = semantic_init_new_rows(
-                in_emb, _out_w, old_vocab_size,
-                build_semantic_tag_init(tokenizer, old_vocab_size),
+                in_emb, _out_w, new_token_start,
+                build_semantic_tag_init(tokenizer, new_token_start),
             )
             print(f"[tagged-mode] semantic warm-start: {_n_sem} open tags "
                   f"initialized from their display names")
