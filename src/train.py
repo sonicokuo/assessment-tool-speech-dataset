@@ -25,7 +25,7 @@ from adapter import build_adapter
 from sfs import HybridClaimParser, SFSScorer
 from dataset import PreprocessedDataset, collate_fn
 from text_metrics import compute_generation_metrics
-from feature_set import FEATURE_SCALES
+from feature_set import FEATURE_SCALES, N_FEATURES
 from section_tags import (
     SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
     SECTION_TAGS,
@@ -40,6 +40,14 @@ from section_readout import (
     section_readout_loss,
     query_section_indices,
     warmup_lambda,
+)
+# [decoupled_grounding] token-free 2D grounding head. Parallel branch off the BEATs
+# patches — produces per-feature attention maps WITHOUT the LM emitting any special
+# token, so the LM generates clean untagged prose (0% degeneration). See
+# src/decoupled_grounding.py. Off by default (decoupled_grounding: false).
+from decoupled_grounding import (
+    DecoupledGroundingHead,
+    decoupled_grounding_loss_term,
 )
 # Degeneration-aware, lower-variance best-checkpoint selection.
 from ckpt_selection import seeded_val_indices, should_save_best
@@ -479,6 +487,8 @@ def compute_loss(
     gt_mask: torch.Tensor | None = None,
     prompt_nums_ids: torch.Tensor | None = None,
     section_ctx: dict | None = None,
+    decoupled_head: "DecoupledGroundingHead | None" = None,
+    batch: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """B-full multi-task forward + auxiliary regression head.
 
@@ -596,6 +606,31 @@ def compute_loss(
     else:
         metrics["loss_mse"] = 0.0
 
+    # [decoupled_grounding] Parallel token-free 2D-grounding term. Runs the head on
+    # the batch's BEATs patches (NOT the adapter/LM path) and regresses each scored
+    # feature out of A · V.detach(). Its gradient lands on the head's own queries /
+    # projections / readout — it never touches the LM CE graph above, so the LM
+    # keeps generating clean untagged prose while this head learns the maps in
+    # parallel. No-op when off, no head, or no BEATs patches in the batch.
+    decoupled_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    lambda_decoupled = float(config.get("lambda_decoupled", 0.0))
+    if (
+        config.get("decoupled_grounding", False)
+        and decoupled_head is not None
+        and lambda_decoupled > 0.0
+        and batch is not None
+    ):
+        d_loss, d_metrics = decoupled_grounding_loss_term(
+            decoupled_head, batch, lambda_decoupled, device,
+        )
+        if d_loss is not None:
+            decoupled_loss = d_loss.to(lm_loss_prose.dtype)
+            metrics.update(d_metrics)
+        else:
+            metrics["loss_decoupled"] = 0.0
+    else:
+        metrics["loss_decoupled"] = 0.0
+
     lambda_prose = float(config.get("lambda_prose", 1.0))
     lambda_nums = float(config.get("lambda_nums", 0.0))
     lambda_mse = float(config.get("lambda_mse", 0.0))
@@ -603,6 +638,9 @@ def compute_loss(
     total = lambda_prose * lm_loss_prose + lambda_nums * lm_loss_nums + lambda_mse * mse_loss
     # [section_readout] add the grounding term (readout_loss is 0 when disabled).
     total = total + lambda_readout * readout_loss
+    # [decoupled_grounding] add the parallel grounding term (already scaled by
+    # lambda_decoupled inside decoupled_grounding_loss_term; 0 when disabled).
+    total = total + decoupled_loss
     metrics["loss_total"] = float(total.detach().item())
     return total, metrics
 
@@ -759,6 +797,31 @@ def train(config: dict) -> None:
               f"query_mode={sq_mode}; ids {list(section_id_to_idx.keys())}; "
               f"range_open_id={range_open_id_train}")
 
+    # [decoupled_grounding] Token-free 2D grounding head — INDEPENDENT of use_sections.
+    # Produces per-feature attention maps over the BEATs T*F patches via learned
+    # per-feature queries (nn.Parameter, NOT vocab tokens), so the LM generates clean
+    # untagged prose and never emits a special token. Needs the precomputed BEATs
+    # patches in the .pt files (beats_cached: true) so the dataloader carries
+    # beats_patches; off by default (decoupled_grounding: false → zero overhead).
+    decoupled_head: "DecoupledGroundingHead | None" = None
+    if config.get("decoupled_grounding", False):
+        if not config.get("beats_cached", False):
+            print("[decoupled_grounding] WARNING: decoupled_grounding=true but "
+                  "beats_cached is false — the dataloader will not carry beats_patches "
+                  "and the grounding term will be a silent no-op. Set beats_cached: true.")
+        # Kept in float32 (NOT bf16) for regression precision, like SectionReadoutHead.
+        decoupled_head = DecoupledGroundingHead(
+            d_model=int(config.get("decoupled_d_model", 256)),
+            d_patch=int(config.get("spec_d_patch", 768)),
+            n_features=N_FEATURES,
+            n_heads=int(config.get("decoupled_n_heads", 1)),
+            readout_hidden=config.get("decoupled_readout_hidden"),  # None → linear bottleneck
+            huber_delta=float(config.get("decoupled_huber_delta", 1.0)),
+        ).to(device)
+        print(f"[decoupled_grounding] enabled: lambda_decoupled="
+              f"{config.get('lambda_decoupled', 0.0)}, d_model={config.get('decoupled_d_model', 256)}, "
+              f"d_patch={config.get('spec_d_patch', 768)}, n_features={N_FEATURES}")
+
     # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
     # after wandb.init() below. Helps compare adapter vs LoRA/full-FT footprint across runs.
     lm_total = sum(p.numel() for p in llm.parameters())
@@ -879,6 +942,10 @@ def train(config: dict) -> None:
     if readout_head is not None:
         # [section_readout] grounding head, also at adapter LR.
         param_groups.append({"params": readout_head.parameters(), "lr": config["lr_adapter"]})
+    if decoupled_head is not None:
+        # [decoupled_grounding] token-free 2D grounding head, also at adapter LR.
+        # Its queries / projections / readout train on the parallel grounding loss.
+        param_groups.append({"params": decoupled_head.parameters(), "lr": config["lr_adapter"]})
     optimizer = torch.optim.AdamW(
         param_groups,
         weight_decay=config["weight_decay"],
@@ -931,6 +998,8 @@ def train(config: dict) -> None:
             section_head.load_state_dict(checkpoint["section_head_state_dict"])
         if readout_head is not None and "readout_head_state_dict" in checkpoint:  # [section_readout]
             readout_head.load_state_dict(checkpoint["readout_head_state_dict"])
+        if decoupled_head is not None and "decoupled_head_state_dict" in checkpoint:  # [decoupled_grounding]
+            decoupled_head.load_state_dict(checkpoint["decoupled_head_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -1021,6 +1090,8 @@ def train(config: dict) -> None:
                 gt_mask=batch.get("gt_mask"),
                 prompt_nums_ids=prompt_nums_ids,
                 section_ctx=section_ctx,
+                decoupled_head=decoupled_head,   # [decoupled_grounding]
+                batch=batch,                     # [decoupled_grounding] head reads beats_patches/gt off it
             )
             loss = loss / accum_steps
             # Defensive NaN/Inf guard. Without this, one bad batch (e.g., a
@@ -1081,6 +1152,14 @@ def train(config: dict) -> None:
                     for k, v in loss_metrics.items():
                         if k.startswith("readout_mae/"):
                             log_payload[f"train_{k}"] = v
+                # [decoupled_grounding] surface the parallel grounding loss + per-feature
+                # MAE — THE signal for whether the token-free maps are getting grounded.
+                if "loss_decoupled" in loss_metrics:
+                    log_payload["train_loss_decoupled"] = loss_metrics["loss_decoupled"]
+                    log_payload["lambda_decoupled"] = float(config.get("lambda_decoupled", 0.0))
+                    for k, v in loss_metrics.items():
+                        if k.startswith("decoupled_mae/"):
+                            log_payload[f"train_{k}"] = v
                 wandb.log(log_payload)
 
             batch_bar.set_postfix(
@@ -1109,6 +1188,10 @@ def train(config: dict) -> None:
             val_readout_loss_sum = 0.0
             val_readout_mae_sum: dict[str, float] = {}
             val_readout_n = 0
+            # [decoupled_grounding] held-out parallel grounding signal: loss + MAE.
+            val_decoupled_loss_sum = 0.0
+            val_decoupled_mae_sum: dict[str, float] = {}
+            val_decoupled_n = 0
             with torch.no_grad():
                 for batch in val_loader:
                     # Match the training forward path exactly: pass `mode=sq_mode`
@@ -1142,6 +1225,8 @@ def train(config: dict) -> None:
                         # target. Aligns val with train.
                         prompt_nums_ids=prompt_nums_ids,
                         section_ctx=section_ctx,
+                        decoupled_head=decoupled_head,   # [decoupled_grounding]
+                        batch=batch,                     # [decoupled_grounding]
                     )
                     val_loss += loss.item()
                     for k in val_metrics_sum:
@@ -1155,6 +1240,18 @@ def train(config: dict) -> None:
                             if k.startswith("readout_mae/"):
                                 val_readout_mae_sum[k] = val_readout_mae_sum.get(k, 0.0) + v
                         val_readout_n += 1
+
+                    # [decoupled_grounding] accumulate parallel grounding metrics
+                    # when the head actually ran (loss_decoupled present AND nonzero
+                    # — present-but-0.0 means the branch was off / had no patches).
+                    if loss_metrics.get("loss_decoupled", 0.0) != 0.0 or any(
+                        k.startswith("decoupled_mae/") for k in loss_metrics
+                    ):
+                        val_decoupled_loss_sum += loss_metrics.get("loss_decoupled", 0.0)
+                        for k, v in loss_metrics.items():
+                            if k.startswith("decoupled_mae/"):
+                                val_decoupled_mae_sum[k] = val_decoupled_mae_sum.get(k, 0.0) + v
+                        val_decoupled_n += 1
 
                     batch_bar.set_postfix(
                         loss="{:.04f}".format(float(val_loss / n_val)))
@@ -1326,6 +1423,11 @@ def train(config: dict) -> None:
                 log_dict["val_loss_readout"] = val_readout_loss_sum / val_readout_n
                 for k, v in val_readout_mae_sum.items():
                     log_dict[f"val_{k}"] = v / val_readout_n
+            # [decoupled_grounding] held-out parallel grounding loss + per-feature MAE.
+            if val_decoupled_n > 0:
+                log_dict["val_loss_decoupled"] = val_decoupled_loss_sum / val_decoupled_n
+                for k, v in val_decoupled_mae_sum.items():
+                    log_dict[f"val_{k}"] = v / val_decoupled_n
             if gen_metrics["bleu"] is not None:
                 log_dict["val_bleu"] = gen_metrics["bleu"]
             if gen_metrics["rouge_l"] is not None:
@@ -1347,6 +1449,14 @@ def train(config: dict) -> None:
             )
             print("\tVal Readout Loss {:.04f}".format(val_readout_loss_sum / val_readout_n))
             print("\tVal Readout MAE (normalized): {}".format(mae_str))
+        # [decoupled_grounding] echo the parallel grounding metrics too.
+        if avg_val_loss is not None and val_decoupled_n > 0:
+            d_mae_str = "  ".join(
+                f"{k.split('/')[-1]}={v / val_decoupled_n:.3f}"
+                for k, v in sorted(val_decoupled_mae_sum.items())
+            )
+            print("\tVal Decoupled Loss {:.04f}".format(val_decoupled_loss_sum / val_decoupled_n))
+            print("\tVal Decoupled MAE (normalized): {}".format(d_mae_str))
         print("\tLearning Rate {:.07f}".format(curr_lr))
 
         # Save best — selected on val_sfs_f1 (higher = better). avg_sfs_f1 is set
@@ -1372,6 +1482,8 @@ def train(config: dict) -> None:
                 payload["section_head_state_dict"] = section_head.state_dict()
             if readout_head is not None:  # [section_readout]
                 payload["readout_head_state_dict"] = readout_head.state_dict()
+            if decoupled_head is not None:  # [decoupled_grounding]
+                payload["decoupled_head_state_dict"] = decoupled_head.state_dict()
             return payload
 
         # Atomic save: write to .tmp then os.replace (POSIX atomic). Without

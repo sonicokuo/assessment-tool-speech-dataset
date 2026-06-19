@@ -1,0 +1,125 @@
+# EMNLP v16 — DECOUPLED token-free 2D grounding head + untagged headline LM.
+#
+# Copied from configs/config.psc.emnlp.yaml (the v7-proven UNTAGGED headline:
+# Qwen3-8B + LoRA r=16, tagged_mode=false, use_sections=false). The ONLY change
+# in spirit is that a DecoupledGroundingHead runs in PARALLEL off the BEATs T*F
+# patches: it produces one attention map per scored feature via LEARNED queries
+# (nn.Parameter, NOT vocab tokens), supervised by a masked-Huber regression of
+# each feature's scalar out of z = A · V.detach(). The LM is untouched — it
+# generates clean untagged prose (0% degeneration) on the normal prose CE; the
+# 2D map comes ONLY from the head, never from special section/feature tokens.
+#
+# Because the head reads precomputed BEATs patches off each batch, this run needs
+# beats_cached: true (so the dataloader carries beats_patches) and a data_dir of
+# .pt files that actually contain the beats_patches key.
+#
+# See src/decoupled_grounding.py and the [decoupled_grounding] wiring in
+# src/train.py (decoupled_grounding_loss_term + compute_loss + optimizer/ckpt).
+
+# ── Model ──────────────────────────────────────────────
+lm_name: "Qwen/Qwen3-8B"
+adapter_variant: "film-mamba"
+
+# LoRA on q/k/v/o + MLP projections. ~45M trainable on top of 8B frozen.
+lora_rank: 16
+lora_alpha: 32
+lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_dropout: 0.05
+
+# UNTAGGED generation — the headline path. No section/feature special tokens; the
+# LM never emits a foreign token, so prose stays clean. The 2D grounding map comes
+# entirely from the decoupled head below, NOT from tagged decoding.
+tagged_mode: false
+use_sections: false
+
+# ── Decoupled grounding head (the v16 novelty) ─────────────────────────────────
+# Token-free per-feature 2D attention maps, trained as a PARALLEL branch off the
+# BEATs patches with a masked-Huber readout (V detached → gradient lands on the
+# learned queries, forcing each map onto real evidence).
+decoupled_grounding: true       # turn the head + parallel loss term ON
+lambda_decoupled: 0.5           # weight of the parallel grounding loss in the total
+decoupled_d_model: 256          # internal query/key/value width of the head
+decoupled_n_heads: 1            # single-head → one directly-interpretable (T,F) map
+# decoupled_readout_hidden: null  # None → Linear(d_model→1) bottleneck (default)
+decoupled_huber_delta: 1.0
+
+# Spec encoder / BEATs patches. The head cross-attends to BEATs T*F patches, so the
+# patches must be precomputed and cached into the .pt files.
+spec_encoder_name: "beats"
+spec_checkpoint_name: "BEATs_iter3_plus_AS2M.pt"
+spec_d_patch: 768               # BEATs encoder_embed_dim → head's d_patch
+spec_freeze: true
+
+# Whether BEATs patches are precomputed and cached into the .pt files. MUST be
+# true here: the decoupled head reads beats_patches off each batch, and the
+# dataloader only emits that key when beats_cached is true.
+beats_cached: true
+
+# Section-query dims (unused with use_sections=false but kept for config schema parity).
+section_d_k: 256
+section_d_v: 256
+section_query_mode: "static"
+
+# ── Optimizer ──────────────────────────────────────────────
+optimizer: "adamw"
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+lr_adapter: 1.0e-4   # the decoupled head also trains at this LR (added as its own group)
+lr_lm: 1.0e-5
+weight_decay: 0.01
+grad_clip: 1.0
+
+# ── Scheduler ──────────────────────────────────────────────
+lr_scheduler: "cosine"
+warmup_ratio: 0.03
+min_lr_ratio: 0.0
+
+# ── Training ──────────────────────────────────────────────
+bf16: true
+batch_size: 6
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+epochs: 10
+seed: 73
+max_target_length: 512
+max_nums_length: 64
+resume_from: null
+
+# ── Data ──────────────────────────────────────────────
+# UNTAGGED augmented split + CLEAN-F0 dev features for correct SFS scoring
+# (so f0_mean isn't undercounted on overlapped clips at eval).
+data_dir: "/ocean/projects/cis260125p/shared/data/processed_aug"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_aug.json"
+features_path: "/ocean/projects/cis260125p/shared/data/features.json"
+features_csv:
+  train: "/ocean/projects/cis260125p/shared/data/features_aug_train.csv"
+  val:   "/ocean/projects/cis260125p/shared/data/features_pyannote/dev_cleanf0.csv"
+num_workers: 4
+pin_memory: true
+
+# ── B-full multi-task loss weights ──────────────────────────────────
+lambda_prose: 1.0
+lambda_nums:  0.3
+lambda_mse:   0.3
+
+# ── Evaluation ──────────────────────────────────────────────
+eval_every_epoch: 1
+prompt: "Describe the quality of this recording."
+prompt_prose: "Describe the quality of this recording."
+prompt_nums:  "List the numerical features of this recording:"
+val_sfs_n: 32
+
+# ── Generation ──────────────────────────────────────────────
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+
+# ── Saving ──────────────────────────────────────────────
+save_dir: "/ocean/projects/cis260125p/shared/checkpoints/v16_decoupled"
+
+# ── Logging ──────────────────────────────────────────────
+wandb_entity: "speech_quality_adapter"
+wandb_project: "aqua-nl-emnlp"
+wandb_run_name: "v16-decoupled"
+log_every: 10

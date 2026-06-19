@@ -313,3 +313,68 @@ def feature_names() -> list[str]:
     """Convenience: the ordered short names of the scored features (for naming the
     per-feature MAEs / maps in wandb and figures)."""
     return [name for name, _csv, _fmt in SUPERVISED_FEATURES]
+
+
+def decoupled_grounding_loss_term(
+    head: "DecoupledGroundingHead | None",
+    batch: dict,
+    lambda_decoupled: float,
+    device: torch.device | str = "cpu",
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+    """Parallel grounding-loss term off the BEATs patches (the train.py integration).
+
+    Lives HERE (not in train.py) so it is importable and unit-testable WITHOUT
+    pulling transformers / peft / wandb — train.py just re-exports it. It runs the
+    token-free DecoupledGroundingHead on the batch's precomputed BEATs patches,
+    regresses each scored feature's scalar from the attention-pooled
+    z = A · V.detach(), and returns lambda_decoupled * masked_huber as a fresh
+    loss term. Because the head reads `beats_patches` straight off the batch (the
+    SAME field section_readout consumes) and pools over V.detach(), its gradient
+    lands on the head's own queries / K_proj / readout — it NEVER flows through the
+    LM token CE. It is a fully decoupled branch added to the total loss in
+    compute_loss.
+
+    Pulls from the batch (mirrors train.py's _build_section_ctx / section_readout):
+        beats_patches:       (B, P, d_patch) precomputed BEATs patch embeddings.
+        beats_patches_mask:  (B, P) bool, True at PADDED positions (collate_fn's
+                             convention). The head wants True at VALID positions,
+                             so it is inverted here.
+        gt_scalars:          (B, F) Praat scalar GT (feature_set.extract_scalars).
+        gt_mask:             (B, F) bool, True where the scalar was measured.
+
+    Returns:
+        (weighted_loss_or_None, metrics). No-op (None, {}) whenever the head is
+        absent, lambda is <= 0, the batch carries no BEATs patches (legacy .pt), or
+        there are no GT scalars — so it is safe to call unconditionally and is
+        zero-overhead when off. metrics has 'loss_decoupled' (the UNWEIGHTED loss)
+        and one 'decoupled_mae/<feat>' per scored feature.
+    """
+    if head is None or lambda_decoupled <= 0.0:
+        return None, {}
+    patches = batch.get("beats_patches")
+    gt_scalars = batch.get("gt_scalars")
+    gt_mask = batch.get("gt_mask")
+    if patches is None or gt_scalars is None or gt_mask is None:
+        return None, {}
+
+    head_dtype = head.K_proj.weight.dtype
+    patches = patches.to(device).to(head_dtype)
+
+    # collate_fn emits beats_patches_mask=True at PADDED positions; the head's
+    # patch_mask is True at VALID positions, so invert. None → all valid.
+    pad_mask = batch.get("beats_patches_mask")
+    valid_mask = None
+    if pad_mask is not None:
+        valid_mask = ~pad_mask.to(device).to(torch.bool)
+
+    gt_scalars = gt_scalars.to(device)
+    gt_mask = gt_mask.to(device)
+
+    _A, _z, pred_scalars = head(patches, patch_mask=valid_mask)
+    loss, mae = head.grounding_loss(pred_scalars, gt_scalars, gt_mask)
+    weighted = lambda_decoupled * loss
+
+    metrics: dict[str, float] = {"loss_decoupled": float(loss.detach().item())}
+    for i, fname in enumerate(feature_names()):
+        metrics[f"decoupled_mae/{fname}"] = float(mae[i].item())
+    return weighted, metrics
