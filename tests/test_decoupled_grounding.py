@@ -126,9 +126,8 @@ def test_grounding_grad_reaches_queries_not_V():
     torch.manual_seed(0)
     B, P, d_patch, d_model = 2, 6, 12, 16
     head = DecoupledGroundingHead(d_model=d_model, d_patch=d_patch)
-    # Give the readout a non-trivial map so there is real gradient to propagate.
-    last = head.readout if isinstance(head.readout, torch.nn.Linear) else head.readout[-1]
-    torch.nn.init.normal_(last.weight, std=0.5)
+    # Give the per-feature readouts a non-trivial map so there is real gradient.
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
 
     patches = torch.randn(B, P, d_patch, requires_grad=True)
     gt = torch.randn(B, N_FEATURES)
@@ -174,8 +173,7 @@ def test_V_path_is_dead_isolated():
     torch.manual_seed(1)
     B, P, d_patch, d_model = 1, 5, 8, 8
     head = DecoupledGroundingHead(d_model=d_model, d_patch=d_patch)
-    last = head.readout if isinstance(head.readout, torch.nn.Linear) else head.readout[-1]
-    torch.nn.init.normal_(last.weight, std=0.5)
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
 
     # Freeze the attention (queries + K_proj) so the ONLY way the loss could change
     # is by moving V. Since V is detached, the gradient on V_proj must be exactly 0
@@ -194,19 +192,132 @@ def test_V_path_is_dead_isolated():
     # readout still learns (its weights are on the live z), but V_proj — the value
     # encoder the map pools over — is provably untouched by the grounding loss.
     assert head.V_proj.weight.grad is None
-    last = head.readout if isinstance(head.readout, torch.nn.Linear) else head.readout[-1]
-    assert last.weight.grad is not None and last.weight.grad.abs().sum().item() > 0.0
+    assert (head.readout_weight.grad is not None
+            and head.readout_weight.grad.abs().sum().item() > 0.0)
 
 
-def test_readout_is_shallow_bottleneck():
-    """Default readout is a single Linear(d_model→1) so the attention map — not a
-    deep readout — is the evidence bottleneck."""
+def test_readout_is_shallow_per_feature_bottleneck():
+    """Default readout is a PER-FEATURE linear: one weight row + bias per feature,
+    batched into (n_features, d_model) / (n_features,) parameters, so the attention
+    map — not a deep readout — is the evidence bottleneck AND no feature shares a
+    readout with another."""
     head = DecoupledGroundingHead(d_model=16, d_patch=8)
-    assert isinstance(head.readout, torch.nn.Linear)
-    assert head.readout.out_features == 1
-    # opt-in 1-hidden MLP variant.
+    # per-feature linear: one (d_model,) weight row + scalar bias for each feature.
+    assert head.readout_weight.shape == (N_FEATURES, 16)
+    assert head.readout_bias.shape == (N_FEATURES,)
+    assert head._readout_hidden is None
+    # opt-in 1-hidden per-feature MLP variant: each feature has its OWN hidden layer.
     head2 = DecoupledGroundingHead(d_model=16, d_patch=8, readout_hidden=32)
-    assert isinstance(head2.readout, torch.nn.Sequential)
+    assert head2._readout_hidden == 32
+    assert head2.readout_w1.shape == (N_FEATURES, 16, 32)
+    assert head2.readout_w2.shape == (N_FEATURES, 32, 1)
+    assert head2.readout_bias.shape == (N_FEATURES,)
+    # output shape is still (B, n_features) — public API unchanged.
+    _A, _z, pred = head2(torch.randn(2, 5, 8))
+    assert pred.shape == (2, N_FEATURES)
+
+
+# ── per-feature readouts: independence + bias-init (THE FIX) ──────────────────
+def test_per_feature_readouts_are_independent():
+    """THE CORE OF THE FIX: each feature owns its readout parameters, so a loss on
+    ONLY feature i moves feature i's readout row and NO other feature's. With a
+    single shared readout every feature shared one weight matrix, so the large-
+    magnitude features dragged the small ones; per-feature heads make that
+    impossible. Proven by backpropping a loss on a single feature and checking the
+    gradient is nonzero on that row and EXACTLY zero on every other row."""
+    torch.manual_seed(7)
+    B, P, d_patch, d_model = 4, 6, 12, 16
+    head = DecoupledGroundingHead(d_model=d_model, d_patch=d_patch)
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
+
+    target_idx = 2  # supervise ONLY feature 2
+    patches = torch.randn(B, P, d_patch)
+    gt = torch.randn(B, N_FEATURES)
+    mask = torch.zeros(B, N_FEATURES, dtype=torch.bool)
+    mask[:, target_idx] = True
+
+    _A, _z, pred = head(patches)
+    loss, _ = head.grounding_loss(pred, gt, mask)
+    loss.backward()
+
+    # the supervised feature's readout row gets gradient ...
+    g = head.readout_weight.grad
+    gb = head.readout_bias.grad
+    assert g is not None and gb is not None
+    assert g[target_idx].abs().sum().item() > 0.0
+    assert gb[target_idx].abs().item() > 0.0
+    # ... and EVERY other feature's readout row + bias gets EXACTLY zero gradient —
+    # they no longer share parameters, so they cannot be dragged by feature 2.
+    for i in range(N_FEATURES):
+        if i == target_idx:
+            continue
+        assert g[i].abs().sum().item() == 0.0, f"feature {i} readout weight was dragged"
+        assert gb[i].abs().item() == 0.0, f"feature {i} readout bias was dragged"
+
+
+def test_per_feature_mlp_readouts_are_independent():
+    """Same independence guarantee for the opt-in per-feature 1-hidden MLP variant:
+    a loss on feature i must not touch any other feature's hidden/output params."""
+    torch.manual_seed(8)
+    B, P, d_patch, d_model = 4, 6, 12, 16
+    head = DecoupledGroundingHead(d_model=d_model, d_patch=d_patch, readout_hidden=8)
+    target_idx = 5
+    patches = torch.randn(B, P, d_patch)
+    gt = torch.randn(B, N_FEATURES)
+    mask = torch.zeros(B, N_FEATURES, dtype=torch.bool)
+    mask[:, target_idx] = True
+    _A, _z, pred = head(patches)
+    loss, _ = head.grounding_loss(pred, gt, mask)
+    loss.backward()
+    for param in (head.readout_w1, head.readout_w2, head.readout_b1, head.readout_bias):
+        grad = param.grad
+        assert grad is not None
+        for i in range(N_FEATURES):
+            tot = grad[i].abs().sum().item()
+            if i == target_idx:
+                assert tot > 0.0
+            else:
+                assert tot == 0.0, f"feature {i} {tuple(param.shape)} param was dragged"
+
+
+def test_feature_init_bias_sets_starting_prediction():
+    """`feature_init_bias=[means...]` seeds each per-feature readout's output bias
+    with that feature's prior mean, so at init (near-zero readout weights) the head
+    PREDICTS those means, not 0 — the fix for f0_mean starting stuck in a ~165 Hz
+    hole. Verified by zeroing the readout weights so the prediction is the pure bias
+    and asserting pred ≈ the requested means across a batch."""
+    torch.manual_seed(9)
+    means = [15.0, 5.0, 165.0, 46.0, 6.0, 3.0, 10.0, 0.3][:N_FEATURES]
+    means = means + [0.0] * (N_FEATURES - len(means))  # pad if catalog grows
+    head = DecoupledGroundingHead(d_model=12, d_patch=10, feature_init_bias=means)
+    # the bias is exactly the requested per-feature means.
+    assert torch.allclose(head.readout_bias.detach(),
+                          torch.tensor(means, dtype=head.readout_bias.dtype))
+    # zero the readout weights → prediction is the pure per-feature bias = the means.
+    with torch.no_grad():
+        head.readout_weight.zero_()
+    _A, _z, pred = head(torch.randn(3, 7, 10))
+    expect = torch.tensor(means, dtype=pred.dtype).unsqueeze(0).expand(3, -1)
+    assert torch.allclose(pred, expect, atol=1e-5)
+    # and crucially f0_mean (a high-mean feature) does NOT start at 0.
+    assert pred[0, 2].item() > 100.0
+
+
+def test_default_no_bias_init_starts_near_zero():
+    """Default (no feature_init_bias) preserves prior behavior: zero bias, so the
+    head starts predicting ~0 (small-init readout)."""
+    head = DecoupledGroundingHead(d_model=12, d_patch=10)
+    assert torch.all(head.readout_bias.detach() == 0.0)
+    _A, _z, pred = head(torch.randn(2, 5, 10))
+    assert pred.abs().max().item() < 1.0  # near zero at init (small readout weights)
+
+
+def test_feature_init_bias_wrong_length_raises():
+    try:
+        DecoupledGroundingHead(d_model=8, d_patch=8, feature_init_bias=[1.0, 2.0])
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for mismatched feature_init_bias length")
 
 
 # ── masked loss ──────────────────────────────────────────────────────────────
@@ -223,9 +334,8 @@ def test_zero_mask_is_zero_loss():
 def test_present_features_contribute_to_loss():
     torch.manual_seed(2)
     head = DecoupledGroundingHead(d_model=8, d_patch=8)
-    last = head.readout
-    torch.nn.init.normal_(last.weight, std=0.5)
-    last.bias.data.fill_(10.0)                             # force a large error
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
+    head.readout_bias.data.fill_(10.0)                    # force a large error
     A, z, pred = head(torch.randn(3, 5, 8))
     gt = torch.zeros(3, N_FEATURES)
     full = torch.ones(3, N_FEATURES, dtype=torch.bool)
@@ -289,8 +399,7 @@ def test_identical_init_queries_diverge_after_a_step():
     torch.manual_seed(3)
     B, P, d_patch, d_model = 4, 6, 8, 8
     head = DecoupledGroundingHead(d_model=d_model, d_patch=d_patch, n_features=2)
-    last = head.readout
-    torch.nn.init.normal_(last.weight, std=0.5)
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
     # force the two queries identical at init.
     with torch.no_grad():
         head.queries[1] = head.queries[0]

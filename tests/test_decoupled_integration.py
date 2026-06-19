@@ -62,7 +62,7 @@ def _head(d_patch=16, d_model=24):
 def test_helper_returns_finite_loss_and_grads_queries():
     head = _head()
     # give the readout a non-trivial map so there is real gradient to propagate.
-    torch.nn.init.normal_(head.readout.weight, std=0.5)
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
     batch = _fake_batch()
 
     weighted, metrics = decoupled_grounding_loss_term(head, batch, lambda_decoupled=0.5)
@@ -102,7 +102,7 @@ def test_head_produces_B_F_T_F_map_via_reshape():
 # ── lambda scaling ───────────────────────────────────────────────────────────
 def test_lambda_scales_loss_linearly():
     head = _head()
-    torch.nn.init.normal_(head.readout.weight, std=0.5)
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
     batch = _fake_batch()
     w_half, _ = decoupled_grounding_loss_term(head, batch, lambda_decoupled=0.5)
     w_one, m_one = decoupled_grounding_loss_term(head, batch, lambda_decoupled=1.0)
@@ -153,7 +153,7 @@ def test_grounding_grad_does_not_reach_V_proj():
     this is also what keeps the branch off the LM CE graph (it shares only the
     detached/encoder patches), so the LM keeps generating clean untagged prose."""
     head = _head()
-    torch.nn.init.normal_(head.readout.weight, std=0.5)
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
     batch = _fake_batch()
     weighted, _ = decoupled_grounding_loss_term(head, batch, lambda_decoupled=0.7)
     weighted.backward()
@@ -161,15 +161,15 @@ def test_grounding_grad_does_not_reach_V_proj():
     assert head.V_proj.weight.grad is None
     assert head.V_proj.bias.grad is None
     # readout (on the live z) and queries DO learn.
-    assert head.readout.weight.grad is not None
-    assert head.readout.weight.grad.abs().sum().item() > 0.0
+    assert head.readout_weight.grad is not None
+    assert head.readout_weight.grad.abs().sum().item() > 0.0
 
 
 def test_input_patches_not_mutated_and_no_grad_leak_to_batch():
     """The helper must not require grad on the incoming batch tensors (they come
     straight off the dataloader). The head builds its own graph from them."""
     head = _head()
-    torch.nn.init.normal_(head.readout.weight, std=0.5)
+    torch.nn.init.normal_(head.readout_weight, std=0.5)
     batch = _fake_batch()
     patches_before = batch["beats_patches"].clone()
     weighted, _ = decoupled_grounding_loss_term(head, batch, lambda_decoupled=0.5)

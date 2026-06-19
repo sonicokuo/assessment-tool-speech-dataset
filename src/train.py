@@ -809,6 +809,18 @@ def train(config: dict) -> None:
             print("[decoupled_grounding] WARNING: decoupled_grounding=true but "
                   "beats_cached is false — the dataloader will not carry beats_patches "
                   "and the grounding term will be a silent no-op. Set beats_cached: true.")
+        # Optional per-feature readout bias init = each feature's prior MEAN, in the
+        # SAME raw scalar units the grounding loss regresses (gt_scalars). Seeds each
+        # per-feature readout's output bias to that mean so a high-mean feature
+        # (f0_mean ~165) doesn't start pinned at 0. Pass via config as a list in
+        # SUPERVISED_FEATURES order; None → zeros (prior behavior). Compute it from
+        # the train split's per-feature means (over the present/measured entries).
+        feature_init_bias = config.get("decoupled_feature_init_bias")  # list[float] | None
+        if feature_init_bias is not None and len(feature_init_bias) != N_FEATURES:
+            raise ValueError(
+                f"decoupled_feature_init_bias must have {N_FEATURES} entries "
+                f"(SUPERVISED_FEATURES order), got {len(feature_init_bias)}"
+            )
         # Kept in float32 (NOT bf16) for regression precision, like SectionReadoutHead.
         decoupled_head = DecoupledGroundingHead(
             d_model=int(config.get("decoupled_d_model", 256)),
@@ -817,10 +829,12 @@ def train(config: dict) -> None:
             n_heads=int(config.get("decoupled_n_heads", 1)),
             readout_hidden=config.get("decoupled_readout_hidden"),  # None → linear bottleneck
             huber_delta=float(config.get("decoupled_huber_delta", 1.0)),
+            feature_init_bias=feature_init_bias,  # None → zeros; else per-feature raw means
         ).to(device)
         print(f"[decoupled_grounding] enabled: lambda_decoupled="
               f"{config.get('lambda_decoupled', 0.0)}, d_model={config.get('decoupled_d_model', 256)}, "
-              f"d_patch={config.get('spec_d_patch', 768)}, n_features={N_FEATURES}")
+              f"d_patch={config.get('spec_d_patch', 768)}, n_features={N_FEATURES}, "
+              f"feature_init_bias={'set' if feature_init_bias is not None else 'zeros'}")
 
     # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
     # after wandb.init() below. Helps compare adapter vs LoRA/full-FT footprint across runs.

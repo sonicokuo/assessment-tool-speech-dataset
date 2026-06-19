@@ -43,6 +43,20 @@ feature's map onto real evidence. The readout is kept SHALLOW (linear or 1-hidde
 MLP) so it cannot itself absorb the feature and let A stay flat: the attention map
 is the bottleneck.
 
+PER-FEATURE READOUTS (NOT one shared readout)
+---------------------------------------------
+Each feature gets its OWN readout (its own weight row + bias), batched into a single
+parameter and applied with einsum (no Python loop). A single shared Linear(d_model→1)
+reused across all features made the readout specialize toward the large-magnitude
+features (f0_mean ~165, f0_sd ~46) and DRAG the small-magnitude ones (overlap_ratio
+~0.3) the wrong way: in a live run overlap_ratio error rose during training while
+f0_mean stayed pinned near 0. Since the readout gradient flows back into the
+attention queries, a corrupted shared readout corrupts BOTH the scalar predictions
+AND the per-feature 2D maps. Per-feature heads make every feature's readout (and
+hence its query/map gradient) independent of the others. An optional
+`feature_init_bias` seeds each readout's output bias with that feature's prior mean
+so a high-mean feature does not start in a deep hole at 0.
+
 (`V_proj` still receives gradient from any *separate* main task that consumes a
 non-detached z, but NOT from this grounding loss — exactly as section_readout.py.)
 
@@ -94,8 +108,17 @@ class DecoupledGroundingHead(nn.Module):
                      map is a single, directly-interpretable (T, F) distribution
                      for the figures; the returned A is always (B, n_features, P)
                      regardless of head count (heads are averaged into one map).
-        readout_hidden: None → a single Linear(d_model→1) readout (true bottleneck,
-                     matches "keep it shallow"); an int → one GELU hidden layer.
+        readout_hidden: None → a single PER-FEATURE Linear(d_model→1) readout (true
+                     bottleneck, matches "keep it shallow"); an int → one per-feature
+                     GELU hidden layer.
+        feature_init_bias: optional length-n_features tensor / list of the per-feature
+                     TARGET means used to initialize each readout's output bias, so a
+                     feature starts predicting its prior mean instead of 0. UNITS: the
+                     same units `grounding_loss` regresses, i.e. the RAW scalar units
+                     of `gt_scalars` (the head predicts raw scalars; the loss
+                     scale-normalizes only the *error*, never the prediction). So pass
+                     raw per-feature means, e.g. [snr≈15, srmr≈5, f0_mean≈165, ...] in
+                     SUPERVISED_FEATURES order. Default None → zeros (prior behavior).
         huber_delta: smooth-L1 / Huber transition point on the scale-normalized
                      error (same convention as section_readout.py).
     """
@@ -108,6 +131,7 @@ class DecoupledGroundingHead(nn.Module):
         n_heads: int = 1,
         readout_hidden: int | None = None,
         huber_delta: float = 1.0,
+        feature_init_bias: "torch.Tensor | list[float] | tuple[float, ...] | None" = None,
     ):
         super().__init__()
         if d_model % n_heads != 0:
@@ -131,24 +155,55 @@ class DecoupledGroundingHead(nn.Module):
         self.K_proj = nn.Linear(self.d_patch, self.d_model)
         self.V_proj = nn.Linear(self.d_patch, self.d_model)
 
-        # ── SHALLOW readout: pooled z (d_model) → 1 scalar, per feature ─────────
-        # One shared trunk applied to every feature's z (like section_readout's
-        # shared MLP): the n_features z-vectors must DIFFER for the shared readout
-        # to recover the n_features distinct scalars, which forces distinct maps.
-        if readout_hidden is None:
-            self.readout: nn.Module = nn.Linear(self.d_model, 1)
-            last = self.readout
+        # ── SHALLOW *PER-FEATURE* readout: each feature's pooled z_i → 1 scalar ──
+        # PER-FEATURE, NOT shared. A single shared Linear(d_model→1) reused across
+        # every feature's z made the readout specialize toward the large-magnitude
+        # features (f0_mean ~165, f0_sd ~46) and DRAG the small ones (overlap_ratio
+        # ~0.3) the wrong way — overlap_ratio error climbed during training while
+        # f0_mean stayed pinned near 0. Because the readout's gradient flows back
+        # into the attention queries, a corrupted shared readout corrupts BOTH the
+        # scalars AND every per-feature 2D map. Here each feature i owns its own
+        # (W[i], b[i]) (and its own hidden layer when readout_hidden is set), so no
+        # feature can drag another's parameters or its query/map. Implemented as a
+        # single batched per-feature parameter (shape (n_features, ...)) applied with
+        # einsum — no Python loop, one tensor op for all features.
+        #
+        # Parameterized form (NOT an nn.Linear/nn.Sequential) so each feature row is
+        # an isolated parameter group whose gradient is independent by construction.
+        self._readout_hidden = None if readout_hidden is None else int(readout_hidden)
+        if self._readout_hidden is None:
+            # Per-feature linear: pred[:, i] = z[:, i] @ W[i] + b[i].
+            #   W: (n_features, d_model), b: (n_features,)
+            self.readout_weight = nn.Parameter(torch.empty(self.n_features, self.d_model))
+            self.readout_bias = nn.Parameter(torch.zeros(self.n_features))
+            nn.init.normal_(self.readout_weight, mean=0.0, std=0.01)
         else:
-            self.readout = nn.Sequential(
-                nn.Linear(self.d_model, int(readout_hidden)),
-                nn.GELU(),
-                nn.Linear(int(readout_hidden), 1),
-            )
-            last = self.readout[-1]
-        # Near-zero output init so the readout starts ~0 and ramps with training
-        # (small-init philosophy, matches SectionReadoutHead).
-        nn.init.normal_(last.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(last.bias)
+            h = self._readout_hidden
+            # Per-feature 1-hidden GELU MLP, all features batched:
+            #   hidden[:, i] = GELU(z[:, i] @ W1[i] + b1[i])     W1: (Nf, d_model, h)
+            #   pred[:, i]   = hidden[:, i] @ W2[i] + b2[i]      W2: (Nf, h, 1)
+            self.readout_w1 = nn.Parameter(torch.empty(self.n_features, self.d_model, h))
+            self.readout_b1 = nn.Parameter(torch.zeros(self.n_features, h))
+            self.readout_w2 = nn.Parameter(torch.empty(self.n_features, h, 1))
+            self.readout_bias = nn.Parameter(torch.zeros(self.n_features))
+            # Kaiming-flavored small init on the hidden layer, near-zero output layer
+            # so the head still starts ~at the bias (small-init philosophy).
+            nn.init.normal_(self.readout_w1, mean=0.0, std=1.0 / math.sqrt(self.d_model))
+            nn.init.normal_(self.readout_w2, mean=0.0, std=0.01)
+
+        # Per-feature bias init: each feature's output bias → its prior TARGET mean
+        # (raw scalar units; see __init__ docstring). With near-zero output weights
+        # the head therefore starts predicting each feature's mean instead of 0, so a
+        # large-mean feature (f0_mean ~165) doesn't sit in a ~165 Hz hole at step 0.
+        if feature_init_bias is not None:
+            bias_t = torch.as_tensor(feature_init_bias, dtype=self.readout_bias.dtype)
+            if bias_t.shape != (self.n_features,):
+                raise ValueError(
+                    f"feature_init_bias must have shape ({self.n_features},), "
+                    f"got {tuple(bias_t.shape)}"
+                )
+            with torch.no_grad():
+                self.readout_bias.copy_(bias_t)
 
         self._scale = 1.0 / math.sqrt(self.d_head)
 
@@ -217,8 +272,28 @@ class DecoupledGroundingHead(nn.Module):
         # Returned attention map: average over heads to ONE (B, n_features, P) map.
         A = A_heads.mean(dim=1)                                      # (B, n_features, P)
 
-        pred_scalars = self.readout(z).squeeze(-1)                  # (B, n_features)
+        pred_scalars = self._readout(z)                             # (B, n_features)
         return A, z, pred_scalars
+
+    # ── per-feature readout ─────────────────────────────────────────────────────
+    def _readout(self, z: torch.Tensor) -> torch.Tensor:
+        """Apply each feature's OWN readout to its OWN pooled vector z_i.
+
+        z: (B, n_features, d_model) → pred: (B, n_features). Feature i is computed
+        from z[:, i] and parameters row i ONLY, so its gradient never touches another
+        feature's readout (the independence property the per-feature heads buy us).
+        Batched with einsum — one op for all features, no Python loop.
+        """
+        if self._readout_hidden is None:
+            # pred[b, i] = sum_d z[b, i, d] * W[i, d] + b[i]
+            pred = torch.einsum("bid,id->bi", z, self.readout_weight) + self.readout_bias
+            return pred
+        # hidden[b, i, h] = sum_d z[b, i, d] * W1[i, d, h] + b1[i, h]
+        hidden = torch.einsum("bid,idh->bih", z, self.readout_w1) + self.readout_b1
+        hidden = F.gelu(hidden)
+        # pred[b, i] = sum_h hidden[b, i, h] * W2[i, h, 0] + bias[i]
+        pred = torch.einsum("bih,iho->bio", hidden, self.readout_w2).squeeze(-1) + self.readout_bias
+        return pred
 
     # ── input normalization ────────────────────────────────────────────────────
     def _flatten_inputs(
