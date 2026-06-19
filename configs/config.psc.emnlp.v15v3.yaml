@@ -1,0 +1,70 @@
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-08
+adapter_variant: film-mamba
+batch_size: 6
+beats_cached: true
+bf16: true
+data_dir: /ocean/projects/cis260125p/shared/data/processed_aug
+descriptions_path: /ocean/projects/cis260125p/shared/data/descriptions_aug_tagged.json
+epochs: 10
+eval_every_epoch: 1
+features_csv:
+  train: /ocean/projects/cis260125p/shared/data/features_aug_train.csv
+  val: /ocean/projects/cis260125p/shared/data/features_pyannote/dev.csv
+features_path: /ocean/projects/cis260125p/shared/data/features.json
+grad_clip: 1.0
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+lambda_mse: 0.3
+lambda_nums: 0.3
+lambda_prose: 1.0
+lambda_readout: 0.02
+lambda_readout_warmup_epochs: 3
+lm_name: Qwen/Qwen3-8B
+log_every: 10
+lora_alpha: 32
+lora_dropout: 0.05
+lora_rank: 16
+lora_targets:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+lr_adapter: 0.0001
+lr_lm: 1.0e-05
+lr_scheduler: cosine
+max_nums_length: 64
+max_target_length: 512
+min_lr_ratio: 0.0
+num_workers: 4
+optimizer: adamw
+pin_memory: true
+prompt: Describe the quality of this recording.
+prompt_nums: 'List the numerical features of this recording:'
+prompt_prose: Describe the quality of this recording.
+resume_from: null
+save_dir: /ocean/projects/cis260125p/shared/checkpoints/v15v3_l02
+section_d_k: 256
+section_d_v: 256
+section_query_mode: dynamic
+seed: 73
+semantic_tag_init: false
+spec_checkpoint_name: BEATs_iter3_plus_AS2M.pt
+spec_d_patch: 768
+spec_encoder_name: beats
+spec_freeze: true
+tagged_mode: true
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+use_sections: true
+val_sfs_n: 32
+wandb_entity: speech_quality_adapter
+wandb_project: aqua-nl-emnlp
+wandb_run_name: v15v3-l02
+warmup_ratio: 0.03
+weight_decay: 0.01
