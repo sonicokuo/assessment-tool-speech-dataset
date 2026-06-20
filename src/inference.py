@@ -602,7 +602,15 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             target_claims = claim_parser.parse(sample["target_text"])
             ground_truth = {c.feature: c.value for c in target_claims}
 
-        if sample["overlap_segments"] and "overlap_segments" not in ground_truth:
+        # Only score overlap spans when the model is trained to emit them (tagged/
+        # section path). Untagged targets are built with --no-overlap-segments and
+        # never mention spans, so adding an "overlap_span" entry to the SFS recall
+        # denominator would cap recall (8/9) for a feature the model never produces.
+        # score_overlap_spans defaults True (read from the ckpt's embedded config via
+        # _sync_config_with_checkpoint); untagged configs set it False.
+        if (config.get("score_overlap_spans", True)
+                and sample["overlap_segments"]
+                and "overlap_segments" not in ground_truth):
             ground_truth["overlap_segments"] = sample["overlap_segments"]
 
         # SFS scoring — save per_feature too so the aggregate can be rebuilt

@@ -45,6 +45,12 @@ tagged_mode: false
 # rows, set use_sections=true on the CLI.
 use_sections: false
 
+# SFS recall denominator: only count overlap spans as a scorable GT feature when
+# the model is trained to emit them (tagged/section path). This run is untagged with
+# --no-overlap-segments targets, so spans are never produced; including overlap_span
+# in the denominator caps recall at 8/9 on every overlap clip. False keeps it honest.
+score_overlap_spans: false
+
 # Spec encoder configuration. Default is BEATs (vendored under src/beats/);
 # AST is available via spec_encoder_name="ast" — see src/spec_encoder.py.
 spec_encoder_name: "beats"

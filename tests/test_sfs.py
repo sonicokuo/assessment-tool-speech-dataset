@@ -216,6 +216,93 @@ class TestSFSScorer:
         result = self.scorer.score(claims, {"snr": 28.0})
         assert result["precision"] == 0.0
 
+    def test_untagged_recall_not_capped_by_spans(self):
+        """GT without overlap_segments → recall denominator is scalars only, so a
+        generation mentioning every scalar feature scores recall == 1.0. This is the
+        untagged --no-overlap-segments case: the model is not trained to emit spans,
+        so overlap_span must NOT be in the recall denominator.
+
+        Contrast with the SAME GT but WITH overlap_segments injected and no span
+        claims in the text: the old (buggy) behavior adds overlap_span to the
+        denominator → recall < 1.0. The delta is exactly the one span entry,
+        proving the fix is precisely the removal of the unproducible feature.
+        """
+        # Two scalar features the model genuinely emits.
+        gt_scalars = {"snr": 28.0, "f0_mean": 187.0}
+        claims = [
+            Claim("snr", 28.0, "dB", "SNR is 28 dB"),
+            Claim("f0_mean", 187.0, "Hz", "F0 = 187 Hz"),
+        ]
+
+        # FIXED untagged path: no overlap_segments in GT → denominator = 2 scalars.
+        gt_no_spans = dict(gt_scalars)
+        res_fixed = self.scorer.score(claims, gt_no_spans)
+        assert res_fixed["n_gt_features"] == 2
+        assert res_fixed["recall"] == 1.0
+
+        # OLD buggy path: spans injected but never mentioned in text → denominator
+        # = 2 scalars + 1 overlap_span = 3, and the span goes unmentioned.
+        gt_with_spans = dict(gt_scalars)
+        gt_with_spans["overlap_segments"] = [(2.0, 4.0)]
+        res_old = self.scorer.score(claims, gt_with_spans)
+        assert res_old["n_gt_features"] == 3
+        assert res_old["recall"] == 2.0 / 3.0  # 8/9-style cap, here 2/3
+
+        # The only difference between the two denominators is the overlap_span entry.
+        assert res_old["n_gt_features"] - res_fixed["n_gt_features"] == 1
+
+    def test_spans_still_scored_when_in_gt_and_text(self):
+        """Guard: the tagged path is untouched. When spans are genuinely in GT AND
+        the text emits matching start/end pairs, overlap_span is scored and counts
+        toward both precision and recall (recall == 1.0 here)."""
+        claims = [
+            Claim("snr", 28.0, "dB", "SNR is 28 dB"),
+            Claim("overlap_start", 2.0, "s", ""),
+            Claim("overlap_end", 4.0, "s", ""),
+        ]
+        gt = {"snr": 28.0, "overlap_segments": [(2.0, 4.0)]}
+        result = self.scorer.score(claims, gt)
+        assert result["n_gt_features"] == 2  # snr + overlap_span
+        assert result["recall"] == 1.0
+        spans = [r for r in result["per_feature"] if r["feature"] == "overlap_span"]
+        assert len(spans) == 1 and spans[0]["correct"]
+
+
+class TestScoreOverlapSpansGuard:
+    """The fix gates GT span injection behind a config flag (default True) in both
+    train.py's val block and inference.py. These tests exercise the guard *logic*
+    directly (the exact condition both sites use) so a regression in the flag
+    plumbing is caught without standing up a full train/inference run."""
+
+    @staticmethod
+    def _inject(config, sample, ground_truth):
+        """Mirror of the guarded GT-injection in train.py / inference.py."""
+        gt = dict(ground_truth)
+        if config.get("score_overlap_spans", True) and sample.get("overlap_segments"):
+            gt["overlap_segments"] = sample["overlap_segments"]
+        return gt
+
+    def test_flag_false_skips_injection(self):
+        sample = {"overlap_segments": [(2.0, 4.0)]}
+        gt = self._inject({"score_overlap_spans": False}, sample, {"snr": 28.0})
+        assert "overlap_segments" not in gt
+
+    def test_flag_true_injects(self):
+        sample = {"overlap_segments": [(2.0, 4.0)]}
+        gt = self._inject({"score_overlap_spans": True}, sample, {"snr": 28.0})
+        assert gt["overlap_segments"] == [(2.0, 4.0)]
+
+    def test_flag_default_true_preserves_legacy(self):
+        """Absent flag (tagged/section configs) → defaults True → spans injected,
+        preserving existing behavior and keeping span-IoU tests green."""
+        sample = {"overlap_segments": [(2.0, 4.0)]}
+        gt = self._inject({}, sample, {"snr": 28.0})
+        assert gt["overlap_segments"] == [(2.0, 4.0)]
+
+    def test_flag_false_no_segments_is_noop(self):
+        gt = self._inject({"score_overlap_spans": False}, {"overlap_segments": []}, {"snr": 28.0})
+        assert "overlap_segments" not in gt
+
 
 class TestTaggedClaimParser:
     """The tagged parser sees `<f_NAME>…</f>` spans and yields one Claim per

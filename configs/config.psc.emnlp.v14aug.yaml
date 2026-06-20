@@ -60,6 +60,9 @@ top_k: 0
 top_p: 1.0
 use_sections: false
 val_sfs_n: 32
+# Untagged --no-overlap-segments targets never emit spans; don't count overlap_span
+# in the SFS recall denominator (would cap recall at 8/9 on overlap clips).
+score_overlap_spans: false
 wandb_entity: speech_quality_adapter
 wandb_project: aqua-nl-emnlp
 wandb_run_name: v14-aug-noise

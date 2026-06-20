@@ -1350,7 +1350,14 @@ def train(config: dict) -> None:
                     target_text = sample.get("target_text", "") or ""
                     target_claims = claim_parser.parse(target_text)
                     ground_truth = {c.feature: c.value for c in target_claims}
-                    if sample.get("overlap_segments"):
+                    # Only put overlap spans into the GT when the model is actually
+                    # trained to emit them (tagged/section path). Untagged targets are
+                    # built with --no-overlap-segments and never mention spans, so
+                    # injecting them here would add an "overlap_span" entry to the SFS
+                    # recall denominator that the model can never satisfy (caps recall
+                    # at 8/9 on every overlap clip). Gated by score_overlap_spans
+                    # (default True preserves the tagged-path behavior).
+                    if config.get("score_overlap_spans", True) and sample.get("overlap_segments"):
                         ground_truth["overlap_segments"] = sample["overlap_segments"]
                     pred_claims = claim_parser.parse(gen_text)
 

@@ -31,6 +31,9 @@ lora_dropout: 0.05
 # entirely from the decoupled head below, NOT from tagged decoding.
 tagged_mode: false
 use_sections: false
+# Untagged --no-overlap-segments targets never emit spans; don't count overlap_span
+# in the SFS recall denominator (would cap recall at 8/9 on overlap clips).
+score_overlap_spans: false
 
 # ── Decoupled grounding head (the v16 novelty) ─────────────────────────────────
 # Token-free per-feature 2D attention maps, trained as a PARALLEL branch off the
