@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from peft import LoraConfig, get_peft_model
 
 from adapter import build_adapter
+from ckpt_io import load_llm_state_dict
 from dataset import PreprocessedDataset
 from sfs import HybridClaimParser, SFSScorer
 from text_metrics import compute_generation_metrics
@@ -432,8 +433,15 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     )
     adapter.load_state_dict(checkpoint["adapter_state_dict"])
     # New checkpoints use `llm_state_dict`; legacy ones used `lora_state_dict`.
+    # SLIM ckpts (ckpt_format="peft_slim") carry only LoRA + unfrozen rows and load
+    # strict=False over the already-built (from_pretrained + get_peft_model) base;
+    # old FAT ckpts carry the full base and load strict. See src/ckpt_io.py.
     llm_sd = checkpoint.get("llm_state_dict") or checkpoint["lora_state_dict"]
-    llm.load_state_dict(llm_sd)
+    _missing, _unexpected = load_llm_state_dict(
+        llm, llm_sd, ckpt_format=checkpoint.get("ckpt_format"),
+    )
+    if _unexpected:
+        raise RuntimeError(f"Unexpected keys loading LLM checkpoint: {_unexpected[:5]} ...")
 
     # Section-query head (EMNLP rework, Path 3). Same gate as in train.py.
     section_head: SectionQueryHead | None = None

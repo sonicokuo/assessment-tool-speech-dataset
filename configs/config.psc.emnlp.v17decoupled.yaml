@@ -73,6 +73,10 @@ temperature: 1.0
 top_k: 0
 top_p: 1.0
 use_sections: false
+# Per-epoch val SFS subset (FIX 2): 256 stratified-by-overlap clips, fixed across
+# epochs. 32 (val_sfs_n, kept as fallback) gave bootstrap CI ±0.06 — too noisy to
+# rank epochs / pick best.pt. Cost ≈256 greedy generations/epoch (~a few min).
+val_subset_size: 256
 val_sfs_n: 32
 # Untagged --no-overlap-segments targets never emit spans; don't count overlap_span
 # in the SFS recall denominator (would cap recall at 8/9 on overlap clips).

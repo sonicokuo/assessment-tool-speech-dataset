@@ -51,6 +51,12 @@ from decoupled_grounding import (
 )
 # Degeneration-aware, lower-variance best-checkpoint selection.
 from ckpt_selection import seeded_val_indices, should_save_best
+from ckpt_io import (
+    CKPT_FORMAT_SLIM,
+    slim_llm_state_dict,
+    load_llm_state_dict,
+    overlap_strata_from_csv_map,
+)
 from spec_encoder import SpecEncoder
 
 
@@ -1006,15 +1012,29 @@ def train(config: dict) -> None:
         checkpoint = torch.load(config["resume_from"], weights_only=False)
         adapter.load_state_dict(checkpoint["adapter_state_dict"])
         # New checkpoints use "llm_state_dict"; pre-2026-05-11 ones used "lora_state_dict".
+        # SLIM ckpts (ckpt_format="peft_slim") carry only LoRA + unfrozen rows — loaded
+        # with strict=False over the already-restored frozen base. Old FAT ckpts carry
+        # the full base — auto-detected and loaded strict. See src/ckpt_io.py.
         llm_sd = checkpoint.get("llm_state_dict") or checkpoint["lora_state_dict"]
-        llm.load_state_dict(llm_sd)
+        _missing, _unexpected = load_llm_state_dict(
+            llm, llm_sd, ckpt_format=checkpoint.get("ckpt_format"),
+        )
+        if _unexpected:
+            raise RuntimeError(f"Unexpected keys loading LLM checkpoint: {_unexpected[:5]} ...")
         if section_head is not None and "section_head_state_dict" in checkpoint:
             section_head.load_state_dict(checkpoint["section_head_state_dict"])
         if readout_head is not None and "readout_head_state_dict" in checkpoint:  # [section_readout]
             readout_head.load_state_dict(checkpoint["readout_head_state_dict"])
         if decoupled_head is not None and "decoupled_head_state_dict" in checkpoint:  # [decoupled_grounding]
             decoupled_head.load_state_dict(checkpoint["decoupled_head_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # best.pt no longer carries optimizer/scheduler (inference-only). Resuming is
+        # meant to use last.pt, which does. Guard so resuming from a best.pt (or any
+        # optimizer-less ckpt) doesn't KeyError — it just starts fresh optimizer state.
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        else:
+            print("  [resume] no optimizer_state_dict in checkpoint (best.pt?) — "
+                  "starting optimizer from scratch. Resume from last.pt for exact continuation.")
         if "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
@@ -1055,6 +1075,26 @@ def train(config: dict) -> None:
     os.makedirs(config["save_dir"], exist_ok=True)
 
     max_steps = int(config["max_steps"]) if config.get("max_steps") else None
+
+    # ── Per-epoch val SFS subset (FIX 2) ──────────────────────────────────────
+    # val_subset_size clips are scored every epoch for val SFS. 32 was too noisy
+    # to rank epochs / select best.pt (bootstrap CI ±0.06); 256 roughly halves
+    # the noise. The subset is FIXED across epochs (same seed, same clips) so
+    # epoch-to-epoch SFS deltas are paired/comparable. When the val features CSV
+    # exposes overlap_ratio, the subset is STRATIFIED across low/med/high overlap
+    # bins so it stays representative; otherwise it's a seeded uniform draw.
+    # COST: ~val_subset_size greedy generations per epoch (≈256 × ~0.3-1 s on an
+    # 8B LoRA on PSC ⇒ a few minutes/epoch). Backward-compat: if val_subset_size
+    # is absent, fall back to the legacy val_sfs_n (default 32).
+    val_subset_size = int(config.get("val_subset_size", config.get("val_sfs_n", 32)))
+    val_strata = overlap_strata_from_csv_map(val_set.files, val_set.feature_csv_map)
+    if val_strata is not None:
+        from collections import Counter as _Counter
+        print(f"[val-subset] size={val_subset_size}, stratified by overlap bin: "
+              f"{dict(_Counter(val_strata))}")
+    else:
+        print(f"[val-subset] size={val_subset_size}, seeded uniform "
+              f"(no overlap_ratio in val features CSV)")
 
     # Readout-grounding warmup: the readout gradient destabilizes generation in
     # dynamic mode (v12: lambda 0.5 -> 31% degenerate). Ramp it in over the first
@@ -1284,15 +1324,16 @@ def train(config: dict) -> None:
 
             sample_rows = []
             sfs_f1s, sfs_precs, sfs_recs = [], [], []
-            # val_sfs_n controls the val-time generation sample count. Default 32 (was 8) —
-            # 8 was too noisy to read F1 trends across epochs; 32 cuts noise floor in half
-            # for ~2 minutes additional generation time per epoch.
-            # Seeded RANDOM subset (stable across epochs), not the biased first-N
-            # prefix slice — see ckpt_selection.seeded_val_indices.
+            # val_subset_size (FIX 2) controls the val-time generation sample count.
+            # Default 256 (was 32) — 32's bootstrap CI (±0.06) was too noisy to rank
+            # epochs / select best.pt; 256 roughly halves the noise floor. Computed
+            # once above (size + overlap strata); the seeded+stratified subset is the
+            # SAME clips every epoch so cross-epoch SFS deltas are paired.
             val_idx = seeded_val_indices(
                 len(val_set),
-                config.get("val_sfs_n", 32),
+                val_subset_size,
                 seed=config.get("val_sfs_seed", 1234),
+                strata=val_strata,
             )
             n_samples = len(val_idx)
 
@@ -1482,23 +1523,34 @@ def train(config: dict) -> None:
 
         # Save best — selected on val_sfs_f1 (higher = better). avg_sfs_f1 is set
         # when val-time generation runs (val_sfs_n > 0); skip selection on epochs where it didn't.
-        def _ckpt_payload(epoch_idx: int) -> dict:
-            # New canonical key is `llm_state_dict` (covers both LoRA and full-FT
-            # weights). The pre-existing `lora_state_dict` alias is kept so older
-            # tools that look for that key still find the same tensor.
-            llm_sd = llm.state_dict()
+        def _ckpt_payload(epoch_idx: int, save_optimizer: bool = True) -> dict:
+            # SLIM checkpoints (2026-06): the LLM portion is the ADAPTER ONLY — LoRA
+            # tensors + any requires_grad rows (tagged-mode embed/lm_head). The frozen
+            # 8B base is dropped (it is restored at load time by from_pretrained), so a
+            # LoRA-r16 ckpt shrinks ~17 GB → ~0.2 GB. See src/ckpt_io.py.
+            #   - `llm_state_dict` is the canonical key; `lora_state_dict` is the legacy
+            #     alias — both point at the same slim dict (back-compat with the getter
+            #     in inference.py / the resume path).
+            #   - `ckpt_format = "peft_slim"` tags the new format so loaders take the
+            #     strict=False path; old fat ckpts lack the tag and are auto-detected.
+            #   - optimizer/scheduler are written ONLY for last.pt (save_optimizer=True),
+            #     since best.pt is inference-only. This drops the full Adam state (which,
+            #     even slimmed, only tracks trainable params) from best.pt.
+            llm_sd = slim_llm_state_dict(llm)
             payload = {
                 "epoch": epoch_idx,
+                "ckpt_format": CKPT_FORMAT_SLIM,
                 "adapter_state_dict": adapter.state_dict(),
                 "llm_state_dict": llm_sd,
                 "lora_state_dict": llm_sd,  # legacy alias
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
                 "best_val_sfs_f1": best_val_sfs_f1,
                 "wandb_run_id": wandb_run_id,
                 "config": config,
                 "added_special_tokens": list(TAG_SPECIAL_TOKENS) if config.get("tagged_mode") else [],
             }
+            if save_optimizer:
+                payload["optimizer_state_dict"] = optimizer.state_dict()
+                payload["scheduler_state_dict"] = scheduler.state_dict()
             if section_head is not None:
                 payload["section_head_state_dict"] = section_head.state_dict()
             if readout_head is not None:  # [section_readout]
@@ -1545,7 +1597,8 @@ def train(config: dict) -> None:
         if _save_best:
             best_val_sfs_f1 = avg_sfs_f1
             best_path = os.path.join(config["save_dir"], "best.pt")
-            _atomic_save(_ckpt_payload(epoch), best_path)
+            # best.pt is inference-only → omit optimizer/scheduler.
+            _atomic_save(_ckpt_payload(epoch, save_optimizer=False), best_path)
             print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
             if config.get("upload_ckpt_to_wandb", True):
                 run_name = (wandb.run.name if wandb.run is not None else None) or "run"
@@ -1555,8 +1608,11 @@ def train(config: dict) -> None:
                     metadata={"epoch": epoch, "val_sfs_f1": best_val_sfs_f1},
                 )
 
-        # Save last (for resuming)
-        _atomic_save(_ckpt_payload(epoch), os.path.join(config["save_dir"], "last.pt"))
+        # Save last (for resuming) — keeps optimizer + scheduler so --resume_from works.
+        _atomic_save(
+            _ckpt_payload(epoch, save_optimizer=True),
+            os.path.join(config["save_dir"], "last.pt"),
+        )
         print("Saved epoch model")
 
     wandb.finish()
