@@ -154,6 +154,75 @@ class TestClaimParser:
         assert "shimmer" in features
         assert "speaking_rate" in features
 
+    # ── Combined-phrasing artifact (F0 / speaking_rate / F0 deviation) ──────
+    # The model sometimes states F0 alongside a second feature in one sentence.
+    # The Hz unit disambiguates which listed number is F0; the unitless second
+    # value (voice probability) must NOT become a scored feature.
+
+    def test_f0_combined_with_voice_probability(self):
+        claims = self.parser.parse(
+            "The F0 and voice probability are 172.26 Hz and 0.9821 respectively."
+        )
+        by_feat = {c.feature: c.value for c in claims}
+        # F0 binds to the Hz number.
+        assert by_feat.get("f0_mean") == 172.26
+        # The unitless 0.9821 (voice probability) is NOT any scored feature.
+        assert by_feat == {"f0_mean": 172.26}
+        assert all(c.value != 0.9821 for c in claims)
+
+    def test_f0_combined_with_speaking_rate(self):
+        claims = self.parser.parse(
+            "The F0 and speaking rate are 130.16 Hz and 5.221 syl/sec."
+        )
+        by_feat = {c.feature: c.value for c in claims}
+        # Hz number → f0_mean; syl/sec number → speaking_rate.
+        assert by_feat.get("f0_mean") == 130.16
+        assert by_feat.get("speaking_rate") == 5.221
+        assert by_feat == {"f0_mean": 130.16, "speaking_rate": 5.221}
+
+    def test_f0_deviation_is_f0_sd_not_f0_mean(self):
+        claims = self.parser.parse("The F0 deviation is 120.00 Hz.")
+        by_feat = {c.feature: c.value for c in claims}
+        # "F0 deviation" == F0 standard deviation → f0_sd.
+        assert by_feat.get("f0_sd") == 120.0
+        # Must NOT leak into f0_mean.
+        assert "f0_mean" not in by_feat
+        assert by_feat == {"f0_sd": 120.0}
+
+    def test_f0_combined_does_not_capture_unitless_value(self):
+        # Negative guard: the second, unitless number in a combined F0 sentence
+        # must never be parsed as a feature, regardless of its magnitude.
+        claims = self.parser.parse(
+            "The F0 and voice probability are 172.26 Hz and 0.9821 respectively."
+        )
+        values = {c.value for c in claims}
+        assert 0.9821 not in values
+
+    def test_f0_mean_phrasings_still_work(self):
+        # Regression guard: the pre-existing F0-mean phrasings must keep parsing
+        # and must NOT be hijacked by the new combined / deviation patterns.
+        for text, val in [
+            ("F0 = 187 Hz", 187.0),
+            ("The F0 mean is 186.69 Hz.", 186.69),
+            ("fundamental frequency mean is 200.5 Hz", 200.5),
+        ]:
+            claims = self.parser.parse(text)
+            by_feat = {c.feature: c.value for c in claims}
+            assert by_feat.get("f0_mean") == val
+            assert "f0_sd" not in by_feat
+
+    def test_speaking_rate_combined_does_not_steal_articulation(self):
+        # Negative guard: when an articulation-rate number trails a "speaking rate"
+        # mention in the same clause, the combined speaking-rate pattern must NOT
+        # bind the articulation number to speaking_rate.
+        claims = self.parser.parse(
+            "The speaking rate is moderate, with articulation rate of 5.0 syl/sec."
+        )
+        by_feat = {c.feature: c.value for c in claims}
+        # articulation_rate is captured; speaking_rate must NOT grab 5.0.
+        assert by_feat.get("articulation_rate") == 5.0
+        assert by_feat.get("speaking_rate") != 5.0
+
 
 class TestSFSScorer:
     def setup_method(self):

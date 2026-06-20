@@ -47,6 +47,22 @@ class ClaimParser:
             r"(?:F0\s*(?:mean\s*)?|(?:mean\s+)?pitch(?:\s+mean)?|fundamental\s+frequency(?:\s+mean)?)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
             [("f0_mean", 1, "Hz")],
         ),
+        # Combined phrasing the model emits when it states F0 alongside a second
+        # feature in one sentence: "The F0 and voice probability are 172.26 Hz and
+        # 0.9821 respectively." / "The F0 and speaking rate are 130.16 Hz and 5.221
+        # syl/sec." The base F0 pattern above misses these because the "(=|is|of)"
+        # connector does not sit directly after "F0" (the words "and X are" intervene).
+        # We anchor on the *Hz* unit to disambiguate which of the two listed numbers is
+        # F0: only the Hz-denominated value binds to f0_mean, so the unitless second
+        # value (voice probability 0.9821) and the syl/sec value are never captured here.
+        # The gap "(?:[^.]|\.\d)*?" allows decimal points inside numbers but blocks
+        # sentence-ending periods so the match cannot cross a sentence boundary.
+        # Requires "F0 and" (not bare "F0"/"F0 mean"/"F0 deviation"), so it never
+        # competes with the base f0_mean or the f0_sd "deviation" patterns.
+        (
+            r"F0\s+and\b(?:[^.]|\.\d)*?\b(?:are|is)\s+(\d+\.?\d*)\s*Hz",
+            [("f0_mean", 1, "Hz")],
+        ),
         # Formants: F1, F2, F3, F4
         (
             r"(F[1-4])\s*(?:=|≈|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
@@ -86,6 +102,17 @@ class ClaimParser:
             r"(\d+\.?\d*)\s*syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?\s+for\s+the\s+speaking\s+rate",
             [("speaking_rate", 1, "syl/s")],
         ),
+        # Combined phrasing: "The F0 and speaking rate are 130.16 Hz and 5.221 syl/sec."
+        # The tightened speaking-rate pattern above misses this because the syl/sec number
+        # is not adjacent to "speaking rate" (the F0 value and "Hz and" intervene). We grab
+        # the *syl/sec-denominated* number, skipping over the intervening Hz value. The gap
+        # "(?:(?!articulation)(?:[^.]|\.\d))*?" allows decimals, blocks sentence periods, and
+        # refuses to cross the word "articulation" so a trailing articulation-rate number
+        # (a different feature) is never mis-bound to speaking_rate.
+        (
+            r"speaking\s+rate\b(?:(?!articulation)(?:[^.]|\.\d))*?(\d+\.?\d*)\s*syl(?:lables?)?\s*(?:/\s*|per\s+)s(?:ec(?:ond)?)?",
+            [("speaking_rate", 1, "syl/s")],
+        ),
         # Duration — "The duration of the speech sample is X s" / "duration is X s"
         (
             r"duration(?:\s+of\s+the\s+(?:speech\s+)?sample)?\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*s(?!yl)",
@@ -112,9 +139,13 @@ class ClaimParser:
             [("overlap_ratio", 1, "")],
         ),
         # F0 standard deviation — "F0 standard deviation SD is X Hz",
-        # "F0 SD is X Hz", and "F0 standard deviation (SD) is X Hz".
+        # "F0 SD is X Hz", "F0 standard deviation (SD) is X Hz", and the model's
+        # shorthand "F0 deviation is X Hz" ("standard" omitted). "standard" is made
+        # optional so bare "deviation" maps to f0_sd; this does NOT leak into f0_mean
+        # because the base/combined f0_mean patterns require an "is/of/=" connector or
+        # "and" directly after "F0", never the word "deviation".
         (
-            r"F0\s+(?:standard\s+deviation(?:\s*\(?\s*SD\s*\)?)?|SD)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
+            r"F0\s+(?:(?:standard\s+)?deviation(?:\s*\(?\s*SD\s*\)?)?|SD)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
             [("f0_sd", 1, "Hz")],
         ),
         # Fallback for split phrasings like "F0 mean is X Hz with a standard deviation SD of Y Hz"
