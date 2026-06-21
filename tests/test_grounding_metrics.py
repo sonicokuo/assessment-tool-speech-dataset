@@ -11,6 +11,8 @@ from grounding_metrics import (  # noqa: E402
     freq_mass,
     time_concentration_ratio,
     freq_band_concentration_ratio,
+    iou_time,
+    pointing_game,
 )
 
 NF = 8
@@ -90,6 +92,54 @@ def test_freq_band_none_cases():
     assert freq_band_concentration_ratio(_grid([1, 1], [1] * NF), [], NF) is None
     # out-of-range band rows filtered out → None
     assert freq_band_concentration_ratio(_grid([1, 1], [1] * NF), [99, 100], NF) is None
+
+
+# ── time-axis IoU (bottleneck keep-mask vs oracle spans) ─────────────────────
+def test_iou_time_planted_band_is_one():
+    # planted overlap mass in bins 4-5 of 10 over 1.0 s → window [0.4,0.6)
+    tp = [0.0] * 10
+    tp[4] = tp[5] = 1.0
+    r = iou_time(_grid(tp, [1] * NF), [(0.4, 0.6)], duration=1.0, n_freq=NF, thresh=0.0)
+    assert r is not None and r["iou"] > 0.99
+    assert r["n_pred"] == 2 and r["n_gt"] == 2
+
+
+def test_iou_time_disjoint_is_zero():
+    tp = [0.0] * 10
+    tp[0] = tp[1] = 1.0                     # mass at the start
+    r = iou_time(_grid(tp, [1] * NF), [(0.8, 1.0)], duration=1.0, n_freq=NF, thresh=0.0)
+    assert r is not None and r["iou"] == 0.0
+
+
+def test_iou_time_median_threshold_default():
+    # a diffuse-but-peaked map; median threshold keeps the above-median bins.
+    tp = [0.1] * 10
+    tp[5] = 1.0
+    r = iou_time(_grid(tp, [1] * NF), [(0.5, 0.6)], duration=1.0, n_freq=NF)  # median
+    assert r is not None and 0.0 <= r["iou"] <= 1.0
+
+
+def test_iou_time_none_cases():
+    assert iou_time(_grid([1, 1], [1] * NF), [], 1.0, NF) is None
+    assert iou_time(_grid([1, 1], [1] * NF), [(0, 0.5)], 0.0, NF) is None
+    assert iou_time([0.0] * (4 * NF), [(0, 0.5)], 1.0, NF) is None
+
+
+# ── pointing game (argmax bin inside a window?) ──────────────────────────────
+def test_pointing_game_hit_and_miss():
+    tp = [0.0] * 10
+    tp[4] = tp[5] = 1.0
+    hit = pointing_game(_grid(tp, [1] * NF), [(0.4, 0.6)], duration=1.0, n_freq=NF)
+    assert hit is not None and hit["hit"] is True
+    tp2 = [1.0] * 10
+    tp2[4] = tp2[5] = 0.0
+    miss = pointing_game(_grid(tp2, [1] * NF), [(0.4, 0.6)], duration=1.0, n_freq=NF)
+    assert miss is not None and miss["hit"] is False
+
+
+def test_pointing_game_none_cases():
+    assert pointing_game(_grid([1, 1], [1] * NF), [], 1.0, NF) is None
+    assert pointing_game([0.0] * (3 * NF), [(0, 0.5)], 1.0, NF) is None
 
 
 if __name__ == "__main__":

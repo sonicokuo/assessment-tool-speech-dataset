@@ -76,6 +76,97 @@ def time_concentration_ratio(
             "ratio": float(mass_in / frac), "n_bins": t_p}
 
 
+def _time_bin_in_windows(t_p: int, windows, duration: float) -> np.ndarray:
+    """Binary (t_p,) GT vector: True where time-bin i overlaps any window."""
+    gt = np.zeros(t_p, dtype=bool)
+    if not windows or duration <= 0:
+        return gt
+    bin_dur = duration / t_p
+    for i in range(t_p):
+        t0, t1 = i * bin_dur, (i + 1) * bin_dur
+        if any(t0 < e and t1 > s for s, e in windows):
+            gt[i] = True
+    return gt
+
+
+def iou_time(
+    alpha_flat,
+    windows: list[tuple[float, float]],
+    duration: float,
+    n_freq: int = F_P_DEFAULT,
+    thresh: str | float = "median",
+) -> dict | None:
+    """Time-axis IoU of a thresholded keep-map vs the oracle GT time windows.
+
+    The keep-map (or attention map) is marginalized over frequency to a per-time-bin
+    mass, thresholded to a binary keep-set, and intersected/unioned with the GT
+    binary time-bin vector built from `windows` + `duration` (same bin logic as
+    time_concentration_ratio). Designed for the BOTTLENECK keep-mask λ̄ (which does
+    not sum to 1) as well as a softmax map.
+
+    Args:
+        alpha_flat: flat (t_p*n_freq) map (keep-probs or attention).
+        windows:    oracle time spans [(start_s, end_s), ...] (overlap / pause).
+        duration:   clip duration in seconds.
+        thresh:     "median" → threshold at the median of the per-bin mass; "mean" →
+                    the mean; a float in [0,1] → an absolute threshold on the mass
+                    (use this for a true keep-probability map where 0.5 is natural).
+    Returns:
+        {iou, pred_frac, gt_frac, n_bins, n_pred, n_gt} or None when there are no
+        windows, no duration, zero mass, or the union is empty.
+    """
+    if not windows or duration <= 0:
+        return None
+    tm = time_mass(alpha_flat, n_freq)
+    if tm.sum() <= 0:
+        return None
+    t_p = len(tm)
+    if isinstance(thresh, str):
+        thr = float(np.median(tm)) if thresh == "median" else float(np.mean(tm))
+    else:
+        thr = float(thresh)
+    pred = tm > thr
+    gt = _time_bin_in_windows(t_p, windows, duration)
+    inter = int(np.logical_and(pred, gt).sum())
+    union = int(np.logical_or(pred, gt).sum())
+    if union == 0:
+        return None
+    return {
+        "iou": float(inter / union),
+        "pred_frac": float(pred.mean()),
+        "gt_frac": float(gt.mean()),
+        "n_bins": t_p,
+        "n_pred": int(pred.sum()),
+        "n_gt": int(gt.sum()),
+    }
+
+
+def pointing_game(
+    alpha_flat,
+    windows: list[tuple[float, float]],
+    duration: float,
+    n_freq: int = F_P_DEFAULT,
+) -> dict | None:
+    """Pointing-game hit: does the argmax time-bin of the map fall inside any window?
+
+    Threshold-free localization metric (Zhang 2018). Marginalize over frequency,
+    take the peak time-bin, and check whether its center lies in any GT window.
+
+    Returns {hit, peak_bin, peak_time, n_bins} or None on no windows / zero mass.
+    """
+    if not windows or duration <= 0:
+        return None
+    tm = time_mass(alpha_flat, n_freq)
+    if tm.sum() <= 0:
+        return None
+    t_p = len(tm)
+    bin_dur = duration / t_p
+    peak = int(np.argmax(tm))
+    center = (peak + 0.5) * bin_dur
+    hit = any(s <= center < e for s, e in windows)
+    return {"hit": bool(hit), "peak_bin": peak, "peak_time": float(center), "n_bins": t_p}
+
+
 def freq_band_concentration_ratio(
     alpha_flat,
     band_rows: list[int],

@@ -626,8 +626,13 @@ def compute_loss(
         and lambda_decoupled > 0.0
         and batch is not None
     ):
+        # [bottleneck] effective bits weight (per-epoch warmed in the train loop;
+        # stored back into config as 'bits_lambda_effective'). 0 in softmax mode or
+        # during bits warmup → no bits penalty, identical to the pure-Huber term.
+        bits_lambda_eff = float(config.get("bits_lambda_effective", 0.0))
         d_loss, d_metrics = decoupled_grounding_loss_term(
             decoupled_head, batch, lambda_decoupled, device,
+            bits_lambda=bits_lambda_eff,
         )
         if d_loss is not None:
             decoupled_loss = d_loss.to(lm_loss_prose.dtype)
@@ -827,6 +832,17 @@ def train(config: dict) -> None:
                 f"decoupled_feature_init_bias must have {N_FEATURES} entries "
                 f"(SUPERVISED_FEATURES order), got {len(feature_init_bias)}"
             )
+        # [bottleneck] grounding_mode selects v17 softmax (default) vs v18 bottleneck
+        # (hard-concrete keep-mask + noise substitution + bits penalty). The v18 head
+        # is the SAME size; the bottleneck path is additive and config-gated, so
+        # softmax/v17 stays bit-identical when grounding_mode is "softmax" or omitted.
+        grounding_mode = str(config.get("grounding_mode", "softmax"))
+        # Per-feature bits-penalty β (dict {short_name: float} | list | None). None →
+        # the head's catalog defaults (β=0 for the 5 global feats, 0.02 pauses, 0.05
+        # overlap_ratio). Only consumed in bottleneck mode.
+        bits_beta = config.get("bits_beta_per_feature")
+        concrete_temp_start = float(config.get("concrete_temp_start",
+                                               config.get("concrete_temp", 1.0)))
         # Kept in float32 (NOT bf16) for regression precision, like SectionReadoutHead.
         decoupled_head = DecoupledGroundingHead(
             d_model=int(config.get("decoupled_d_model", 256)),
@@ -836,11 +852,20 @@ def train(config: dict) -> None:
             readout_hidden=config.get("decoupled_readout_hidden"),  # None → linear bottleneck
             huber_delta=float(config.get("decoupled_huber_delta", 1.0)),
             feature_init_bias=feature_init_bias,  # None → zeros; else per-feature raw means
+            grounding_mode=grounding_mode,
+            bits_beta_per_feature=bits_beta,
+            concrete_temp=concrete_temp_start,
         ).to(device)
-        print(f"[decoupled_grounding] enabled: lambda_decoupled="
-              f"{config.get('lambda_decoupled', 0.0)}, d_model={config.get('decoupled_d_model', 256)}, "
+        print(f"[decoupled_grounding] enabled: grounding_mode={grounding_mode}, "
+              f"lambda_decoupled={config.get('lambda_decoupled', 0.0)}, "
+              f"d_model={config.get('decoupled_d_model', 256)}, "
               f"d_patch={config.get('spec_d_patch', 768)}, n_features={N_FEATURES}, "
               f"feature_init_bias={'set' if feature_init_bias is not None else 'zeros'}")
+        if grounding_mode == "bottleneck":
+            print(f"[decoupled_grounding] bottleneck: beta={decoupled_head.bits_beta.tolist()}, "
+                  f"concrete_temp={concrete_temp_start}→{config.get('concrete_temp_end', 0.3)}, "
+                  f"bits_warmup_epochs={config.get('bits_warmup_epochs', 0)}, "
+                  f"bits_lambda={config.get('bits_lambda', 1.0)}")
 
     # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
     # after wandb.init() below. Helps compare adapter vs LoRA/full-FT footprint across runs.
@@ -1103,12 +1128,44 @@ def train(config: dict) -> None:
     _readout_target = float(config.get("lambda_readout", 0.0))
     _readout_warmup = int(config.get("lambda_readout_warmup_epochs", 0))
 
+    # [bottleneck] bits-penalty warmup + concrete-temperature anneal. The bits term
+    # is β=0 for the first `bits_warmup_epochs` (the readout learns to predict from
+    # the FULL representation first), then the GLOBAL bits weight ramps in like
+    # lambda_readout; concrete_temp anneals linearly start→end so the keep-mask
+    # sharpens toward 0/1 by the end of training. Only active in bottleneck mode.
+    _is_bottleneck = (
+        decoupled_head is not None
+        and getattr(decoupled_head, "grounding_mode", "softmax") == "bottleneck"
+    )
+    _bits_lambda_target = float(config.get("bits_lambda", 1.0))
+    _bits_warmup = int(config.get("bits_warmup_epochs", 0))
+    _temp_start = float(config.get("concrete_temp_start", config.get("concrete_temp", 1.0)))
+    _temp_end = float(config.get("concrete_temp_end", _temp_start))
+    _n_epochs = int(config["epochs"])
+
     for epoch in range(start_epoch, config["epochs"]):
         if _readout_target > 0.0:
             config["lambda_readout"] = warmup_lambda(_readout_target, epoch, _readout_warmup)
             print(f"[section_readout] epoch {epoch+1}: effective lambda_readout="
                   f"{config['lambda_readout']:.4f} (target {_readout_target}, "
                   f"warmup {_readout_warmup} epochs)")
+        if _is_bottleneck:
+            # bits weight: 0 for epochs < bits_warmup_epochs, then warmup_lambda from
+            # (epoch - bits_warmup_epochs) over the remaining epochs.
+            if epoch < _bits_warmup:
+                config["bits_lambda_effective"] = 0.0
+            else:
+                ramp = max(1, _n_epochs - _bits_warmup)
+                config["bits_lambda_effective"] = warmup_lambda(
+                    _bits_lambda_target, epoch - _bits_warmup, ramp,
+                )
+            # concrete temperature anneal (linear start→end across all epochs).
+            frac = 0.0 if _n_epochs <= 1 else min(1.0, max(0, epoch) / (_n_epochs - 1))
+            cur_temp = _temp_start + (_temp_end - _temp_start) * frac
+            decoupled_head.set_concrete_temp(cur_temp)
+            print(f"[bottleneck] epoch {epoch+1}: bits_lambda_effective="
+                  f"{config['bits_lambda_effective']:.4f} (target {_bits_lambda_target}, "
+                  f"warmup {_bits_warmup} epochs), concrete_temp={cur_temp:.4f}")
         print("\nEpoch: {}/{}".format(epoch + 1, config["epochs"]))
 
         curr_lr = float(optimizer.param_groups[0]["lr"])
@@ -1177,6 +1234,8 @@ def train(config: dict) -> None:
                     torch.nn.utils.clip_grad_norm_(section_head.parameters(), config["grad_clip"])
                 if readout_head is not None:  # [section_readout]
                     torch.nn.utils.clip_grad_norm_(readout_head.parameters(), config["grad_clip"])
+                if decoupled_head is not None:  # [decoupled_grounding] clip the grounding head too
+                    torch.nn.utils.clip_grad_norm_(decoupled_head.parameters(), config["grad_clip"])
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -1213,6 +1272,18 @@ def train(config: dict) -> None:
                     log_payload["lambda_decoupled"] = float(config.get("lambda_decoupled", 0.0))
                     for k, v in loss_metrics.items():
                         if k.startswith("decoupled_mae/"):
+                            log_payload[f"train_{k}"] = v
+                # [bottleneck] surface the bits penalty + per-feature meanbits — THE
+                # signal for whether the keep-mask is sparsifying onto evidence.
+                if "loss_bits" in loss_metrics:
+                    log_payload["train_loss_bits"] = loss_metrics["loss_bits"]
+                    log_payload["bits_lambda_effective"] = float(
+                        config.get("bits_lambda_effective", 0.0))
+                    log_payload["concrete_temp"] = (
+                        float(decoupled_head.concrete_temp)
+                        if decoupled_head is not None else 0.0)
+                    for k, v in loss_metrics.items():
+                        if k.startswith("meanbits/"):
                             log_payload[f"train_{k}"] = v
                 wandb.log(log_payload)
 

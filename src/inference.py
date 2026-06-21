@@ -337,6 +337,18 @@ _STRUCTURAL_KEYS = (
     "spec_d_patch",
     "section_d_k",
     "section_d_v",
+    # Decoupled-grounding head. grounding_mode MUST come from the checkpoint so any
+    # head-loading path (grounding_validate, extraction) builds the SAME forward
+    # (softmax vs bottleneck) the head was trained with. The other decoupled_* keys
+    # ride along to reconstruct the head with matching dims/β/temperature.
+    "grounding_mode",
+    "decoupled_grounding",
+    "decoupled_d_model",
+    "decoupled_n_heads",
+    "decoupled_readout_hidden",
+    "bits_beta_per_feature",
+    "concrete_temp_start",
+    "concrete_temp_end",
 )
 
 

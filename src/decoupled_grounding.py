@@ -91,6 +91,96 @@ from feature_set import N_FEATURES, SUPERVISED_FEATURES, FEATURE_SCALES
 # module default so callers don't have to thread the magic number through.
 DEFAULT_D_PATCH: int = 768
 
+# ── hard-concrete / L0 gate constants (Louizos, Welling, Kingma — arXiv:1712.01312) ──
+# The binary-concrete sample is "stretched" from (0,1) to (HC_GAMMA, HC_ZETA) and
+# hard-clamped to [0,1], so a gate is EXACTLY 0 when the stretched sample is < 0 and
+# EXACTLY 1 when it is > 1 — true deletion at the tails — while staying differentiable
+# in the interior via the reparameterized concrete relaxation.
+HC_GAMMA: float = -0.1   # lower stretch bound (< 0 → gives true-0 mass)
+HC_ZETA: float = 1.1     # upper stretch bound (> 1 → gives true-1 mass)
+HC_EPS: float = 1e-6     # numerical floor for the inverse-sigmoid noise term
+
+
+# ── grounding modes ──────────────────────────────────────────────────────────
+# "softmax"    — v17 head: A = softmax(qKᵀ), z = A·V.detach(), readout(z). Default.
+# "bottleneck" — v18 head: per-feature hard-concrete keep-mask over patches, un-kept
+#                patches substituted by the DETACHED per-patch marginal mean (the
+#                IBA noise baseline), scalar read by mean-pool of the substituted
+#                representation. Deletion-faithful by construction + a closed-form
+#                bits penalty (β·meanbits). See src/.../2dmap-faithfulness-design.md.
+GROUNDING_MODES = ("softmax", "bottleneck")
+
+
+# ── per-feature bits-penalty β defaults (design doc §4.2) ────────────────────
+# Length-N_FEATURES, in SUPERVISED_FEATURES order
+#   [snr, srmr, f0_mean, f0_sd, speaking_rate, pause_count, pause_rate, overlap_ratio]
+# GLOBAL features (snr, srmr, f0_mean, f0_sd, speaking_rate) get β=0: a diffuse mask
+# is the FAITHFUL answer for a clip-global attribute, so it is never penalized. Only
+# the localizable features pay bits: overlap_ratio (the one feature with oracle GT
+# regions, 0.05) and pause_count/pause_rate (0.02 each). Keyed by short name so the
+# constructor arg can be a partial dict; missing keys fall back to these.
+DEFAULT_BITS_BETA: dict[str, float] = {
+    "snr": 0.0,
+    "srmr": 0.0,
+    "f0_mean": 0.0,
+    "f0_sd": 0.0,
+    "speaking_rate": 0.0,
+    "pause_count": 0.02,
+    "pause_rate": 0.02,
+    "overlap_ratio": 0.05,
+}
+
+
+def hard_concrete_sample(
+    logits: torch.Tensor,
+    temp: float,
+    training: bool,
+) -> torch.Tensor:
+    """Hard-concrete keep-mask λ ∈ [0,1] per element (Louizos 1712.01312, eq. 10-12).
+
+    TRAIN (training=True): draws u~Uniform(0,1) per call, forms the binary-concrete
+    sample s = sigmoid((logits + log u − log(1−u)) / temp), STRETCHES it to
+    (HC_GAMMA, HC_ZETA), then hard-clamps to [0,1]. The noise makes the gate
+    stochastic and the clamp gives genuine 0/1 mass in the tails while the
+    reparameterization keeps gradients flowing to `logits`.
+
+    EVAL (training=False): deterministic, no noise — s = sigmoid(logits/temp),
+    stretched and clamped the same way, so the returned mask is the expected
+    deterministic keep-map λ̄ used for figures / extraction (and is ~binary once
+    the logits are confident, by the same clamp).
+
+    Args:
+        logits:   (...,) keep-logit per element (q·Kᵀ/√d in the head).
+        temp:     concrete temperature; lower → sharper toward 0/1.
+        training: stochastic (True) vs deterministic (False).
+    Returns:
+        λ of the same shape as `logits`, every entry in [0,1].
+    """
+    if training:
+        u = torch.rand_like(logits).clamp_(HC_EPS, 1.0 - HC_EPS)
+        s = torch.sigmoid((logits + torch.log(u) - torch.log1p(-u)) / temp)
+    else:
+        s = torch.sigmoid(logits / temp)
+    s_stretched = s * (HC_ZETA - HC_GAMMA) + HC_GAMMA
+    return s_stretched.clamp(0.0, 1.0)
+
+
+def hard_concrete_keepprob(logits: torch.Tensor, temp: float) -> torch.Tensor:
+    """Closed-form P(gate > 0) for the hard-concrete gate (the analytic bits term).
+
+    From Louizos 1712.01312: the probability the stretched gate is strictly positive
+    (i.e. the patch is kept) is sigmoid(logits − temp·log(−HC_GAMMA/HC_ZETA)). No
+    Monte-Carlo over masks — one cheap expression per element. Summed/averaged over
+    patches it is the EXPECTED fraction of patches kept = meanbits.
+
+    Args:
+        logits: (...,) keep-logit per element.
+        temp:   concrete temperature (same value used in the sample).
+    Returns:
+        keep-probability in (0,1), same shape as `logits`.
+    """
+    return torch.sigmoid(logits - temp * math.log(-HC_GAMMA / HC_ZETA))
+
 
 class DecoupledGroundingHead(nn.Module):
     """Learned per-feature queries cross-attending to T*F audio patches.
@@ -132,16 +222,34 @@ class DecoupledGroundingHead(nn.Module):
         readout_hidden: int | None = None,
         huber_delta: float = 1.0,
         feature_init_bias: "torch.Tensor | list[float] | tuple[float, ...] | None" = None,
+        grounding_mode: str = "softmax",
+        bits_beta_per_feature: "dict[str, float] | list[float] | tuple[float, ...] | None" = None,
+        concrete_temp: float = 1.0,
     ):
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        if grounding_mode not in GROUNDING_MODES:
+            raise ValueError(
+                f"grounding_mode must be one of {GROUNDING_MODES}, got {grounding_mode!r}"
+            )
         self.n_features = int(n_features)
         self.d_model = int(d_model)
         self.d_patch = int(d_patch)
         self.n_heads = int(n_heads)
         self.d_head = self.d_model // self.n_heads
         self.huber_delta = float(huber_delta)
+        self.grounding_mode = grounding_mode
+
+        # ── bottleneck-mode state (hard-concrete keep-mask) ────────────────────
+        # `concrete_temp` is an annealable BUFFER (rides into checkpoints, set per
+        # epoch by train.py). β is a length-n_features tensor BUFFER (non-persistent
+        # — re-resolved from config each run so it never goes stale).
+        self.register_buffer(
+            "concrete_temp", torch.tensor(float(concrete_temp)), persistent=True,
+        )
+        beta_vec = self._resolve_beta(bits_beta_per_feature)
+        self.register_buffer("bits_beta", beta_vec, persistent=False)
 
         # ── learned per-feature query table — ONE query per scored feature ──────
         # nn.Parameter (NOT nn.Embedding tied to a tokenizer / vocab row): these
@@ -218,6 +326,59 @@ class DecoupledGroundingHead(nn.Module):
             scales = torch.ones(self.n_features, dtype=torch.float32)
         self.register_buffer("scales", scales, persistent=False)
 
+    # ── per-feature β resolution (bottleneck mode) ────────────────────────────
+    def _resolve_beta(
+        self,
+        bits_beta_per_feature: "dict[str, float] | list[float] | tuple[float, ...] | None",
+    ) -> torch.Tensor:
+        """Resolve the per-feature bits-penalty β into a length-n_features tensor.
+
+        Accepts a dict keyed by short feature name (partial dicts allowed — missing
+        keys fall back to DEFAULT_BITS_BETA when on the canonical catalog, else 0),
+        a length-n_features list/tuple (positional), or None (→ DEFAULT_BITS_BETA on
+        the catalog, all-zeros off it). GLOBAL features default to β=0 so a diffuse
+        mask is never penalized.
+        """
+        if isinstance(bits_beta_per_feature, dict):
+            names = (feature_names() if self.n_features == N_FEATURES
+                     else [f"f{i}" for i in range(self.n_features)])
+            beta = []
+            for nm in names:
+                if nm in bits_beta_per_feature:
+                    beta.append(float(bits_beta_per_feature[nm]))
+                else:
+                    beta.append(float(DEFAULT_BITS_BETA.get(nm, 0.0)))
+            return torch.tensor(beta, dtype=torch.float32)
+        if isinstance(bits_beta_per_feature, (list, tuple)):
+            if len(bits_beta_per_feature) != self.n_features:
+                raise ValueError(
+                    f"bits_beta_per_feature list must have {self.n_features} entries "
+                    f"(SUPERVISED_FEATURES order), got {len(bits_beta_per_feature)}"
+                )
+            return torch.tensor([float(x) for x in bits_beta_per_feature], dtype=torch.float32)
+        # None → catalog defaults (DEFAULT_BITS_BETA) on the canonical catalog, else 0.
+        if self.n_features == N_FEATURES:
+            return torch.tensor(
+                [DEFAULT_BITS_BETA.get(nm, 0.0) for nm in feature_names()],
+                dtype=torch.float32,
+            )
+        return torch.zeros(self.n_features, dtype=torch.float32)
+
+    def set_concrete_temp(self, temp: float) -> None:
+        """Set the concrete temperature in-place (called per-epoch for annealing)."""
+        with torch.no_grad():
+            self.concrete_temp.fill_(float(temp))
+
+    def set_bits_beta(self, beta: "torch.Tensor | list[float] | tuple[float, ...]") -> None:
+        """Overwrite the per-feature β in-place (called per-epoch for bits warmup)."""
+        bt = torch.as_tensor(beta, dtype=self.bits_beta.dtype, device=self.bits_beta.device)
+        if bt.shape != (self.n_features,):
+            raise ValueError(
+                f"beta must have shape ({self.n_features},), got {tuple(bt.shape)}"
+            )
+        with torch.no_grad():
+            self.bits_beta.copy_(bt)
+
     # ── forward ───────────────────────────────────────────────────────────────
     def forward(
         self,
@@ -233,7 +394,7 @@ class DecoupledGroundingHead(nn.Module):
                         also be given as (B, T, F) when patches are (B, T, F, d).
                         Masked positions get -inf pre-softmax (≈0 attention).
 
-        Returns:
+        Returns (SOFTMAX mode — v17, unchanged):
             A:           (B, n_features, P) — per-feature attention map over patches
                          (heads averaged). Rows sum to 1 over valid patches.
             z:           (B, n_features, d_model) — pooled vectors A @ V.detach().
@@ -241,11 +402,26 @@ class DecoupledGroundingHead(nn.Module):
                          the grounding gradient lands on the attention/queries, not
                          on V's encoding.
             pred_scalars:(B, n_features) — shallow readout of z.
+
+        Returns (BOTTLENECK mode — v18):
+            mask:        (B, n_features, P) — the hard-concrete KEEP-mask λ̄ ∈ [0,1]
+                         per patch (does NOT sum to 1; it is a per-patch keep
+                         probability, exactly the map IoU/RISE/pointing expect).
+            z:           (B, n_features, d_model) — mean-pool of the noise-substituted
+                         Z over valid patches (V still detached → grounding property).
+            pred_scalars:(B, n_features).
+        Side effect (bottleneck): the per-(b,f,p) keep-LOGIT and the valid mask are
+        stashed on `self._last_logit_lambda` / `self._last_valid_mask` so the loss
+        term can add the closed-form bits penalty without a second forward.
         """
         patches, patch_mask = self._flatten_inputs(patches, patch_mask)
         B, P, _ = patches.shape
         H, Dh = self.n_heads, self.d_head
 
+        if self.grounding_mode == "bottleneck":
+            return self._forward_bottleneck(patches, patch_mask, B, P, H, Dh)
+
+        # ── SOFTMAX path (v17 — verbatim) ─────────────────────────────────────
         # K, V : (B, P, d_model) → (B, H, P, Dh)
         K = self.K_proj(patches).view(B, P, H, Dh).transpose(1, 2)   # (B, H, P, Dh)
         V = self.V_proj(patches).view(B, P, H, Dh).transpose(1, 2)   # (B, H, P, Dh)
@@ -274,6 +450,127 @@ class DecoupledGroundingHead(nn.Module):
 
         pred_scalars = self._readout(z)                             # (B, n_features)
         return A, z, pred_scalars
+
+    # ── bottleneck forward (v18 — hard-concrete keep-mask + noise substitution) ──
+    def _forward_bottleneck(
+        self,
+        patches: torch.Tensor,    # (B, P, d_patch) already flattened
+        patch_mask: torch.Tensor | None,   # (B, P) bool, True = VALID
+        B: int, P: int, H: int, Dh: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The faithfulness-by-construction path. See design doc §3.2.
+
+        Per feature f, per patch p:
+          logit_λ = (q_f · K_p)/√d            (heads averaged → one logit per patch)
+          λ       = hard_concrete(logit_λ)    ∈ [0,1], true 0/1 in the tails
+          R       = V_proj(patches)           (kept patch representation; V detached)
+          R̄       = masked_mean_p(R.detach()) (the IBA noise baseline)
+          Z       = λ·R + (1−λ)·R̄.detach()    (un-kept patches replaced by noise)
+          z       = masked_mean_p(Z)          (pool over valid patches)
+          pred    = readout(z)
+        """
+        # K, V projections (multi-head folded back so the keep-logit is single per patch).
+        K = self.K_proj(patches).view(B, P, H, Dh).transpose(1, 2)   # (B, H, P, Dh)
+        V = self.V_proj(patches)                                     # (B, P, d_model) — "R"
+        q = self.queries.view(self.n_features, H, Dh).transpose(0, 1).unsqueeze(0)  # (1,H,Nf,Dh)
+
+        # per-head scores (B,H,Nf,P) → average heads → keep-logit (B,Nf,P).
+        scores = torch.matmul(q, K.transpose(-1, -2)) * self._scale  # (B, H, Nf, P)
+        logit_lambda = scores.mean(dim=1)                            # (B, Nf, P)
+
+        # valid mask (B,P) → (B,1,P). Invalid patches are forced un-kept (λ=0) by
+        # driving their logit very negative; they also never enter the pool denom.
+        if patch_mask is not None:
+            valid = patch_mask.view(B, 1, P)                         # (B,1,P) bool
+            neg = torch.finfo(logit_lambda.dtype).min
+            logit_lambda = logit_lambda.masked_fill(~valid, neg)
+        else:
+            valid = torch.ones(B, 1, P, dtype=torch.bool, device=patches.device)
+
+        # hard-concrete keep-mask λ ∈ [0,1] (stochastic in train, deterministic eval).
+        lam = hard_concrete_sample(logit_lambda, float(self.concrete_temp), self.training)  # (B,Nf,P)
+        lam = lam * valid.to(lam.dtype)   # belt-and-braces: invalid → exactly 0
+
+        # R = kept patch representation; R̄ = DETACHED per-patch marginal mean (noise).
+        R = V                                                        # (B, P, d_model)
+        validf = valid.squeeze(1).to(R.dtype).unsqueeze(-1)         # (B, P, 1)
+        denom_patches = validf.sum(dim=1).clamp(min=1.0)           # (B, 1)
+        R_bar = (R.detach() * validf).sum(dim=1) / denom_patches   # (B, d_model) — IBA baseline
+        R_bar = R_bar.detach().unsqueeze(1).unsqueeze(2)           # (B,1,1,d_model)
+
+        # noise substitution — THE faithfulness step. V detached (grounding property),
+        # baseline detached (can't be made informative).
+        R_det = R.detach().unsqueeze(1)                            # (B,1,P,d_model)
+        lam_e = lam.unsqueeze(-1)                                  # (B,Nf,P,1)
+        Z = lam_e * R_det + (1.0 - lam_e) * R_bar                  # (B,Nf,P,d_model)
+
+        # mean-pool over VALID patches → z (B,Nf,d_model).
+        valid_e = valid.unsqueeze(-1).to(Z.dtype)                 # (B,1,P,1)
+        z = (Z * valid_e).sum(dim=2) / denom_patches.unsqueeze(1) # (B,Nf,d_model)
+
+        pred_scalars = self._readout(z)                           # (B, Nf)
+
+        # the returned "map" is the DETERMINISTIC expected keep-mask λ̄ (figures /
+        # extraction / metrics). In eval `lam` is already deterministic; in train we
+        # recompute the deterministic value so the returned map is stable to look at.
+        if self.training:
+            with torch.no_grad():
+                lam_bar = hard_concrete_sample(logit_lambda, float(self.concrete_temp), training=False)
+                lam_bar = lam_bar * valid.to(lam_bar.dtype)
+        else:
+            lam_bar = lam
+
+        # stash for the bits penalty (read by decoupled_grounding_loss_term).
+        self._last_logit_lambda = logit_lambda
+        self._last_valid_mask = valid
+        return lam_bar, z, pred_scalars
+
+    # ── bits penalty (closed-form, bottleneck mode) ──────────────────────────────
+    def bits_penalty(
+        self,
+        logit_lambda: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Per-feature analytic bits term Σ_f β_f · meanbits(λ_f) (design doc §4.1).
+
+        meanbits(λ_f) = mean over valid patches of P(gate>0) = closed-form keep-prob.
+        Uses the stashed logit/valid from the last bottleneck forward when not given.
+
+        Returns:
+            (weighted_bits_scalar, meanbits_dict). The scalar is Σ_f β_f·meanbits_f
+            (already β-weighted, NOT yet times any global bits_lambda). The dict has
+            one 'meanbits/<feat>' (the UNWEIGHTED per-feature keep fraction) for wandb.
+        """
+        if logit_lambda is None:
+            logit_lambda = getattr(self, "_last_logit_lambda", None)
+        if valid_mask is None:
+            valid_mask = getattr(self, "_last_valid_mask", None)
+        if logit_lambda is None:
+            zero = (self.bits_beta.sum() * 0.0)
+            return zero, {}
+
+        B, Nf, P = logit_lambda.shape
+        if valid_mask is None:
+            valid = torch.ones(B, 1, P, dtype=torch.bool, device=logit_lambda.device)
+        else:
+            valid = valid_mask if valid_mask.dim() == 3 else valid_mask.view(B, 1, P)
+
+        keep = hard_concrete_keepprob(logit_lambda, float(self.concrete_temp))  # (B,Nf,P)
+        validf = valid.to(keep.dtype)                                           # (B,1,P)
+        denom = validf.sum(dim=-1).clamp(min=1.0)                              # (B,1)
+        # mean keep-prob over valid patches, per (b,f) → mean over batch → (Nf,)
+        meanbits_bf = (keep * validf).sum(dim=-1) / denom                       # (B,Nf)
+        meanbits = meanbits_bf.mean(dim=0)                                      # (Nf,)
+
+        beta = self.bits_beta.to(meanbits.device, meanbits.dtype)              # (Nf,)
+        weighted = (beta * meanbits).sum()
+
+        metrics: dict[str, float] = {}
+        names = (feature_names() if self.n_features == N_FEATURES
+                 else [f"f{i}" for i in range(self.n_features)])
+        for i, nm in enumerate(names):
+            metrics[f"meanbits/{nm}"] = float(meanbits[i].detach().item())
+        return weighted, metrics
 
     # ── per-feature readout ─────────────────────────────────────────────────────
     def _readout(self, z: torch.Tensor) -> torch.Tensor:
@@ -395,19 +692,24 @@ def decoupled_grounding_loss_term(
     batch: dict,
     lambda_decoupled: float,
     device: torch.device | str = "cpu",
+    bits_lambda: float = 0.0,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """Parallel grounding-loss term off the BEATs patches (the train.py integration).
 
     Lives HERE (not in train.py) so it is importable and unit-testable WITHOUT
     pulling transformers / peft / wandb — train.py just re-exports it. It runs the
     token-free DecoupledGroundingHead on the batch's precomputed BEATs patches,
-    regresses each scored feature's scalar from the attention-pooled
-    z = A · V.detach(), and returns lambda_decoupled * masked_huber as a fresh
-    loss term. Because the head reads `beats_patches` straight off the batch (the
-    SAME field section_readout consumes) and pools over V.detach(), its gradient
-    lands on the head's own queries / K_proj / readout — it NEVER flows through the
-    LM token CE. It is a fully decoupled branch added to the total loss in
-    compute_loss.
+    regresses each scored feature's scalar from the pooled z (softmax: A·V.detach();
+    bottleneck: mean-pool of the noise-substituted Z), and returns
+    lambda_decoupled · masked_huber as a fresh loss term. Because the head reads
+    `beats_patches` straight off the batch (the SAME field section_readout consumes)
+    and pools over V.detach(), its gradient lands on the head's own queries / K_proj
+    / readout — it NEVER flows through the LM token CE. It is a fully decoupled branch
+    added to the total loss in compute_loss.
+
+    In BOTTLENECK mode (head.grounding_mode == "bottleneck") the closed-form bits
+    penalty Σ_f β_f·meanbits(λ_f) is added, scaled by `bits_lambda` (the per-epoch
+    warmed global bits weight; 0 during bits warmup or for the softmax head).
 
     Pulls from the batch (mirrors train.py's _build_section_ctx / section_readout):
         beats_patches:       (B, P, d_patch) precomputed BEATs patch embeddings.
@@ -421,8 +723,9 @@ def decoupled_grounding_loss_term(
         (weighted_loss_or_None, metrics). No-op (None, {}) whenever the head is
         absent, lambda is <= 0, the batch carries no BEATs patches (legacy .pt), or
         there are no GT scalars — so it is safe to call unconditionally and is
-        zero-overhead when off. metrics has 'loss_decoupled' (the UNWEIGHTED loss)
-        and one 'decoupled_mae/<feat>' per scored feature.
+        zero-overhead when off. metrics has 'loss_decoupled' (the UNWEIGHTED Huber),
+        one 'decoupled_mae/<feat>' per scored feature, and — in bottleneck mode —
+        'loss_bits' (the UNWEIGHTED Σβ·meanbits) plus one 'meanbits/<feat>' each.
     """
     if head is None or lambda_decoupled <= 0.0:
         return None, {}
@@ -445,11 +748,20 @@ def decoupled_grounding_loss_term(
     gt_scalars = gt_scalars.to(device)
     gt_mask = gt_mask.to(device)
 
-    _A, _z, pred_scalars = head(patches, patch_mask=valid_mask)
+    _map, _z, pred_scalars = head(patches, patch_mask=valid_mask)
     loss, mae = head.grounding_loss(pred_scalars, gt_scalars, gt_mask)
     weighted = lambda_decoupled * loss
 
     metrics: dict[str, float] = {"loss_decoupled": float(loss.detach().item())}
     for i, fname in enumerate(feature_names()):
         metrics[f"decoupled_mae/{fname}"] = float(mae[i].item())
+
+    # [bottleneck] add the closed-form bits penalty (β-weighted per feature). The
+    # stashed logit/valid from the forward above feed bits_penalty (no 2nd forward).
+    if getattr(head, "grounding_mode", "softmax") == "bottleneck":
+        bits_weighted, bits_metrics = head.bits_penalty()
+        metrics["loss_bits"] = float(bits_weighted.detach().item())
+        metrics.update(bits_metrics)
+        if bits_lambda > 0.0:
+            weighted = weighted + bits_lambda * bits_weighted.to(weighted.dtype)
     return weighted, metrics
