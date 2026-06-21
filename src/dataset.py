@@ -115,7 +115,17 @@ def collate_fn(batch):
         "audio_features": audio_padded,
         "overlap_info": overlap_padded,
         "target_text": target_text,
+        # Per-clip UNPADDED WavLM frame counts → clip duration (n_frames / 50 Hz)
+        # for the overlap-map supervision time-mask; cheap and back-compatible.
+        "audio_lens": torch.tensor([f.shape[0] for f in audio_features], dtype=torch.long),
     }
+
+    # Oracle overlap spans [(start_s, end_s), ...] in SECONDS, one list per clip.
+    # Carried as a plain list (variable length, NOT stacked) so the overlap-map
+    # supervision in decoupled_grounding_loss_term can build a per-clip time target.
+    # Present on every item (defaults to [] in the dataset), so always emitted.
+    if "overlap_segments" in batch[0]:
+        out["overlap_segments"] = [item.get("overlap_segments", []) for item in batch]
 
     # BEATs patches — variable patch count per clip because Libri2Mix durations
     # vary. Zero-pad to the batch max and emit a (B, P_max) bool mask that's

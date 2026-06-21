@@ -48,6 +48,8 @@ from section_readout import (
 from decoupled_grounding import (
     DecoupledGroundingHead,
     decoupled_grounding_loss_term,
+    feature_names,
+    overlap_ratio_index,
 )
 # Degeneration-aware, lower-variance best-checkpoint selection.
 from ckpt_selection import seeded_val_indices, should_save_best
@@ -630,9 +632,21 @@ def compute_loss(
         # stored back into config as 'bits_lambda_effective'). 0 in softmax mode or
         # during bits warmup → no bits penalty, identical to the pure-Huber term.
         bits_lambda_eff = float(config.get("bits_lambda_effective", 0.0))
+        # [overlap-map supervision] direct segmentation loss on the overlap query's
+        # map vs the oracle overlap_segments. 0.0 (default) → exact no-op, both modes
+        # unchanged; >0 adds lambda_overlap_map · soft-Dice(overlap map, time-target).
+        lambda_overlap_map = float(config.get("lambda_overlap_map", 0.0))
         d_loss, d_metrics = decoupled_grounding_loss_term(
             decoupled_head, batch, lambda_decoupled, device,
             bits_lambda=bits_lambda_eff,
+            lambda_overlap_map=lambda_overlap_map,
+            # 'max' (not 'mean') frequency reduction: a softmax attention row is
+            # mass-conserving, so mean-over-freq sums to 1/F_P for every clip → no
+            # gradient to shape the map. Max distinguishes a concentrated map from a
+            # diffuse one in BOTH softmax and bottleneck modes.
+            overlap_map_reduce=str(config.get("overlap_map_reduce", "max")),
+            overlap_map_empty_weight=float(config.get("overlap_map_empty_weight", 1.0)),
+            overlap_target_soft=bool(config.get("overlap_target_soft", True)),
         )
         if d_loss is not None:
             decoupled_loss = d_loss.to(lm_loss_prose.dtype)
@@ -866,6 +880,16 @@ def train(config: dict) -> None:
                   f"concrete_temp={concrete_temp_start}→{config.get('concrete_temp_end', 0.3)}, "
                   f"bits_warmup_epochs={config.get('bits_warmup_epochs', 0)}, "
                   f"bits_lambda={config.get('bits_lambda', 1.0)}")
+        # [overlap-map supervision] direct segmentation loss on the overlap query's map.
+        _lambda_ovl_map = float(config.get("lambda_overlap_map", 0.0))
+        if _lambda_ovl_map > 0.0:
+            print(f"[decoupled_grounding] overlap-map supervision ON: "
+                  f"lambda_overlap_map={_lambda_ovl_map}, "
+                  f"reduce={config.get('overlap_map_reduce', 'mean')}, "
+                  f"empty_weight={config.get('overlap_map_empty_weight', 1.0)}, "
+                  f"soft_target={config.get('overlap_target_soft', True)} "
+                  f"(supervises feature '{feature_names()[overlap_ratio_index()]}' "
+                  f"idx {overlap_ratio_index()})")
 
     # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
     # after wandb.init() below. Helps compare adapter vs LoRA/full-FT footprint across runs.

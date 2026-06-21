@@ -87,6 +87,29 @@ import torch.nn.functional as F
 from feature_set import N_FEATURES, SUPERVISED_FEATURES, FEATURE_SCALES
 
 
+# BEATs frequency-patch count (128 mel / 16 patch). The flat patch map of length
+# P factors as P = T_p * F_P, TIME-MAJOR (flat index = t * F_P + f) — the exact
+# convention used in src/grounding_metrics.py, scripts/attention_gt_alignment.py,
+# and src/spec_encoder.py::PatchGrid. The overlap-map supervision marginalizes the
+# overlap query's map over these F_P frequency bins because overlap is a TIME
+# property, so the target is a time-mask broadcast across all frequency bins.
+F_P_DEFAULT: int = 8
+
+# WavLM frame rate (Hz). duration_sec = n_wavlm_frames / WAVLM_FRAME_RATE_HZ —
+# the SAME convention as src/grounding_validate.py::clip_duration_sec and
+# src/inference.py::measured_duration_sec.
+WAVLM_FRAME_RATE_HZ: float = 50.0
+
+# Fallback only: WavLM frames per BEATs time-patch, used to recover a clip's VALID
+# time-patch count from its duration when overlap_time_target is called WITHOUT an
+# explicit valid_t_p (i.e. the standalone/unit path). The training loss term ALWAYS
+# passes the exact valid_t_p it reads off the patch-valid mask, so this constant never
+# enters the training objective — it just lets a direct overlap_time_target(segs, dur,
+# padded_t_p) recover the valid region instead of spreading the clip across padding.
+# 20 WavLM frames / patch → a 4 s clip (200 frames) has 10 valid time-patches.
+WAVLM_FRAMES_PER_TIME_PATCH: int = 20
+
+
 # BEATs patch feature dim. The encoder emits 768-d patch embeddings; kept as a
 # module default so callers don't have to thread the magic number through.
 DEFAULT_D_PATCH: int = 768
@@ -687,12 +710,346 @@ def feature_names() -> list[str]:
     return [name for name, _csv, _fmt in SUPERVISED_FEATURES]
 
 
+def overlap_ratio_index() -> int:
+    """Index of `overlap_ratio` in SUPERVISED_FEATURES (the one feature with oracle
+    GT regions). Resolved from the catalog so it tracks any reordering."""
+    return feature_names().index("overlap_ratio")
+
+
+# ── DIRECT overlap-map supervision (the strongest grounding claim) ───────────────
+# The decoupled grounding loss only WEAKLY supervises the 2D map: it regresses the
+# overlap_ratio SCALAR from the pooled z, and a diffuse map predicts that scalar as
+# well as a sharp one does. Here we add a SEGMENTATION-style target: the overlap
+# query's map, marginalized over frequency to a per-time-bin activation, must land
+# on the time region the oracle overlap_segments cover. This is the only feature
+# with frame-level ground truth, so it is the strongest available grounding signal.
+
+
+def overlap_time_target(
+    overlap_segments: "list[tuple[float, float]] | list[list[float]]",
+    duration_sec: float,
+    t_p: int,
+    soft: bool = True,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+    valid_t_p: int | None = None,
+) -> torch.Tensor:
+    """Build the per-clip (T_p,) TARGET time-mask from oracle overlap_segments.
+
+    TIME MAPPING (documented, exact):
+      The clip's REAL (unpadded) span is divided into `valid_t_p` equal time-patch
+      bins; bin i ∈ [0, valid_t_p) covers the half-open wall-clock interval
+          [ i * bin_dur ,  (i+1) * bin_dur ),    bin_dur = duration_sec / valid_t_p
+      i.e. every VALID bin spans `duration_sec / valid_t_p` seconds. duration_sec comes
+      from the WavLM frame count (n_frames / 50 Hz) — the same convention as
+      grounding_validate.clip_duration_sec and inference.measured_duration_sec — and
+      `valid_t_p` is the clip's UNPADDED time-patch count (its valid BEATs patch count
+      // F_P). A bin is POSITIVE iff its interval intersects ANY overlap span, using
+      the half-open intersection `t0 < seg_end and t1 > seg_start` (identical to
+      grounding_metrics._time_bin_in_windows and attention_gt_alignment), so a clip
+      with NO overlap (empty segments) yields an ALL-ZERO target (the map should be
+      empty) and a MULTI-segment clip lights every bin any span touches.
+
+    PADDED-BATCH CORRECTNESS (the fix for the variable-length-batch bug): the returned
+    vector has length `t_p` (the BATCH-PADDED time-patch count), but bins are only ever
+    SET over the VALID region [0, valid_t_p); the trailing [valid_t_p, t_p) bins (which
+    correspond to PADDING patches whose map activation is forced to ~0) stay 0. Using
+    `duration_sec / valid_t_p` (NOT duration_sec / t_p) keeps each bin's wall-clock
+    width matched to the eval builder (grounding_metrics.iou_time, which runs the head
+    on the UNPADDED clip with its own valid t_p), so the train target and the eval
+    metric score the SAME time region.
+
+    valid_t_p resolution: when given (the training loss term ALWAYS passes the exact
+    valid time-patch count it reads off the patch-valid mask) it is used directly,
+    clamped to ≤ t_p. When None (standalone / unit-test path with no mask), it is
+    recovered from the duration as round(duration_sec * 50 / WAVLM_FRAMES_PER_TIME_PATCH),
+    clamped to [1, t_p]; this fallback never enters the training objective.
+
+    soft=True returns the FRACTION of each bin covered by overlap (∈ [0,1]) — a soft
+    target that rewards partial-bin coverage and is smoother for Dice/gradient. With
+    soft=False it returns the hard {0,1} intersection indicator. Either way an empty
+    segment list → all zeros, and a clip with no measurable duration → all zeros.
+
+    Args:
+        overlap_segments: [(start_s, end_s), ...] in SECONDS (the .pt oracle field).
+        duration_sec:     clip duration in seconds (n_wavlm_frames / 50).
+        t_p:              OUTPUT length = the batch-padded time-patch count (P // F_P).
+        soft:             True → per-bin covered fraction; False → hard 0/1 indicator.
+        valid_t_p:        the clip's UNPADDED time-patch count (valid patches // F_P).
+                          None → recover from duration via WAVLM_FRAMES_PER_TIME_PATCH.
+    Returns:
+        (t_p,) float target in [0,1], nonzero only in [0, valid_t_p); all-zero when
+        there is no overlap / no duration.
+    """
+    target = torch.zeros(int(t_p), device=device, dtype=dtype)
+    if t_p <= 0 or duration_sec <= 0 or not overlap_segments:
+        return target
+    # Resolve the clip's VALID time-patch count (the divisor for bin_dur). The loss
+    # term passes it exactly; the standalone path recovers it from the duration so a
+    # padded t_p doesn't spread the clip across padding bins.
+    if valid_t_p is None:
+        vtp = int(round(float(duration_sec) * WAVLM_FRAME_RATE_HZ
+                        / float(WAVLM_FRAMES_PER_TIME_PATCH)))
+    else:
+        vtp = int(valid_t_p)
+    vtp = max(1, min(vtp, int(t_p)))
+    bin_dur = float(duration_sec) / float(vtp)
+    for seg in overlap_segments:
+        s0 = float(seg[0])
+        s1 = float(seg[1])
+        if s1 <= s0:
+            continue
+        # Only ever fill the VALID region [0, vtp); trailing padding bins stay 0.
+        for i in range(vtp):
+            t0 = i * bin_dur
+            t1 = (i + 1) * bin_dur
+            # half-open intersection of [t0,t1) with [s0,s1)
+            lo = max(t0, s0)
+            hi = min(t1, s1)
+            if hi > lo:
+                if soft:
+                    # fraction of this bin covered by the span (accumulate across
+                    # segments, clamp so multiple touching segments can't exceed 1).
+                    target[i] = min(1.0, float(target[i]) + (hi - lo) / bin_dur)
+                else:
+                    target[i] = 1.0
+    return target
+
+
+def overlap_time_activation(
+    overlap_map: torch.Tensor,
+    f_p: int = F_P_DEFAULT,
+    reduce: str = "max",
+) -> torch.Tensor:
+    """Marginalize the overlap feature's flat map over frequency → per-time activation.
+
+    reduce='max' is the DEFAULT (not 'mean'). For a SOFTMAX map the row sums to 1 over
+    P, so mean-over-frequency gives a per-time activation that sums to exactly 1/F_P
+    for EVERY clip irrespective of shape (mass conservation) — a concentrated map and a
+    diffuse one are then indistinguishable, killing the segmentation gradient. Max is
+    not mass-conserving: a peaked row → a high per-time max on its bin, a diffuse row →
+    a low max everywhere. For a BOTTLENECK keep-prob map (already unnormalized, true 1
+    in the keep tail) max-over-frequency → 1 on a kept time bin, the correct reading.
+    'mean' remains available for callers that want the conserved marginal explicitly.
+
+    Args:
+        overlap_map: (B, P) the overlap query's map (softmax A[:, ovl, :] rows, OR the
+                     bottleneck keep-mask λ[:, ovl, :] keep-probs). P = T_p * F_P,
+                     TIME-MAJOR (index = t*F_P + f).
+        f_p:         frequency-patch count (default 8). T_p = P // f_p.
+        reduce:      'max' (default) or 'mean' over the F_P frequency bins per time.
+    Returns:
+        (B, T_p) per-time-bin activation in the same numeric range as the input map.
+    """
+    if overlap_map.dim() != 2:
+        raise ValueError(f"overlap_map must be (B, P), got {tuple(overlap_map.shape)}")
+    B, P = overlap_map.shape
+    t_p = P // f_p
+    if t_p == 0:
+        raise ValueError(f"P={P} too short for f_p={f_p}")
+    grid = overlap_map[:, : t_p * f_p].reshape(B, t_p, f_p)   # (B, T_p, F_P)
+    if reduce == "max":
+        return grid.max(dim=-1).values
+    if reduce == "mean":
+        return grid.mean(dim=-1)
+    raise ValueError(f"reduce must be 'mean' or 'max', got {reduce!r}")
+
+
+def soft_dice_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor | None = None,
+    eps: float = 1.0,
+) -> torch.Tensor:
+    """Soft-Dice loss between a per-time activation and a per-time target.
+
+    WHY DICE (not BCE): overlap spans are SHORT — on a clip with one 1 s overlap in
+    4 s, only ~25% of the time-bins are positive, and on clean clips 0%. A per-bin
+    BCE is dominated by the majority NEGATIVE bins, so the trivial all-zero map gets
+    a low BCE and the positive region is under-weighted. Soft-Dice is the harmonic
+    overlap of the two masses, normalized by their sizes, so it is INVARIANT to the
+    positive/negative ratio and directly maximizes intersection-over-(pred+gt) — the
+    same quantity the IoU figure reports. It also gives a clean, non-vanishing
+    gradient onto the positive bins even when they are a tiny fraction.
+
+    Args:
+        pred:   (B, T_p) activation in [0,1] (softmax mass per bin or keep-prob).
+        target: (B, T_p) soft/hard target in [0,1].
+        valid:  optional (B,) bool/float — rows to include (e.g. only overlap clips
+                for the positive term). None → all rows.
+        eps:    Laplace smoothing on numerator+denominator; also makes an all-zero
+                pred vs all-zero target give loss 0 (the clean-clip ideal).
+    Returns:
+        scalar mean Dice loss over the included rows (1 - dice). 0 when no rows.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"pred {tuple(pred.shape)} vs target {tuple(target.shape)}")
+    inter = (pred * target).sum(dim=-1)                      # (B,)
+    denom = pred.sum(dim=-1) + target.sum(dim=-1)            # (B,)
+    dice = (2.0 * inter + eps) / (denom + eps)               # (B,) in (0,1]
+    per_clip = 1.0 - dice                                    # (B,)
+    if valid is not None:
+        v = valid.to(per_clip.dtype)
+        denom_v = v.sum().clamp(min=1.0)
+        return (per_clip * v).sum() / denom_v
+    return per_clip.mean()
+
+
+def overlap_map_loss_from_map(
+    overlap_map: torch.Tensor,
+    overlap_targets: torch.Tensor,
+    has_overlap: torch.Tensor,
+    f_p: int = F_P_DEFAULT,
+    reduce: str = "max",
+    empty_weight: float = 1.0,
+    iou_thresh: str | float = "median",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Segmentation-style supervision of the OVERLAP query's 2D map.
+
+    Marginalizes the overlap map over frequency to a (B, T_p) per-time activation and
+    compares it to the (B, T_p) oracle time-target with:
+
+      - a soft-DICE positive term on OVERLAP-bearing clips (push the map ONTO the
+        overlapped region), masked to has_overlap so non-overlap clips never
+        contribute a (meaningless) positive Dice term, AND
+      - a low-activation term on NON-overlap (clean) clips: the activation is driven
+        toward 0 so a clean clip gets a near-EMPTY overlap map. This is what supports
+        the hedging story (no overlap → the model should not light the overlap map).
+        Implemented as the same Dice against the all-zero target, which for a clean
+        clip reduces to pushing total activation down.
+
+    FREQUENCY REDUCE = 'max' (default, NOT 'mean'). In SOFTMAX mode the attention row
+    sums to 1 over P, so a MEAN-over-frequency activation sums to exactly 1/F_P for
+    EVERY clip regardless of map shape (mass conservation). Under that reduction the
+    clean-clip 'empty' Dice term is a constant with no gradient, and a concentrated map
+    is indistinguishable from a diffuse one. A MAX-over-frequency reduction is NOT
+    mass-conserving: a peaked softmax row → a high per-time max on its peak bin, a
+    diffuse row → a low max everywhere, so the positive Dice gets gradient toward the
+    target region and the clean term gets gradient toward empty. In BOTTLENECK mode the
+    activation is the per-patch keep-PROBABILITY (unnormalized, true 1 in the keep
+    tail), so max-over-frequency → 1 on a kept time bin, 0 on a dropped one — already
+    the correct, non-conserved reading. Max makes the supervision HONEST in BOTH modes.
+
+    Args:
+        overlap_map:     (B, P) the overlap feature's flat map (softmax row or λ).
+        overlap_targets: (B, T_p) per-clip time targets from overlap_time_target.
+        has_overlap:     (B,) bool/float — True where the clip HAS overlap.
+        f_p:             frequency-patch count (default 8).
+        reduce:          'max' (default) | 'mean' frequency marginalization. 'max' is
+                         scale-appropriate for BOTH the softmax row and the keep-prob.
+        empty_weight:    weight on the clean-clip low-activation term.
+        iou_thresh:      threshold for the logged train IoU. 'median' (default) →
+                         per-clip median of the activation, MATCHING the eval metric
+                         grounding_metrics.iou_time(thresh='median') so train/eval
+                         agree; 'mean' → per-clip mean; a float → an absolute threshold.
+                         (An absolute 0.5 was identically-0 IoU in softmax mode because
+                         a mass-conserved activation never exceeds 1/F_P.)
+    Returns:
+        (loss, metrics). loss is the (positive-Dice + empty_weight*clean-Dice) blend,
+        averaged over whichever group is present. metrics has 'overlap_map_dice_pos',
+        'overlap_map_empty', and 'overlap_map_iou' (mean IoU on overlap clips).
+    """
+    act = overlap_time_activation(overlap_map, f_p=f_p, reduce=reduce)   # (B, T_p)
+    # Align target T_p to the activation's T_p (defensive — both come from the same P).
+    Tp = act.shape[1]
+    if overlap_targets.shape[1] != Tp:
+        tgt = overlap_targets[:, :Tp] if overlap_targets.shape[1] > Tp else F.pad(
+            overlap_targets, (0, Tp - overlap_targets.shape[1])
+        )
+    else:
+        tgt = overlap_targets
+    tgt = tgt.to(act.dtype)
+    has = has_overlap.to(act.dtype)                                      # (B,)
+
+    # POSITIVE term — Dice only on overlap clips (push map ONTO the region).
+    pos_loss = soft_dice_loss(act, tgt, valid=has)
+    # CLEAN term — Dice on non-overlap clips against the all-zero target (→ empty map).
+    clean = 1.0 - has
+    zero_tgt = torch.zeros_like(tgt)
+    clean_loss = soft_dice_loss(act, zero_tgt, valid=clean)
+
+    n_pos = float(has.sum().item())
+    n_clean = float(clean.sum().item())
+    # Blend: average the two groups, weighting present groups only.
+    total = act.new_zeros(())
+    wsum = 0.0
+    if n_pos > 0:
+        total = total + pos_loss
+        wsum += 1.0
+    if n_clean > 0:
+        total = total + empty_weight * clean_loss
+        wsum += empty_weight
+    loss = total / wsum if wsum > 0 else total
+
+    # ── train IoU on overlap clips (logging only, no grad) ──
+    # Threshold is RELATIVE by default ('median' → per-clip median of the activation
+    # over its time bins), EXACTLY matching the eval metric
+    # grounding_metrics.iou_time(thresh='median'), so the logged train IoU and the
+    # validation IoU are on the same footing. (An absolute 0.5 read 0 in softmax mode,
+    # where a mass-conserved activation maxes near 1/F_P; the relative threshold is
+    # meaningful in BOTH the softmax row and the bottleneck keep-prob.)
+    with torch.no_grad():
+        if isinstance(iou_thresh, str):
+            if iou_thresh == "median":
+                thr = act.median(dim=-1, keepdim=True).values         # (B,1)
+            elif iou_thresh == "mean":
+                thr = act.mean(dim=-1, keepdim=True)                  # (B,1)
+            else:
+                raise ValueError(f"iou_thresh str must be 'median'|'mean', got {iou_thresh!r}")
+            pred_bin = act > thr
+        else:
+            pred_bin = act > float(iou_thresh)
+        gt_bin = (tgt > 0.5)
+        inter = (pred_bin & gt_bin).sum(dim=-1).to(act.dtype)
+        union = (pred_bin | gt_bin).sum(dim=-1).clamp(min=1).to(act.dtype)
+        iou_per = inter / union
+        denom_pos = has.sum().clamp(min=1.0)
+        iou = float((iou_per * has).sum() / denom_pos)
+
+    metrics = {
+        "overlap_map_dice_pos": float(pos_loss.detach().item()) if n_pos > 0 else 0.0,
+        "overlap_map_empty": float(clean_loss.detach().item()) if n_clean > 0 else 0.0,
+        "overlap_map_iou": iou,
+    }
+    return loss, metrics
+
+
+def _grad_overlap_map(
+    head: "DecoupledGroundingHead",
+    returned_map: torch.Tensor,
+    overlap_idx: int,
+) -> torch.Tensor:
+    """Gradient-carrying (B, P) overlap-feature map for the segmentation loss.
+
+    SOFTMAX mode: the head's returned A IS the grad-carrying attention (rows sum to 1
+    over valid patches), so slice row `overlap_idx` directly.
+
+    BOTTLENECK mode: the head's returned λ̄ is computed under no_grad (a stable map for
+    figures), so it carries NO gradient. We instead rebuild the DIFFERENTIABLE
+    keep-PROBABILITY P(gate>0) from the stashed keep-logit via hard_concrete_keepprob —
+    the same closed form the bits penalty uses — which has a clean gradient onto the
+    queries / K_proj. Invalid (padded) patches were driven to a very negative logit, so
+    their keep-prob is ≈0 and they contribute nothing to the time activation.
+    """
+    if getattr(head, "grounding_mode", "softmax") == "bottleneck":
+        logit = getattr(head, "_last_logit_lambda", None)   # (B, Nf, P)
+        if logit is not None:
+            keep = hard_concrete_keepprob(logit, float(head.concrete_temp))  # (B,Nf,P)
+            return keep[:, overlap_idx, :]
+    # softmax (or bottleneck without a stashed logit, e.g. eval) → returned map row.
+    return returned_map[:, overlap_idx, :]
+
+
 def decoupled_grounding_loss_term(
     head: "DecoupledGroundingHead | None",
     batch: dict,
     lambda_decoupled: float,
     device: torch.device | str = "cpu",
     bits_lambda: float = 0.0,
+    lambda_overlap_map: float = 0.0,
+    overlap_map_reduce: str = "max",
+    overlap_map_empty_weight: float = 1.0,
+    overlap_target_soft: bool = True,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """Parallel grounding-loss term off the BEATs patches (the train.py integration).
 
@@ -711,6 +1068,15 @@ def decoupled_grounding_loss_term(
     penalty Σ_f β_f·meanbits(λ_f) is added, scaled by `bits_lambda` (the per-epoch
     warmed global bits weight; 0 during bits warmup or for the softmax head).
 
+    DIRECT OVERLAP-MAP SUPERVISION (lambda_overlap_map > 0): a SEGMENTATION-style loss
+    on the OVERLAP query's map only. Builds a (B, T_p) oracle time-target from the
+    batch's `overlap_segments` + per-clip duration (`audio_lens` / 50 Hz), marginalizes
+    the overlap map over frequency, and adds lambda_overlap_map · (soft-Dice positive
+    on overlap clips + low-activation on clean clips). Works in BOTH grounding modes
+    (softmax row or differentiable bottleneck keep-prob). No-op when the batch carries
+    no overlap_segments/audio_lens (back-compat). The overlap_ratio scalar regression
+    above is UNCHANGED.
+
     Pulls from the batch (mirrors train.py's _build_section_ctx / section_readout):
         beats_patches:       (B, P, d_patch) precomputed BEATs patch embeddings.
         beats_patches_mask:  (B, P) bool, True at PADDED positions (collate_fn's
@@ -718,14 +1084,18 @@ def decoupled_grounding_loss_term(
                              so it is inverted here.
         gt_scalars:          (B, F) Praat scalar GT (feature_set.extract_scalars).
         gt_mask:             (B, F) bool, True where the scalar was measured.
+        overlap_segments:    (overlap-map supervision) list[B] of [(start_s,end_s),...].
+        audio_lens:          (overlap-map supervision) (B,) int WavLM frame counts.
 
     Returns:
         (weighted_loss_or_None, metrics). No-op (None, {}) whenever the head is
         absent, lambda is <= 0, the batch carries no BEATs patches (legacy .pt), or
         there are no GT scalars — so it is safe to call unconditionally and is
         zero-overhead when off. metrics has 'loss_decoupled' (the UNWEIGHTED Huber),
-        one 'decoupled_mae/<feat>' per scored feature, and — in bottleneck mode —
-        'loss_bits' (the UNWEIGHTED Σβ·meanbits) plus one 'meanbits/<feat>' each.
+        one 'decoupled_mae/<feat>' per scored feature, — in bottleneck mode —
+        'loss_bits' (the UNWEIGHTED Σβ·meanbits) plus one 'meanbits/<feat>' each, and
+        — when overlap-map supervision is on — 'loss_overlap_map' (UNWEIGHTED),
+        'overlap_map_iou', 'overlap_map_dice_pos', 'overlap_map_empty'.
     """
     if head is None or lambda_decoupled <= 0.0:
         return None, {}
@@ -764,4 +1134,68 @@ def decoupled_grounding_loss_term(
         metrics.update(bits_metrics)
         if bits_lambda > 0.0:
             weighted = weighted + bits_lambda * bits_weighted.to(weighted.dtype)
+
+    # [overlap-map supervision] DIRECT segmentation loss on the overlap query's map.
+    # Reuses the SINGLE forward above (no second pass): pulls the grad-carrying overlap
+    # map (softmax row or bottleneck keep-prob), builds per-clip time targets from the
+    # oracle overlap_segments + duration, and adds the soft-Dice term.
+    if lambda_overlap_map > 0.0:
+        segs_list = batch.get("overlap_segments")
+        audio_lens = batch.get("audio_lens")
+        if segs_list is not None:
+            ovl_idx = overlap_ratio_index()
+            ovl_map = _grad_overlap_map(head, _map, ovl_idx)          # (B, P) grad-carrying
+            B, P = ovl_map.shape
+            t_p = P // F_P_DEFAULT                                    # PADDED time-patch count
+            # Per-clip VALID patch count → VALID time-patch count, so the target's
+            # bins land on the clip's REAL [0, valid_t_p) region (NOT spread across the
+            # batch-padded t_p / into padding bins). Source, IDENTICAL across modes:
+            #   softmax   → valid_mask (~beats_patches_mask), shape (B, P).
+            #   bottleneck→ head._last_valid_mask, shape (B, 1, P).
+            # When no mask is present (all patches valid) the count is the full P → the
+            # valid t_p equals the padded t_p (no padding, unchanged behavior).
+            valid_patch_counts = None
+            if valid_mask is not None:
+                valid_patch_counts = valid_mask.reshape(B, -1).sum(dim=1)   # (B,)
+            else:
+                bn_valid = getattr(head, "_last_valid_mask", None)
+                if bn_valid is not None:
+                    valid_patch_counts = bn_valid.reshape(B, -1).sum(dim=1)  # (B,)
+            if t_p > 0:
+                # Per-clip duration: WavLM frame count / 50 Hz when available, else the
+                # max overlap-segment end (matches grounding_validate.clip_duration_sec).
+                targets = []
+                has = []
+                for b in range(B):
+                    segs = segs_list[b] if b < len(segs_list) else []
+                    segs = segs or []
+                    if audio_lens is not None and b < len(audio_lens):
+                        dur = float(audio_lens[b]) / WAVLM_FRAME_RATE_HZ
+                    else:
+                        dur = float(max((e for _s, e in segs), default=0.0))
+                    if valid_patch_counts is not None:
+                        valid_tp_b = int(valid_patch_counts[b].item()) // F_P_DEFAULT
+                    else:
+                        valid_tp_b = t_p
+                    targets.append(
+                        overlap_time_target(
+                            segs, dur, t_p, soft=overlap_target_soft,
+                            device=ovl_map.device, dtype=ovl_map.dtype,
+                            valid_t_p=valid_tp_b,
+                        )
+                    )
+                    has.append(1.0 if segs else 0.0)
+                target_t = torch.stack(targets, dim=0)               # (B, T_p)
+                has_t = torch.tensor(has, device=ovl_map.device, dtype=ovl_map.dtype)
+                ovl_loss, ovl_metrics = overlap_map_loss_from_map(
+                    ovl_map, target_t, has_t,
+                    f_p=F_P_DEFAULT, reduce=overlap_map_reduce,
+                    empty_weight=overlap_map_empty_weight,
+                )
+                metrics["loss_overlap_map"] = float(ovl_loss.detach().item())
+                metrics["overlap_map_iou"] = ovl_metrics["overlap_map_iou"]
+                metrics["overlap_map_dice_pos"] = ovl_metrics["overlap_map_dice_pos"]
+                metrics["overlap_map_empty"] = ovl_metrics["overlap_map_empty"]
+                weighted = weighted + lambda_overlap_map * ovl_loss.to(weighted.dtype)
+
     return weighted, metrics
