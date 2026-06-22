@@ -42,9 +42,15 @@ class ClaimParser:
         # F0 with std dev (must be before base F0 to capture σ): "F0 = 187 Hz (σ = 34 Hz)"
         (r"F0\s*=\s*(\d+\.?\d*)\s*Hz\s*\(?σ\s*=\s*(\d+\.?\d*)\s*Hz", [("f0_mean", 1, "Hz"), ("f0_std", 2, "Hz")]),
         # F0 / pitch (also matches "F0 mean of 96.96 Hz", "mean pitch of 150 Hz",
-        # "fundamental frequency mean is 186.69 Hz")
+        # "fundamental frequency mean is 186.69 Hz"). The connector group also
+        # accepts the observability builder's assert phrasings
+        # "F0 mean can be estimated at X Hz" and "pitch can be measured: the F0
+        # mean is …" — the verb forms "(can be )?estimated/measured at" sit where
+        # is/of would, so without them the builder's variant-2 assert sentence
+        # ("With little overlap, the F0 mean can be estimated at 202.89 Hz.")
+        # silently parsed to zero claims (confirmed MISS, builder ~line 285).
         (
-            r"(?:F0\s*(?:mean\s*)?|(?:mean\s+)?pitch(?:\s+mean)?|fundamental\s+frequency(?:\s+mean)?)\s*(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
+            r"(?:F0\s*(?:mean\s*)?|(?:mean\s+)?pitch(?:\s+mean)?|fundamental\s+frequency(?:\s+mean)?)\s*(?:=|≈|~|is|of|(?:can\s+be\s+)?(?:estimated|measured)\s+at)\s*(?:approximately\s+)?(\d+\.?\d*)\s*Hz",
             [("f0_mean", 1, "Hz")],
         ),
         # Combined phrasing the model emits when it states F0 alongside a second
