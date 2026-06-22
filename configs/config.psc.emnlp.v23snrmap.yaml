@@ -1,0 +1,119 @@
+# v23 — SUPERVISED dense local-SNR-map head (CBM-style, Koh et al. 2007.04612).
+#
+# Builds on the reliability/observability recipe (the abstention spine is KEPT) and
+# adds the directly-supervised dense grounding the project lacked: a head that
+# regresses the per-FRAME local-SNR timeline off the WavLM frames against the
+# stem-derived ORACLE target (clean_features.snr_timeline_db on the Libri2Mix s1/s2
+# stems). The global SNR scalar is the energy-weighted aggregate of this dense
+# local-SNR field (the Ideal Ratio Mask the separation field has supervised for a
+# decade; Wang/Narayanan/Wang TASLP 2014), so the field is computable EXACTLY, not
+# estimated — a directly-supervised 2D-map contribution + the proven abstention head.
+#
+# Additive + default-off elsewhere: lambda_snr_map=0 (the base default) reproduces the
+# reliability baseline byte-for-byte; here it is 0.5. Build the dense targets first with
+# scripts/compute_snr_map_targets.py into snr_map_dir below.
+
+# ── Model ──────────────────────────────────────────────
+lm_name: "Qwen/Qwen3-8B"
+adapter_variant: "film-mamba"
+lora_rank: 16
+lora_alpha: 32
+lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_dropout: 0.05
+tagged_mode: false
+use_sections: false
+score_overlap_spans: false
+beats_cached: false        # timeline head reads WavLM audio_features (no BEATs needed);
+                           # set true + snr_map_predict_irm: true to also train the IRM grid.
+
+# ── Reliability / abstention head (KEPT — the abstention spine) ─────────
+reliability_head: true     # aux head predicts per-feature mean + log-variance
+lambda_nll: 0.3            # heteroscedastic Gaussian NLL term (trains the variance)
+lambda_mse: 0.0            # NLL-only on the mean; >0 to also keep a plain MSE gradient
+
+# ── v23 SUPERVISED dense local-SNR-map head (this run) ─────────────────
+# lambda_snr_map > 0 builds SupervisedSNRMapHead and adds the masked-Huber dense loss
+# on the per-frame SNR timeline (masked to s1-active frames) vs the oracle target.
+lambda_snr_map: 0.5
+# CBM scalar tie: energy-pool the predicted timeline → clip SNR, regress against the
+# catalog snr scalar — predict the SCALAR THROUGH the dense concept (0 → dense-only).
+lambda_snr_scalar: 0.0  # verify-fix: CBM tie regressed pooled pred vs noisy CSV snr_db (mean 17dB) not the dense oracle (~4dB), 16dB/corr-0.29 mismatch. dense-oracle-only.
+# Optional per-T-F IRM branch (needs beats_cached: true + IRM targets + snr_map_predict_irm).
+lambda_snr_irm: 0.0
+snr_map_predict_irm: false
+snr_map_hidden: 256
+snr_map_kernel_size: 5
+snr_map_huber_delta: 1.0
+# Prior-mean dB bias so the per-frame head starts near the dataset SNR mean, not 0 dB.
+snr_map_snr_bias: 5.0  # verify-nit: true per-frame oracle SNR mean ~4dB, not 15.
+# Oracle dense-target dirs (build-A) — scripts/compute_snr_map_targets.py output, per
+# split. Absent → no targets → the term silently no-ops (default-off byte-identical).
+snr_map_dir:
+  train: "/ocean/projects/cis260125p/shared/data/snr_map_targets/train"
+  val:   "/ocean/projects/cis260125p/shared/data/snr_map_targets/dev"
+
+# ── Encoder unfreeze (default frozen) ──────────
+unfreeze_wavlm_top_n: 0
+unfreeze_beats_top_n: 0
+lr_encoder: 1.0e-5
+
+# ── Optimizer ──────────────────────────────────────────────
+optimizer: "adamw"
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+lr_adapter: 1.0e-4
+lr_lm: 1.0e-5
+weight_decay: 0.01
+grad_clip: 1.0
+
+# ── Scheduler ──────────────────────────────────────────────
+lr_scheduler: "cosine"
+warmup_ratio: 0.03
+min_lr_ratio: 0.0
+
+# ── Training ──────────────────────────────────────────────
+bf16: true
+batch_size: 6
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+epochs: 15
+seed: 73
+max_target_length: 512
+max_nums_length: 64
+resume_from: null
+
+# ── Data ──────────────────────────────────────────────
+data_dir: "/ocean/projects/cis260125p/shared/data/processed_pyannote"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_untagged_noseg_nodur.json"
+features_path: "/ocean/projects/cis260125p/shared/data/features.json"
+features_csv:
+  train: "/ocean/projects/cis260125p/shared/data/features_pyannote/train-100.csv"
+  val:   "/ocean/projects/cis260125p/shared/data/features_pyannote/dev.csv"
+num_workers: 4
+pin_memory: true
+
+# ── B-full multi-task loss weights ──────────────
+lambda_prose: 1.0
+lambda_nums:  0.3
+
+# ── Evaluation ──────────────────────────────────────────────
+eval_every_epoch: 1
+prompt: "Describe the quality of this recording."
+prompt_prose: "Describe the quality of this recording."
+prompt_nums:  "List the numerical features of this recording:"
+val_sfs_n: 32
+
+# ── Generation ──────────────────────────────────────────────
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+
+# ── Saving ──────────────────────────────────────────────
+save_dir: "/ocean/projects/cis260125p/shared/checkpoints/v23_snrmap"
+
+# ── Logging ──────────────────────────────────────────────
+wandb_entity: "speech_quality_adapter"
+wandb_project: "aqua-nl-emnlp"
+wandb_run_name: "v23-snrmap"
+log_every: 10

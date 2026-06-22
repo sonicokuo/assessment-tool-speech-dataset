@@ -25,6 +25,7 @@ class PreprocessedDataset(Dataset):
         data_dir: str,
         descriptions_path: str | None = None,
         features_csv: str | None = None,
+        snr_map_dir: str | None = None,
     ):
         self.data_dir = data_dir
         self.files = sorted([f for f in os.listdir(data_dir) if f.endswith(".pt")])
@@ -33,6 +34,19 @@ class PreprocessedDataset(Dataset):
         if descriptions_path and os.path.exists(descriptions_path):
             with open(descriptions_path) as f:
                 self.descriptions = json.load(f)
+
+        # snr_map_dir → oracle DENSE per-frame local-SNR-map targets (build-A), one
+        # small per-clip .pt keyed by filename via manifest.json (written by
+        # scripts/compute_snr_map_targets.py). Loaded LAZILY in __getitem__ so the
+        # dense timelines never sit in RAM for the whole split. Absent dir / manifest
+        # → no targets → snr_map_loss_term is a silent no-op (default-off byte-identical).
+        self.snr_map_dir = snr_map_dir
+        self.snr_map_manifest: dict[str, str] = {}
+        if snr_map_dir:
+            man = os.path.join(snr_map_dir, "manifest.json")
+            if os.path.exists(man):
+                with open(man) as f:
+                    self.snr_map_manifest = json.load(f)
 
         # features_csv → per-clip GT scalars and bare-numbers target string for B-full.
         # Map filename → CSV row dict. Keys missing from the map fall back to
@@ -68,6 +82,21 @@ class PreprocessedDataset(Dataset):
         # the section-query path depending on config.
         if "beats_patches" in cached:
             result["beats_patches"] = cached["beats_patches"]
+
+        # Oracle dense local-SNR-map target (lazy load by filename). Present only when
+        # snr_map_dir was supplied AND this clip has an entry; otherwise the key is
+        # simply absent and the loss term no-ops for this clip.
+        if self.snr_map_manifest:
+            rel = self.snr_map_manifest.get(filename)
+            if rel is not None:
+                tgt_path = os.path.join(self.snr_map_dir, rel)
+                if os.path.exists(tgt_path):
+                    tgt = torch.load(tgt_path, weights_only=False)
+                    result["snr_map_target"] = tgt["snr_map_target"]          # (T,)
+                    if "snr_map_mask" in tgt:
+                        result["snr_map_mask"] = tgt["snr_map_mask"]          # (T,)
+                    if "snr_irm_target" in tgt:
+                        result["snr_irm_target"] = tgt["snr_irm_target"]      # (T_p, F)
 
         if self.descriptions and stem in self.descriptions:
             result["target_text"] = self.descriptions[stem]
@@ -119,6 +148,45 @@ def collate_fn(batch):
         # for the overlap-map supervision time-mask; cheap and back-compatible.
         "audio_lens": torch.tensor([f.shape[0] for f in audio_features], dtype=torch.long),
     }
+
+    # Oracle DENSE per-frame local-SNR-map target. Padded to the SAME max_len as
+    # audio_features (the timeline is on the WavLM 50 Hz frame grid, so it shares T),
+    # giving (B, max_len). The mask is 0 on padded frames, so padding never enters the
+    # masked-Huber loss. Present only when the dataset carries snr_map_target on a clip;
+    # clips without it (legacy / no manifest entry) get an all-zero target + all-zero
+    # mask, so the loss contributes nothing for them. snr_map_loss_term no-ops entirely
+    # when NO clip in the dataset has the key (key absent from out).
+    if any("snr_map_target" in item for item in batch):
+        snr_tgt = torch.zeros(B, max_len)
+        snr_msk = torch.zeros(B, max_len)
+        for i, item in enumerate(batch):
+            t = item.get("snr_map_target")
+            if t is not None:
+                L = min(t.shape[0], max_len)
+                snr_tgt[i, :L] = t[:L].float()
+                m = item.get("snr_map_mask")
+                if m is not None:
+                    snr_msk[i, :L] = m[:L].float()
+                else:
+                    snr_msk[i, :L] = 1.0   # no explicit mask → supervise all real frames
+        out["snr_map_target"] = snr_tgt
+        out["snr_map_mask"] = snr_msk
+
+    # Oracle IRM grid target (optional). Variable T_p per clip → pad to the batch max
+    # T_p with a (B, T_p_max) validity mask (True on real time-patches).
+    if any("snr_irm_target" in item for item in batch):
+        irm_list = [(i, item["snr_irm_target"]) for i, item in enumerate(batch)
+                    if "snr_irm_target" in item]
+        f_bins = irm_list[0][1].shape[1]
+        tp_max = max(t.shape[0] for _i, t in irm_list)
+        irm_padded = torch.zeros(B, tp_max, f_bins)
+        irm_mask = torch.zeros(B, tp_max)
+        for i, t in irm_list:
+            L = t.shape[0]
+            irm_padded[i, :L] = t.float()
+            irm_mask[i, :L] = 1.0
+        out["snr_irm_target"] = irm_padded
+        out["snr_irm_mask"] = irm_mask
 
     # Oracle overlap spans [(start_s, end_s), ...] in SECONDS, one list per clip.
     # Carried as a plain list (variable length, NOT stacked) so the overlap-map

@@ -122,6 +122,155 @@ def _ratio_to_db(sig: float, noi: float, eps: float, cap_db: float = 60.0) -> fl
     return round(val, 2)
 
 
+# ── DENSE per-frame local-SNR timeline (the oracle 2D-map target) ────────────
+def snr_timeline_db(
+    s1: np.ndarray,
+    interferer: np.ndarray,
+    sr: int = 16000,
+    hop: int = 320,
+    n_frames: int | None = None,
+    active_db_below_peak: float = 40.0,
+    cap_db: float = 60.0,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-FRAME instantaneous SNR timeline + s1-active mask from the clean stems.
+
+    Definition (per frame i over the SAME hop the WavLM features use):
+        SNR(i) = 10 * log10( sum_{n in frame i} s1[n]^2 / sum_{n in frame i} interf[n]^2 )
+
+    This is the directly-supervised local-SNR field the speech-separation literature
+    has targeted for a decade (the energy form of the IRM; Wang/Narayanan/Wang TASLP
+    2014). For Libri2Mix mix_clean = s1 + s2 (verified), so the interferer is EXACTLY
+    s2 and the per-frame ratio is the true target-vs-interferer SNR over time.
+
+    GRID: one value every `hop` samples (default 320 → 50 Hz, the WavLM-Large frame
+    grid from preprocess.py), so the returned timeline aligns frame-for-frame with the
+    cached `audio_features` and the model's per-frame prediction. `n_frames`, when
+    given, forces the output length to the clip's WavLM frame count (the per-frame conv
+    can drift by one frame vs n_samples // hop); the timeline is trimmed / zero-padded
+    (with mask 0 on the pad) to exactly n_frames so collate alignment is exact.
+
+    ACTIVE MASK: a frame is active iff the TARGET s1's frame energy is within
+    `active_db_below_peak` dB of the clip's peak s1-frame energy — the SAME active-set
+    rule clean_snr_db uses for the scalar. The timeline is only well-posed where s1 is
+    present (elsewhere it is 0/0); the mask is what the head supervises on, so the
+    silence / target-absent frames never enter the loss.
+
+    Per-frame caps: frames with a silent interferer cap at +cap_db (very clean); the
+    whole timeline is clipped to [-cap_db, +cap_db] so it stays finite for the Huber.
+
+    Returns:
+        (timeline, active_mask), both float32 length n_frames (or n_samples//hop when
+        n_frames is None). timeline is SNR in dB (0 where inactive — but those frames
+        are masked out), active_mask is 1.0 on s1-active frames else 0.0.
+    """
+    s1 = np.asarray(s1, dtype=np.float64).ravel()
+    interferer = np.asarray(interferer, dtype=np.float64).ravel()
+    n = min(s1.shape[0], interferer.shape[0])
+    if n == 0:
+        L = int(n_frames) if n_frames else 0
+        return np.zeros(L, dtype=np.float32), np.zeros(L, dtype=np.float32)
+    s1, interferer = s1[:n], interferer[:n]
+
+    nf = n // hop
+    if nf < 1:
+        nf = 1
+    s1c = s1[: nf * hop].reshape(nf, hop) if n >= hop else s1.reshape(1, -1)
+    inc = interferer[: nf * hop].reshape(nf, hop) if n >= hop else interferer.reshape(1, -1)
+    s1_pow = (s1c ** 2).mean(axis=1)                       # (nf,)
+    in_pow = (inc ** 2).mean(axis=1)                       # (nf,)
+
+    # per-frame SNR in dB with a silent-interferer cap and an overall clip.
+    timeline = np.full(nf, cap_db, dtype=np.float64)
+    nz = in_pow > eps
+    timeline[nz] = 10.0 * np.log10((s1_pow[nz] + eps) / in_pow[nz])
+    timeline = np.clip(timeline, -cap_db, cap_db)
+
+    # s1-active mask (same rule as clean_snr_db).
+    peak = float(s1_pow.max()) if s1_pow.size else 0.0
+    if peak <= eps:
+        active = np.zeros(nf, dtype=np.float64)
+    else:
+        thresh = peak * (10.0 ** (-active_db_below_peak / 10.0))
+        active = (s1_pow >= thresh).astype(np.float64)
+
+    timeline = timeline.astype(np.float32)
+    active = active.astype(np.float32)
+
+    # Force to the requested length (WavLM frame count) so it aligns with audio_features.
+    if n_frames is not None:
+        L = int(n_frames)
+        if nf >= L:
+            timeline, active = timeline[:L], active[:L]
+        else:
+            timeline = np.pad(timeline, (0, L - nf))
+            active = np.pad(active, (0, L - nf))
+    return timeline, active
+
+
+def irm_grid(
+    s1: np.ndarray,
+    interferer: np.ndarray,
+    sr: int = 16000,
+    n_fft: int = 512,
+    hop: int = 256,
+    t_p: int | None = None,
+    f_bins: int = 8,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Oracle Ideal Ratio Mask pooled to the BEATs (T_p, F_bins) patch grid.
+
+    IRM(t,f) = ( |S1(t,f)|^2 / (|S1(t,f)|^2 + |Interf(t,f)|^2) ) ** 0.5
+    (Wang, Narayanan & Wang, TASLP 2014). Computed on the STFT magnitudes of the clean
+    stems (an EXACT oracle since mix = s1 + s2), then average-pooled from the dense
+    STFT (T_stft, n_fft/2+1) grid down to the coarse BEATs (T_p, f_bins) patch grid the
+    IRM head predicts on. Optional — only needed when training the IRM branch.
+
+    Returns:
+        (T_p, f_bins) float32 IRM in [0,1]. T_p defaults to the STFT frame count when
+        not given.
+    """
+    s1 = np.asarray(s1, dtype=np.float64).ravel()
+    interferer = np.asarray(interferer, dtype=np.float64).ravel()
+    n = min(s1.shape[0], interferer.shape[0])
+    if n == 0:
+        return np.zeros((int(t_p or 1), int(f_bins)), dtype=np.float32)
+    s1, interferer = s1[:n], interferer[:n]
+
+    def _stft_mag(x):
+        win = np.hanning(n_fft)
+        frames = []
+        for start in range(0, max(1, len(x) - n_fft + 1), hop):
+            seg = x[start:start + n_fft]
+            if len(seg) < n_fft:
+                seg = np.pad(seg, (0, n_fft - len(seg)))
+            frames.append(np.abs(np.fft.rfft(seg * win)))
+        if not frames:
+            frames = [np.abs(np.fft.rfft(np.pad(x, (0, n_fft - len(x))) * win))]
+        return np.stack(frames, axis=0)                    # (T_stft, n_fft//2+1)
+
+    S1 = _stft_mag(s1) ** 2
+    IN = _stft_mag(interferer) ** 2
+    irm = np.sqrt(S1 / (S1 + IN + eps))                    # (T_stft, Fbin) in [0,1]
+
+    # pool the freq axis down to f_bins, the time axis down to t_p.
+    T_stft, Fbin = irm.shape
+    Tp = int(t_p) if t_p else T_stft
+    # frequency pooling: average within equal freq bands.
+    f_edges = np.linspace(0, Fbin, f_bins + 1).astype(int)
+    f_pooled = np.stack(
+        [irm[:, f_edges[j]:max(f_edges[j] + 1, f_edges[j + 1])].mean(axis=1) for j in range(f_bins)],
+        axis=1,
+    )                                                      # (T_stft, f_bins)
+    # time pooling to Tp.
+    t_edges = np.linspace(0, T_stft, Tp + 1).astype(int)
+    out = np.stack(
+        [f_pooled[t_edges[i]:max(t_edges[i] + 1, t_edges[i + 1])].mean(axis=0) for i in range(Tp)],
+        axis=0,
+    )                                                      # (Tp, f_bins)
+    return out.astype(np.float32)
+
+
 # ── lazy Praat / VERSA wrappers (single-speaker stem, well-posed) ────────────
 def clean_srmr(s1_wav_path: str, srmr_config: dict | None = None) -> float:
     """SRMR of the clean s1 stem. Single-speaker -> well-posed reverberation.
