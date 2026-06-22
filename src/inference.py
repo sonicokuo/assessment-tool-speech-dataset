@@ -443,7 +443,9 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         .to(device)
         .to(torch.bfloat16)
     )
-    adapter.load_state_dict(checkpoint["adapter_state_dict"])
+    # strict=False: reliability/aux-head checkpoints (regress_head.*) carry keys the
+    # generation-time adapter doesn't build; the head is training-only, so ignore extras.
+    adapter.load_state_dict(checkpoint["adapter_state_dict"], strict=False)
     # New checkpoints use `llm_state_dict`; legacy ones used `lora_state_dict`.
     # SLIM ckpts (ckpt_format="peft_slim") carry only LoRA + unfrozen rows and load
     # strict=False over the already-built (from_pretrained + get_peft_model) base;
