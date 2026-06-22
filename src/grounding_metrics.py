@@ -31,17 +31,36 @@ def _grid(alpha_flat, n_freq: int) -> np.ndarray:
 
 
 def time_mass(alpha_flat, n_freq: int = F_P_DEFAULT) -> np.ndarray:
-    """Per-time-bin attention mass (marginalized over frequency), normalized to sum 1."""
+    """Per-time-bin attention mass (marginalized over frequency), normalized to sum 1.
+
+    A map with NO positive mass (e.g. a fully-collapsed bottleneck keep-mask that clamps
+    to all-zero for a feature whose bits-penalty drove every keep-logit very negative) is
+    NOT undefined: it localizes nothing, so it is treated as the maximally UNINFORMATIVE
+    map (uniform over time bins). Downstream metrics then score it LOW (concentration ->
+    ~1.0, soft-IoU -> the gt-fraction floor) instead of returning null. Negative entries
+    are floored at 0 first. Any genuinely informative map (positive variation) is
+    unaffected.
+    """
     m = _grid(alpha_flat, n_freq).mean(axis=1)
+    m = np.clip(m, 0.0, None)
     s = m.sum()
-    return m / s if s > 0 else m
+    if s > 0:
+        return m / s
+    return np.full_like(m, 1.0 / len(m)) if len(m) > 0 else m
 
 
 def freq_mass(alpha_flat, n_freq: int = F_P_DEFAULT) -> np.ndarray:
-    """Per-frequency-band attention mass (marginalized over time), normalized to sum 1."""
+    """Per-frequency-band attention mass (marginalized over time), normalized to sum 1.
+
+    Zero-mass / all-negative maps fall back to uniform (see time_mass) so a collapsed
+    map scores as uninformative rather than yielding null.
+    """
     m = _grid(alpha_flat, n_freq).mean(axis=0)
+    m = np.clip(m, 0.0, None)
     s = m.sum()
-    return m / s if s > 0 else m
+    if s > 0:
+        return m / s
+    return np.full_like(m, 1.0 / len(m)) if len(m) > 0 else m
 
 
 def time_concentration_ratio(
@@ -139,6 +158,48 @@ def iou_time(
         "n_pred": int(pred.sum()),
         "n_gt": int(gt.sum()),
     }
+
+
+def soft_iou_time(
+    alpha_flat,
+    windows: list[tuple[float, float]],
+    duration: float,
+    n_freq: int = F_P_DEFAULT,
+) -> dict | None:
+    """Threshold-FREE soft (continuous) IoU of the time-marginalized map vs the oracle.
+
+    Unlike iou_time (which thresholds the map to a binary keep-set and is brittle on a
+    flat/collapsed map, where median(tm)==tm gives an all-False prediction and IoU 0),
+    this works directly on the normalized per-bin mass. The oracle is turned into a
+    per-bin mass g (uniform over GT bins, sum 1) and the soft IoU is the histogram
+    intersection-over-union:
+
+        soft_iou = sum_i min(p_i, g_i) / sum_i max(p_i, g_i)
+
+    with p = time_mass (sum 1) and g = GT mass (sum 1). For a perfectly concentrated map
+    (all mass on GT bins) -> 1.0; for a flat/uniform map -> ~gt_frac (the uninformative
+    floor); for mass entirely off the GT bins -> ~0. It is ALWAYS a number when there is
+    at least one GT window and a valid duration, including the collapsed-mask case (where
+    time_mass falls back to uniform), so a diffuse / ungrounded map scores LOW, never null.
+
+    Returns {soft_iou, gt_frac, n_bins} or None only when there are no windows or no
+    duration.
+    """
+    if not windows or duration <= 0:
+        return None
+    tm = time_mass(alpha_flat, n_freq)
+    t_p = len(tm)
+    if t_p == 0:
+        return None
+    gt = _time_bin_in_windows(t_p, windows, duration).astype(float)
+    if gt.sum() <= 0:
+        return None
+    g = gt / gt.sum()
+    inter = float(np.minimum(tm, g).sum())
+    union = float(np.maximum(tm, g).sum())
+    if union <= 0:
+        return None
+    return {"soft_iou": inter / union, "gt_frac": float(gt.mean()), "n_bins": t_p}
 
 
 def pointing_game(

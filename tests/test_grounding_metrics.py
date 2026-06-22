@@ -67,10 +67,18 @@ def test_time_concentration_avoids_region_below_one():
 
 
 def test_time_concentration_none_cases():
+    # genuinely-undefined inputs (no windows / no duration) still return None.
     assert time_concentration_ratio(_grid([1, 1], [1] * NF), [], 1.0, NF) is None
     assert time_concentration_ratio(_grid([1, 1], [1] * NF), [(0, 0.5)], 0.0, NF) is None
-    # zero mass
-    assert time_concentration_ratio([0.0] * (4 * NF), [(0, 0.5)], 1.0, NF) is None
+
+
+def test_time_concentration_zero_mass_is_uniform_not_none():
+    # A collapsed / all-zero map (e.g. a fully-OFF bottleneck keep-mask) localizes
+    # nothing. It must NOT return null: it is scored as the maximally uninformative
+    # (uniform) map, so the concentration ratio is ~1.0 (no better than uniform).
+    r = time_concentration_ratio([0.0] * (4 * NF), [(0, 0.5)], 1.0, NF)
+    assert r is not None
+    assert 0.8 < r["ratio"] < 1.2
 
 
 # ── frequency-band concentration (pitch) ─────────────────────────────────────
@@ -88,10 +96,18 @@ def test_freq_band_uniform_is_about_one():
 
 
 def test_freq_band_none_cases():
-    assert freq_band_concentration_ratio([0.0] * (3 * NF), [0, 1], NF) is None
+    # empty band (no valid rows) is genuinely undefined → None.
     assert freq_band_concentration_ratio(_grid([1, 1], [1] * NF), [], NF) is None
     # out-of-range band rows filtered out → None
     assert freq_band_concentration_ratio(_grid([1, 1], [1] * NF), [99, 100], NF) is None
+
+
+def test_freq_band_zero_mass_is_uniform_not_none():
+    # A zero-mass map falls back to a uniform frequency distribution: a 2/8 band
+    # then carries ~its fractional mass, so ratio ~1.0 (uninformative), not None.
+    r = freq_band_concentration_ratio([0.0] * (3 * NF), [0, 1], NF)
+    assert r is not None
+    assert 0.8 < r["ratio"] < 1.2
 
 
 # ── time-axis IoU (bottleneck keep-mask vs oracle spans) ─────────────────────
@@ -120,9 +136,33 @@ def test_iou_time_median_threshold_default():
 
 
 def test_iou_time_none_cases():
+    # no windows / no duration are genuinely undefined → None.
     assert iou_time(_grid([1, 1], [1] * NF), [], 1.0, NF) is None
     assert iou_time(_grid([1, 1], [1] * NF), [(0, 0.5)], 0.0, NF) is None
-    assert iou_time([0.0] * (4 * NF), [(0, 0.5)], 1.0, NF) is None
+
+
+def test_iou_time_zero_mass_scores_low_not_none():
+    # A collapsed map is scored, not nulled. Under the uniform fallback the per-bin
+    # mass is constant, so a strict > median threshold keeps nothing → a low IoU
+    # (0.0 here), never None. The threshold-free soft IoU is the robust companion.
+    r = iou_time([0.0] * (4 * NF), [(0, 0.5)], 1.0, NF)
+    assert r is not None
+    assert r["iou"] == 0.0
+
+
+def test_soft_iou_time_collapsed_map_is_low_not_none():
+    from grounding_metrics import soft_iou_time
+    # uniform/collapsed map → soft IoU near the gt-fraction floor, always a number.
+    r = soft_iou_time([0.0] * (10 * NF), [(0.0, 0.5)], 1.0, NF)
+    assert r is not None
+    assert 0.0 < r["soft_iou"] < 0.6
+    # a perfectly concentrated map on the GT bins → soft IoU ~1.
+    tp = [0.0] * 10
+    tp[0] = tp[1] = tp[2] = tp[3] = tp[4] = 1.0   # mass on the first half = GT window
+    r2 = soft_iou_time(_grid(tp, [1] * NF), [(0.0, 0.5)], 1.0, NF)
+    assert r2 is not None and r2["soft_iou"] > 0.95
+    # no windows → None.
+    assert soft_iou_time(_grid(tp, [1] * NF), [], 1.0, NF) is None
 
 
 # ── pointing game (argmax bin inside a window?) ──────────────────────────────
@@ -138,8 +178,16 @@ def test_pointing_game_hit_and_miss():
 
 
 def test_pointing_game_none_cases():
+    # no windows → genuinely undefined → None.
     assert pointing_game(_grid([1, 1], [1] * NF), [], 1.0, NF) is None
-    assert pointing_game([0.0] * (3 * NF), [(0, 0.5)], 1.0, NF) is None
+
+
+def test_pointing_game_zero_mass_returns_dict_not_none():
+    # A collapsed map falls back to uniform; argmax is deterministic (bin 0) so the
+    # metric still returns a result dict (a number), never None.
+    r = pointing_game([0.0] * (3 * NF), [(0, 0.5)], 1.0, NF)
+    assert r is not None
+    assert "hit" in r and isinstance(r["hit"], bool)
 
 
 if __name__ == "__main__":

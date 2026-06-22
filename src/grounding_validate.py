@@ -83,7 +83,27 @@ def load_head(checkpoint_path: str, device: str = "cpu") -> DecoupledGroundingHe
         concrete_temp=float(cfg.get("concrete_temp_end",
                                     cfg.get("concrete_temp_start", 1.0))),
     )
-    head.load_state_dict(ck["decoupled_head_state_dict"])
+    # Load tolerantly: a softmax (v17-era) checkpoint predates the bottleneck-only
+    # `concrete_temp` buffer (and any other non-parameter buffer added later), so a
+    # strict load wrongly rejects it. We allow MISSING BUFFERS (the freshly-built head
+    # keeps its constructed default, e.g. concrete_temp from the config) but still
+    # require every trainable PARAMETER to be present, so we never silently score a
+    # head with randomly-initialised weights.
+    sd = ck["decoupled_head_state_dict"]
+    missing, unexpected = head.load_state_dict(sd, strict=False)
+    param_names = {n for n, _ in head.named_parameters()}
+    missing_params = [k for k in missing if k in param_names]
+    if missing_params:
+        raise ValueError(
+            f"{checkpoint_path}: head checkpoint is missing trainable parameters "
+            f"{missing_params} — refusing to score a partially-initialised head."
+        )
+    if unexpected:
+        # extra keys in the checkpoint that the rebuilt head does not have: harmless
+        # (e.g. a renamed/removed buffer), but surface it so it is not silent.
+        print(f"[load_head] note: ignored {len(unexpected)} unexpected key(s) "
+              f"in {os.path.basename(checkpoint_path)}: {unexpected[:5]}"
+              f"{'...' if len(unexpected) > 5 else ''}")
     head.to(device).eval()
     return head
 
@@ -310,8 +330,10 @@ def validate(
     fidx = names.index(feature_name)
 
     rng = np.random.default_rng(seed)
-    ious, points, ratios, rand_ratios = [], [], [], []
+    ious, soft_ious, points, ratios, rand_ratios = [], [], [], [], []
+    rand_soft_ious = []
     n_overlap = 0
+    n_collapsed = 0          # overlap clips whose map carries NO positive mass (uniform fallback)
     del_aucs = []
 
     for s in samples:
@@ -324,9 +346,21 @@ def validate(
 
         if segs and dur > 0:
             n_overlap += 1
-            r_iou = gm.iou_time(alpha, segs, dur, f_dim, thresh="median")
+            # a map with no positive mass localizes nothing — track it so a collapsed
+            # (e.g. bits-penalty-zeroed) bottleneck mask reads as DIFFUSE/low, not null.
+            if float(np.clip(np.asarray(alpha, float), 0.0, None).sum()) <= 0.0:
+                n_collapsed += 1
+            # primary IoU: threshold-FREE soft histogram IoU (robust on flat/collapsed
+            # maps where the median-thresholded hard IoU degenerates to 0).
+            r_siou = gm.soft_iou_time(alpha, segs, dur, f_dim)
+            r_iou = gm.iou_time(alpha, segs, dur, f_dim, thresh="median")   # hard, secondary
             r_pt = gm.pointing_game(alpha, segs, dur, f_dim)
             r_cr = gm.time_concentration_ratio(alpha, segs, dur, f_dim)
+            rand_alpha = rng.permutation(alpha)
+            if r_siou is not None:
+                soft_ious.append(r_siou["soft_iou"])
+                rr_si = gm.soft_iou_time(rand_alpha, segs, dur, f_dim)
+                rand_soft_ious.append(rr_si["soft_iou"] if rr_si is not None else 0.0)
             if r_iou is not None:
                 ious.append(r_iou["iou"])
             if r_pt is not None:
@@ -334,7 +368,6 @@ def validate(
             if r_cr is not None:
                 ratios.append(r_cr["ratio"])
                 # random-λ baseline concentration (same shape, shuffled mass).
-                rand_alpha = rng.permutation(alpha)
                 rr = gm.time_concentration_ratio(rand_alpha, segs, dur, f_dim)
                 rand_ratios.append(rr["ratio"] if rr is not None else 1.0)
 
@@ -348,6 +381,17 @@ def validate(
         "grounding_mode": head.grounding_mode,
         "n_clips": len(samples),
         "n_overlap_clips": n_overlap,
+        # n_collapsed: overlap clips whose extracted map had NO positive mass (the
+        # bottleneck keep-mask clamped fully OFF for this feature). Such maps localize
+        # nothing and are scored as the uninformative floor (soft_iou ~ gt_frac,
+        # concentration ~ 1.0), never null. A high n_collapsed/n_overlap flags a
+        # DIFFUSE / ungrounded map (often a partially-trained bottleneck), not a bug.
+        "n_collapsed_maps": n_collapsed,
+        "frac_collapsed": float(n_collapsed / n_overlap) if n_overlap else None,
+        # primary IoU is the threshold-free soft histogram IoU (always defined).
+        "soft_iou_mean": float(np.mean(soft_ious)) if soft_ious else None,
+        "soft_iou_random_mean": float(np.mean(rand_soft_ious)) if rand_soft_ious else None,
+        # hard median-thresholded IoU kept for continuity (brittle on flat maps).
         "iou_mean": float(np.mean(ious)) if ious else None,
         "pointing_game_hit_rate": float(np.mean(points)) if points else None,
         "concentration_ratio_mean": float(np.mean(ratios)) if ratios else None,
