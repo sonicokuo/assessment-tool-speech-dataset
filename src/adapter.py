@@ -379,8 +379,19 @@ class AdapterWithAuxHead(nn.Module):
     gradient on the audio→numerical-feature mapping — bypassing the LM and the noisy
     digit-subword cross-entropy path.
 
-    Forward returns (prefix, scalar_pred). At inference, scalar_pred is unused; the
-    prefix goes into the LM as before.
+    Two head modes (selected by `reliability_head`):
+      - reliability_head=False (default): a plain `nn.Linear(lm_dim, n_features)`
+        regress_head predicting per-feature MEANS. forward returns (prefix,
+        scalar_pred) and behaviour is byte-identical to the original aux head.
+      - reliability_head=True: a HETEROSCEDASTIC `ReliabilityHead` predicting per
+        feature a mean AND a log-variance (Linear(lm_dim, 2*n_features)). forward
+        returns (prefix, (mean, log_var)); scalar_pred is the 2-tuple. The predicted
+        σ = exp(0.5·log_var) is the per-feature ABSTENTION signal consumed by the
+        risk-coverage eval. Trained with the heteroscedastic NLL (see compute_loss's
+        lambda_nll term).
+
+    At inference the prefix goes into the LM as before; the scalar head output is used
+    only for the numbers/abstention path.
     """
 
     def __init__(
@@ -388,18 +399,30 @@ class AdapterWithAuxHead(nn.Module):
         inner: nn.Module,
         lm_dim: int = LM_DIM,
         n_features: int = N_AUX_FEATURES,
+        reliability_head: bool = False,
     ):
         super().__init__()
         self.inner = inner
-        self.regress_head = nn.Linear(lm_dim, n_features)
+        self.reliability_head = bool(reliability_head)
+        if self.reliability_head:
+            # Imported here (not at module top) so adapter.py stays importable in
+            # environments that only need the plain adapter. ReliabilityHead is a
+            # thin Linear(lm_dim, 2*n_features) wrapper splitting mean / log-var.
+            from reliability_head import ReliabilityHead
+            self.regress_head = ReliabilityHead(lm_dim, n_features=n_features)
+        else:
+            self.regress_head = nn.Linear(lm_dim, n_features)
 
     def forward(
         self,
         audio_features: torch.Tensor,
         overlap_info: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, object]:
         prefix = self.inner(audio_features, overlap_info)   # (B, N, lm_dim)
         pooled = prefix.mean(dim=1)                         # (B, lm_dim)
+        if self.reliability_head:
+            mean, log_var = self.regress_head(pooled)       # each (B, n_features)
+            return prefix, (mean, log_var)
         scalar_pred = self.regress_head(pooled)             # (B, n_features)
         return prefix, scalar_pred
 
@@ -409,6 +432,7 @@ def build_adapter(
     variant: str = "film-mamba",
     with_aux_head: bool = True,
     n_aux_features: int = N_AUX_FEATURES,
+    reliability_head: bool = False,
     **kwargs,
 ) -> nn.Module:
     """Build an adapter variant by name, optionally wrapped with an aux regression head.
@@ -421,11 +445,18 @@ def build_adapter(
                        legacy single-tensor return signature (e.g. for old checkpoints).
         n_aux_features: number of scalar features the aux head regresses to (default 13,
                        matching src/feature_set.py::N_FEATURES).
+        reliability_head: if True, the aux head is the HETEROSCEDASTIC ReliabilityHead
+                       (predicts per-feature mean AND log-variance), and forward returns
+                       (prefix, (mean, log_var)). Default False → plain Linear mean head,
+                       byte-identical to before. Only consulted when with_aux_head=True.
 
     Returns:
         nn.Module whose forward(audio, overlap) returns:
-          - if with_aux_head=True:  (prefix: (B,N,lm_dim), scalar_pred: (B, n_aux_features))
-          - if with_aux_head=False: prefix only (legacy)
+          - with_aux_head=True, reliability_head=False:
+              (prefix: (B,N,lm_dim), scalar_pred: (B, n_aux_features))
+          - with_aux_head=True, reliability_head=True:
+              (prefix: (B,N,lm_dim), (mean: (B, n_aux_features), log_var: (B, n_aux_features)))
+          - with_aux_head=False: prefix only (legacy)
     """
     variants = {
         "concat-only": lambda **kw: ConcatOnlyAdapter(**kw),
@@ -444,5 +475,8 @@ def build_adapter(
     inner = variants[variant](**kwargs)
     lm_dim = kwargs.get("lm_dim", LM_DIM)
     if with_aux_head:
-        return AdapterWithAuxHead(inner, lm_dim=lm_dim, n_features=n_aux_features)
+        return AdapterWithAuxHead(
+            inner, lm_dim=lm_dim, n_features=n_aux_features,
+            reliability_head=reliability_head,
+        )
     return inner

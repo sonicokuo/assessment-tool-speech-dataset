@@ -61,6 +61,47 @@ FEATURE_SCALES: tuple[float, ...] = (
 )
 assert len(FEATURE_SCALES) == N_FEATURES, "FEATURE_SCALES length must match SUPERVISED_FEATURES"
 
+
+# ── Observability classification (paper pivot: "Observability-Aware Description") ──
+# Which features the signal can physically support a number for. On a 2-speaker mix,
+# single-speaker pitch (f0_mean / f0_sd) is unrecoverable — pitch is the confirmed
+# ill-posed case. SRMR is NOT ill-posed (it does not recover on a clean stem either),
+# so it is treated as recoverable. These sets drive the reliability/abstention head's
+# evaluation: the ILL_POSED features are where the model should band/abstain under
+# overlap, and the RECOVERABLE features are the ones SFS keeps scoring as numbers.
+#
+# Membership is by short_name (col 0 of SUPERVISED_FEATURES). Anything not listed in
+# ILL_POSED is recoverable by default. These are LABELS only — they do not change any
+# training math unless an experiment explicitly consumes them (e.g. risk-coverage
+# stratification), so adding them is a no-op for existing runs.
+RECOVERABLE_FEATURES: frozenset[str] = frozenset({
+    "snr", "srmr", "speaking_rate", "pause_count", "pause_rate", "overlap_ratio",
+})
+ILL_POSED_UNDER_OVERLAP_FEATURES: frozenset[str] = frozenset({
+    "f0_mean", "f0_sd",
+})
+
+# Per-feature index lookups, in SUPERVISED_FEATURES order, for the reliability head /
+# risk-coverage eval. Sanity: every short_name is classified exactly once.
+FEATURE_NAMES: tuple[str, ...] = tuple(name for name, _csv, _fmt in SUPERVISED_FEATURES)
+assert (RECOVERABLE_FEATURES | ILL_POSED_UNDER_OVERLAP_FEATURES) == frozenset(FEATURE_NAMES), (
+    "every supervised feature must be classified recoverable XOR ill-posed"
+)
+assert not (RECOVERABLE_FEATURES & ILL_POSED_UNDER_OVERLAP_FEATURES), (
+    "a feature cannot be both recoverable and ill-posed"
+)
+
+
+def recoverable_mask() -> "torch.Tensor":
+    """(N_FEATURES,) bool tensor, True where the feature is recoverable from the mix.
+
+    Useful as a constant abstention prior or for stratifying the risk-coverage curve
+    by observability class. Order matches SUPERVISED_FEATURES.
+    """
+    return torch.tensor(
+        [name in RECOVERABLE_FEATURES for name in FEATURE_NAMES], dtype=torch.bool,
+    )
+
 # Features that are *integers in nature* — pause_count is the only one in the
 # trimmed catalog. Used by build_nums_target to cast before formatting.
 _INT_FEATURES = {"pause_count"}

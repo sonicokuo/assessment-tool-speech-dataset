@@ -1,0 +1,103 @@
+# Observability-aware reliability/abstention head + (optional) encoder unfreeze.
+#
+# Inherits the v7 LoRA-8B recipe (configs/config.psc.emnlp.yaml) and turns ON the two
+# additive capabilities this branch adds:
+#   1. reliability_head: the aux head predicts per-feature (mean, log-variance); the
+#      heteroscedastic NLL (lambda_nll) trains the variance so high predicted sigma =
+#      "abstain on this feature". Risk-coverage / AURC is produced offline by
+#      src/reliability_eval.py from the head's (mean, sigma) + SFS correctness.
+#   2. (optional, commented) encoder unfreeze for the Q4 capacity experiment — fine-tune
+#      the top-N WavLM/BEATs blocks at a small lr_encoder. Default 0 (frozen). Note the
+#      WavLM unfreeze only takes effect with an end-to-end waveform forward (waveforms
+#      are not in the cached .pt files); BEATs unfreeze requires beats_cached=false.
+#
+# Everything here is default-off in the base config, so omitting this file reproduces
+# the frozen-encoder, plain-MSE-head baseline byte-for-byte.
+
+# ── Model ──────────────────────────────────────────────
+lm_name: "Qwen/Qwen3-8B"
+adapter_variant: "film-mamba"
+lora_rank: 16
+lora_alpha: 32
+lora_targets: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_dropout: 0.05
+tagged_mode: false
+use_sections: false
+score_overlap_spans: false
+beats_cached: false
+
+# ── Reliability / abstention head (this branch) ────────────────────────
+reliability_head: true     # aux head predicts per-feature mean + log-variance
+lambda_nll: 0.3            # weight on the heteroscedastic Gaussian NLL term
+lambda_mse: 0.0            # NLL-only on the mean; set >0 to also keep a plain MSE
+                          # gradient on the mean alongside the variance.
+
+# ── Encoder unfreeze (Q4 capacity experiment; default frozen) ──────────
+# unfreeze_wavlm_top_n: 0   # >0 loads WavLM + unfreezes its top-N blocks (needs an
+#                           # end-to-end waveform forward to take effect)
+# unfreeze_beats_top_n: 0   # >0 unfreezes BEATs top-N blocks (needs beats_cached: false)
+# lr_encoder: 1.0e-5        # small LR for the unfrozen encoder param-group
+unfreeze_wavlm_top_n: 0
+unfreeze_beats_top_n: 0
+lr_encoder: 1.0e-5
+
+# ── Optimizer ──────────────────────────────────────────────
+optimizer: "adamw"
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+lr_adapter: 1.0e-4
+lr_lm: 1.0e-5
+weight_decay: 0.01
+grad_clip: 1.0
+
+# ── Scheduler ──────────────────────────────────────────────
+lr_scheduler: "cosine"
+warmup_ratio: 0.03
+min_lr_ratio: 0.0
+
+# ── Training ──────────────────────────────────────────────
+bf16: true
+batch_size: 6
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+epochs: 15
+seed: 73
+max_target_length: 512
+max_nums_length: 64
+resume_from: null
+
+# ── Data ──────────────────────────────────────────────
+data_dir: "/ocean/projects/cis260125p/shared/data/processed_pyannote"
+descriptions_path: "/ocean/projects/cis260125p/shared/data/descriptions_untagged_noseg_nodur.json"
+features_path: "/ocean/projects/cis260125p/shared/data/features.json"
+features_csv:
+  train: "/ocean/projects/cis260125p/shared/data/features_pyannote/train-100.csv"
+  val:   "/ocean/projects/cis260125p/shared/data/features_pyannote/dev.csv"
+num_workers: 4
+pin_memory: true
+
+# ── B-full multi-task loss weights ──────────────
+lambda_prose: 1.0
+lambda_nums:  0.3
+
+# ── Evaluation ──────────────────────────────────────────────
+eval_every_epoch: 1
+prompt: "Describe the quality of this recording."
+prompt_prose: "Describe the quality of this recording."
+prompt_nums:  "List the numerical features of this recording:"
+val_sfs_n: 32
+
+# ── Generation ──────────────────────────────────────────────
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+
+# ── Saving ──────────────────────────────────────────────
+save_dir: "/ocean/projects/cis260125p/shared/checkpoints/v19_reliability"
+
+# ── Logging ──────────────────────────────────────────────
+wandb_entity: "speech_quality_adapter"
+wandb_project: "aqua-nl-emnlp"
+wandb_run_name: null
+log_every: 10

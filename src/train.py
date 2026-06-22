@@ -522,11 +522,19 @@ def compute_loss(
     overlap_info = overlap_info.to(device).to(torch.bfloat16)
 
     # AdapterWithAuxHead returns (prefix, scalar_pred); legacy adapters return prefix only.
+    # With reliability_head=True the aux head's scalar_pred is itself a (mean, log_var)
+    # tuple — split it so the MSE path keeps using the predicted MEAN and the new NLL
+    # term (below) gets both mean and log_var. With the plain head, scalar_pred is the
+    # mean tensor and reliability_log_var stays None (NLL term is then skipped).
     out = adapter(audio_features, overlap_info)
     if isinstance(out, tuple):
         prefix_embeds, scalar_pred = out
     else:
         prefix_embeds, scalar_pred = out, None
+
+    reliability_log_var = None
+    if isinstance(scalar_pred, tuple):
+        scalar_pred, reliability_log_var = scalar_pred   # (mean, log_var)
 
     metrics: dict[str, float] = {}
 
@@ -614,6 +622,40 @@ def compute_loss(
     else:
         metrics["loss_mse"] = 0.0
 
+    # [reliability_head] Heteroscedastic Gaussian NLL (Kendall & Gal 2017). Uses the
+    # SAME masked, per-feature-scale-normalized error as the MSE above, but lets the
+    # head learn a per-feature log-variance so high predicted σ = "this feature is
+    # unreliable here" — the abstention signal the risk-coverage eval consumes. No-op
+    # unless the adapter has a reliability head (reliability_log_var is not None),
+    # there are GT scalars, and lambda_nll > 0; so plain-MSE runs are unaffected.
+    nll_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    has_nll = (
+        reliability_log_var is not None
+        and scalar_pred is not None
+        and gt_scalars is not None
+        and gt_mask is not None
+        and float(config.get("lambda_nll", 0.0)) > 0.0
+    )
+    if has_nll:
+        from reliability_head import heteroscedastic_nll
+        gt_scalars_n = gt_scalars.to(device).to(scalar_pred.dtype)
+        gt_mask_n = gt_mask.to(device)
+        scales_n = torch.tensor(FEATURE_SCALES, device=device, dtype=scalar_pred.dtype)
+        nll_loss = heteroscedastic_nll(
+            scalar_pred, reliability_log_var.to(scalar_pred.dtype),
+            gt_scalars_n, mask=gt_mask_n, scales=scales_n,
+        ).to(lm_loss_prose.dtype)
+        metrics["loss_nll"] = float(nll_loss.detach().item())
+        # Mean predicted σ over present slots — a quick "is the head using its
+        # uncertainty channel" diagnostic. Higher = more abstention headroom.
+        with torch.no_grad():
+            sigma = torch.exp(0.5 * reliability_log_var.float())
+            mask_f = gt_mask_n.to(sigma.dtype)
+            denom_s = mask_f.sum().clamp(min=1.0)
+            metrics["reliability_sigma_mean"] = float((sigma * mask_f).sum() / denom_s)
+    else:
+        metrics["loss_nll"] = 0.0
+
     # [decoupled_grounding] Parallel token-free 2D-grounding term. Runs the head on
     # the batch's BEATs patches (NOT the adapter/LM path) and regresses each scored
     # feature out of A · V.detach(). Its gradient lands on the head's own queries /
@@ -659,8 +701,14 @@ def compute_loss(
     lambda_prose = float(config.get("lambda_prose", 1.0))
     lambda_nums = float(config.get("lambda_nums", 0.0))
     lambda_mse = float(config.get("lambda_mse", 0.0))
+    lambda_nll = float(config.get("lambda_nll", 0.0))
 
     total = lambda_prose * lm_loss_prose + lambda_nums * lm_loss_nums + lambda_mse * mse_loss
+    # [reliability_head] add the heteroscedastic NLL term (nll_loss is 0 when the head
+    # is absent or lambda_nll == 0). Note: NLL and plain MSE can be used together (NLL
+    # trains the variance, MSE keeps a clean mean gradient) or NLL alone — set
+    # lambda_mse=0 for NLL-only on the same predicted mean.
+    total = total + lambda_nll * nll_loss
     # [section_readout] add the grounding term (readout_loss is 0 when disabled).
     total = total + lambda_readout * readout_loss
     # [decoupled_grounding] add the parallel grounding term (already scaled by
@@ -755,8 +803,55 @@ def train(config: dict) -> None:
     embed_layer = llm.get_input_embeddings()
 
     # Adapter
+    # [reliability_head] when reliability_head=true the aux head predicts per-feature
+    # (mean, log_var) instead of a bare mean — the heteroscedastic abstention head.
+    # Default false → plain Linear mean head, byte-identical to before.
     lm_hidden_size = llm.config.hidden_size
-    adapter = build_adapter(config["adapter_variant"], lm_dim=lm_hidden_size).to(device).to(torch.bfloat16)
+    adapter = build_adapter(
+        config["adapter_variant"], lm_dim=lm_hidden_size,
+        reliability_head=bool(config.get("reliability_head", False)),
+    ).to(device).to(torch.bfloat16)
+    if config.get("reliability_head", False):
+        print(f"[reliability_head] heteroscedastic aux head ON "
+              f"(predicts per-feature mean + log-variance); lambda_nll="
+              f"{config.get('lambda_nll', 0.0)}")
+
+    # ── Encoder-unfreeze plumbing (capacity experiment, Q4) ─────────────────
+    # By default both SSL frontends are FROZEN and their features are cached, so
+    # nothing is loaded here and `encoder_unfreeze_params` is empty — byte-identical
+    # to the production frozen path. Setting unfreeze_wavlm_top_n / unfreeze_beats_top_n
+    # to N>0 loads (WavLM) or reuses (BEATs/SpecEncoder, built below) the encoder,
+    # unfreezes its top-N transformer blocks, and routes those params into their own
+    # optimizer group at lr_encoder (a small LR). See src/encoder_unfreeze.py for the
+    # GPU-memory implications.
+    from encoder_unfreeze import (
+        unfreeze_top_n_blocks, encoder_trainable_params, count_blocks,
+    )
+    wavlm_encoder = None  # only built when unfreeze_wavlm_top_n > 0
+    encoder_unfreeze_params: list = []
+    _unfreeze_wavlm_n = int(config.get("unfreeze_wavlm_top_n", 0) or 0)
+    if _unfreeze_wavlm_n > 0:
+        # WavLM is NOT part of the cached-feature training path — audio_features come
+        # pre-extracted in the .pt files. Unfreezing it only has an effect if waveforms
+        # are fed through it at train time (an end-to-end variant, not the default
+        # dataloader). We load + unfreeze it here so the param-group / checkpoint
+        # plumbing is exercised and correct; the forward wiring is a separate change.
+        from transformers import WavLMModel
+        wavlm_name = config.get("wavlm_name", "microsoft/wavlm-large")
+        wavlm_encoder = WavLMModel.from_pretrained(
+            wavlm_name, torch_dtype=torch.bfloat16,
+        ).to(device)
+        for p in wavlm_encoder.parameters():
+            p.requires_grad_(False)
+        _wp = unfreeze_top_n_blocks(wavlm_encoder, _unfreeze_wavlm_n)
+        encoder_unfreeze_params.extend(_wp)
+        print(f"[encoder-unfreeze] WavLM ({wavlm_name}): unfroze top "
+              f"{min(_unfreeze_wavlm_n, count_blocks(wavlm_encoder))}/"
+              f"{count_blocks(wavlm_encoder)} blocks "
+              f"({sum(p.numel() for p in _wp)/1e6:.1f}M params trainable) at "
+              f"lr_encoder={config.get('lr_encoder')}; "
+              f"WARNING: waveforms are not in the cached .pt files — this only affects "
+              f"training if an end-to-end waveform forward is wired in.")
 
     # ── Section-query branch (EMNLP rework, Path 3) ────────────────────────
     # When use_sections=true, set up:
@@ -781,8 +876,27 @@ def train(config: dict) -> None:
                 freeze=config.get("spec_freeze", True),
             ).to(device)
             print(f"[sections] online SpecEncoder: {config.get('spec_encoder_name', 'beats')}")
+            # [encoder-unfreeze] Optionally fine-tune the top-N BEATs blocks. The
+            # SpecEncoder wraps the backbone at spec_encoder.model; its transformer
+            # stack lives at .model.encoder.layers. n=0 (default) is a no-op and the
+            # encoder stays frozen exactly as spec_freeze set it.
+            _unfreeze_beats_n = int(config.get("unfreeze_beats_top_n", 0) or 0)
+            if _unfreeze_beats_n > 0:
+                _bp = unfreeze_top_n_blocks(spec_encoder.model, _unfreeze_beats_n)
+                encoder_unfreeze_params.extend(_bp)
+                spec_encoder.freeze = False  # let SpecEncoder.forward build the graph
+                print(f"[encoder-unfreeze] BEATs: unfroze top "
+                      f"{min(_unfreeze_beats_n, count_blocks(spec_encoder.model))}/"
+                      f"{count_blocks(spec_encoder.model)} blocks "
+                      f"({sum(p.numel() for p in _bp)/1e6:.1f}M params trainable) at "
+                      f"lr_encoder={config.get('lr_encoder')}.")
         else:
             print(f"[sections] using precomputed BEATs patches from .pt files (beats_cached=true)")
+            if int(config.get("unfreeze_beats_top_n", 0) or 0) > 0:
+                print("[encoder-unfreeze] WARNING: unfreeze_beats_top_n > 0 but "
+                      "beats_cached=true — patches are precomputed, so the BEATs "
+                      "encoder is never run at train time and unfreezing is a no-op. "
+                      "Set beats_cached: false to run BEATs online.")
 
         # SectionQueryHead's d_patch must match whatever K/V come from. For BEATs
         # (default) this is 768. Override via config if using AST or a fine-tuned
@@ -896,12 +1010,15 @@ def train(config: dict) -> None:
     lm_total = sum(p.numel() for p in llm.parameters())
     lm_trainable = sum(p.numel() for p in llm.parameters() if p.requires_grad)
     adapter_trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
-    trainable_total = lm_trainable + adapter_trainable
+    # [encoder-unfreeze] unfrozen top-N SSL-encoder blocks (0 in the default frozen path).
+    encoder_trainable = sum(p.numel() for p in encoder_unfreeze_params)
+    trainable_total = lm_trainable + adapter_trainable + encoder_trainable
     param_summary = {
         "params/lm_total": lm_total,
         "params/lm_trainable": lm_trainable,         # full-FT: lm_total; LoRA: small subset
         "params/lora_trainable": lm_trainable if not full_ft else 0,  # legacy compat key
         "params/adapter_trainable": adapter_trainable,
+        "params/encoder_trainable": encoder_trainable,  # [encoder-unfreeze]
         "params/trainable_total": trainable_total,
         "params/trainable_pct_of_lm": 100.0 * trainable_total / lm_total,
         "params/full_ft": int(full_ft),
@@ -1015,6 +1132,17 @@ def train(config: dict) -> None:
         # [decoupled_grounding] token-free 2D grounding head, also at adapter LR.
         # Its queries / projections / readout train on the parallel grounding loss.
         param_groups.append({"params": decoupled_head.parameters(), "lr": config["lr_adapter"]})
+    if encoder_unfreeze_params:
+        # [encoder-unfreeze] the unfrozen top-N SSL-encoder blocks get their OWN group
+        # at lr_encoder — a small LR (e.g. 1e-5) distinct from the adapter LR so
+        # fine-tuning the pretrained frontend doesn't blow away its features. Falls
+        # back to lr_lm if lr_encoder isn't set. Dedupe by id against the LM group is
+        # unnecessary (WavLM/BEATs params are disjoint from the LM), but the params
+        # are a fresh disjoint set regardless.
+        lr_encoder = float(config.get("lr_encoder") or config.get("lr_lm") or lr_lm)
+        param_groups.append({"params": encoder_unfreeze_params, "lr": lr_encoder})
+        print(f"[encoder-unfreeze] {sum(p.numel() for p in encoder_unfreeze_params)/1e6:.1f}M "
+              f"encoder params in their own optimizer group at lr={lr_encoder}")
     optimizer = torch.optim.AdamW(
         param_groups,
         weight_decay=config["weight_decay"],
@@ -1260,6 +1388,8 @@ def train(config: dict) -> None:
                     torch.nn.utils.clip_grad_norm_(readout_head.parameters(), config["grad_clip"])
                 if decoupled_head is not None:  # [decoupled_grounding] clip the grounding head too
                     torch.nn.utils.clip_grad_norm_(decoupled_head.parameters(), config["grad_clip"])
+                if encoder_unfreeze_params:  # [encoder-unfreeze] clip the unfrozen encoder blocks
+                    torch.nn.utils.clip_grad_norm_(encoder_unfreeze_params, config["grad_clip"])
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -1652,6 +1782,27 @@ def train(config: dict) -> None:
                 payload["readout_head_state_dict"] = readout_head.state_dict()
             if decoupled_head is not None:  # [decoupled_grounding]
                 payload["decoupled_head_state_dict"] = decoupled_head.state_dict()
+            # [encoder-unfreeze] persist ONLY the unfrozen (requires_grad) encoder
+            # params so the fine-tuned top-N blocks survive a reload without bloating
+            # the ckpt with the frozen backbone (restored from from_pretrained / the
+            # BEATs checkpoint at load time). Keyed by the full param name.
+            if encoder_unfreeze_params:
+                payload["encoder_unfreeze_top_n"] = {
+                    "wavlm": int(config.get("unfreeze_wavlm_top_n", 0) or 0),
+                    "beats": int(config.get("unfreeze_beats_top_n", 0) or 0),
+                }
+                if wavlm_encoder is not None:
+                    payload["wavlm_unfrozen_state_dict"] = {
+                        n: p.detach().cpu()
+                        for n, p in wavlm_encoder.named_parameters()
+                        if p.requires_grad
+                    }
+                if spec_encoder is not None and int(config.get("unfreeze_beats_top_n", 0) or 0) > 0:
+                    payload["beats_unfrozen_state_dict"] = {
+                        n: p.detach().cpu()
+                        for n, p in spec_encoder.model.named_parameters()
+                        if p.requires_grad
+                    }
             return payload
 
         # Atomic save: write to .tmp then os.replace (POSIX atomic). Without

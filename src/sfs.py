@@ -73,6 +73,17 @@ class ClaimParser:
             r"(?:Signal-to-Noise\s+Ratio\s*(?:\(SNR\))?\s*|SNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+|estimated at\s+)?(\d+\.?\d*)\s*dB",
             [("snr", 1, "dB")],
         ),
+        # SNR — leading-number form used by the observability builder:
+        # "At 26.15 dB, the signal-to-noise ratio SNR is high." The number
+        # PRECEDES the "SNR" mention and the trailing word is a qualitative band
+        # ("high"), not a value, so the base pattern above misses it. We anchor
+        # on "<num> dB, ... (signal-to-noise ratio|SNR)" with the dB-denominated
+        # value bound to snr. The gap "(?:[^.]|\.\d)*?" allows decimals but
+        # blocks a sentence boundary so the match can't cross sentences.
+        (
+            r"(\d+\.?\d*)\s*dB[,]?(?:[^.]|\.\d)*?(?:signal-to-noise\s+ratio|\bSNR\b)",
+            [("snr", 1, "dB")],
+        ),
         # RT60
         (r"RT60\s*(?:=|≈|~|<|>|is)\s*(?:approximately\s+)?(\d+\.?\d*)\s*s", [("rt60", 1, "s")]),
         # HNR (also matches "Harmonics-to-Noise Ratio (HNR) of 12.59 dB")
@@ -358,6 +369,70 @@ class HybridClaimParser:
         return claims if claims else self._legacy.parse(text)
 
 
+# ── Abstention / hedge detection (observability-aware rework) ────────────────
+class AbstentionDetector:
+    """Detect calibrated F0 hedges ("the pitch cannot be reliably estimated …")
+    in a generated description.
+
+    The observability target builder
+    (scripts/build_descriptions_observability.py) emits a conditional hedge
+    INSTEAD of an F0 number when single-speaker pitch is ill-posed (heavy
+    overlap, or too few clean voiced frames). The selective SFS path
+    (`SFSScorer.score_selective`) needs to tell apart three outcomes for an
+    ill-posed feature:
+
+        - a NUMBER was asserted        (parsed as an f0_mean / f0_sd Claim)
+        - the feature was HEDGED        (this detector fires)
+        - the feature was simply OMITTED (neither a number nor a hedge)
+
+    A hedge fires `abstained={"f0_mean", "f0_sd"}` because the pitch hedge covers
+    both pitch scalars (mean and SD share the same physical estimability).
+
+    Detection is phrasing-robust: it keys on a pitch noun (pitch / F0 /
+    fundamental frequency) co-occurring with an inability cue
+    (cannot/ill-posed/not asserted/left unstated/not reported/too few …) inside
+    one sentence. This recognizes the builder's three hedge templates plus
+    natural paraphrases a trained model is likely to emit.
+    """
+
+    # Sentences mentioning pitch.
+    _PITCH_RE = re.compile(
+        r"(?:\bpitch\b|\bF0\b|fundamental\s+frequency)",
+        re.IGNORECASE,
+    )
+    # Inability / abstention cues.
+    _HEDGE_CUE_RE = re.compile(
+        r"(?:cannot\s+be\s+(?:reliably\s+)?(?:estimated|recovered|measured)"
+        r"|ill-posed"
+        r"|not\s+(?:be\s+)?(?:asserted|reported|stated|estimated|recovered|reliable)"
+        r"|left\s+unstated"
+        r"|no\s+(?:reliable\s+)?(?:F0|pitch)\s+(?:value\s+)?is\s+(?:reported|given)"
+        r"|too\s+few\s+clean"
+        r"|not\s+enough\s+clean"
+        r"|unreliable"
+        r"|overlap\s+too\s+much)",
+        re.IGNORECASE,
+    )
+    # Split into sentences on a real sentence boundary (period + space / EOS),
+    # not on the decimal point inside a number.
+    _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+    # Which scalar features a pitch hedge covers.
+    PITCH_FEATURES = ("f0_mean", "f0_sd")
+
+    def detect(self, text: str) -> set[str]:
+        """Return the set of SFS feature keys that `text` ABSTAINS on.
+
+        Currently only pitch (f0_mean, f0_sd) supports calibrated abstention;
+        a sentence that mentions pitch together with an inability cue marks both.
+        """
+        abstained: set[str] = set()
+        for sentence in self._SENT_SPLIT_RE.split(text):
+            if self._PITCH_RE.search(sentence) and self._HEDGE_CUE_RE.search(sentence):
+                abstained.update(self.PITCH_FEATURES)
+        return abstained
+
+
 class SFSScorer:
     """Signal Faithfulness Score — compares parsed claims to SP ground truth.
 
@@ -525,4 +600,202 @@ class SFSScorer:
             "n_correct": sum(1 for r in results if r["correct"]),
             "n_gt_features": len(gt_features),
             "per_feature": results,
+        }
+
+    # ── Selective (observability-aware) scoring ─────────────────────────────
+    # Which GT features support a calibrated ABSTENTION (a hedge that should be
+    # rewarded, not penalized) when the GT marks them unreliable. Currently only
+    # pitch is genuinely ill-posed under overlap on Libri2Mix mixtures.
+    ABSTAINABLE_FEATURES = ("f0_mean", "f0_sd")
+
+    def score_selective(
+        self,
+        text: str,
+        ground_truth: dict[str, float],
+        reliable: dict[str, bool] | None = None,
+        claims: list[Claim] | None = None,
+        abstained: set[str] | None = None,
+    ) -> dict:
+        """Observability-aware (selective) SFS.
+
+        Unlike `score`, which only sees a feature as mentioned/omitted, this path
+        recognizes ABSTENTION (a calibrated hedge) as a distinct, legitimate
+        outcome. Per scorable GT feature, the outcome is one of:
+
+            "correct"   — a number was asserted and lands within tolerance
+            "wrong"     — a number was asserted but is out of tolerance
+            "abstained" — the model hedged INSTEAD of giving a number
+            "omitted"   — neither a number nor a hedge
+
+        Rewarding / penalizing rules (the heart of the metric):
+          - For a feature the signal CAN support (reliable[f] is True):
+                correct  -> rewarded   (counts toward coverage + precision)
+                wrong    -> penalized  (precision miss)
+                abstained-> penalized as a COVERAGE miss (the model ducked a
+                            feature it should have reported) — but NOT a
+                            precision miss, because no false number was asserted.
+                omitted  -> coverage miss.
+          - For a feature the signal CANNOT support (reliable[f] is False):
+                abstained-> REWARDED (calibrated hedge; this is the whole point).
+                omitted  -> neutral (also acceptable to stay silent).
+                correct/wrong (a number at all) -> penalized as an
+                            OVER-CLAIM (asserting an ill-posed estimate as fact),
+                            counted against precision.
+
+        Reported numbers:
+          precision   = correct_numbers / asserted_numbers     (over numbers only)
+          coverage    = correct_numbers / reliable_features     (did we report the
+                        features we could?)
+          selective_f1= harmonic mean of precision and coverage
+          plus a per-clip risk/coverage record for risk-coverage curves.
+
+        Args:
+            text:         the generated (or target) description.
+            ground_truth: feature -> true value (same shape as `score`).
+            reliable:     feature -> bool, whether the signal supports the
+                          feature on THIS clip. If None, every GT feature that
+                          is not in ABSTAINABLE_FEATURES is treated as reliable,
+                          and ABSTAINABLE_FEATURES are treated as reliable iff
+                          they appear in ground_truth (i.e. a GT number exists).
+            claims:       pre-parsed claims (defaults to HybridClaimParser).
+            abstained:    pre-detected abstained feature set (defaults to
+                          AbstentionDetector on `text`).
+
+        Returns a dict with precision / coverage / selective_f1, the per-feature
+        outcome breakdown, and aggregate counts for risk-coverage analysis.
+        """
+        if claims is None:
+            claims = HybridClaimParser().parse(text)
+        if abstained is None:
+            abstained = AbstentionDetector().detect(text)
+
+        # GT features SFS can score (have a tolerance).
+        gt_features = set(ground_truth.keys()) & set(self.TOLERANCES.keys())
+
+        # Reliability per feature.
+        if reliable is None:
+            reliable = {}
+            for f in gt_features:
+                if f in self.ABSTAINABLE_FEATURES:
+                    # Reliable iff a GT number is present for it on this clip.
+                    reliable[f] = f in ground_truth and ground_truth[f] is not None
+                else:
+                    reliable[f] = True
+        else:
+            reliable = dict(reliable)
+            for f in gt_features:
+                reliable.setdefault(
+                    f, f not in self.ABSTAINABLE_FEATURES,
+                )
+
+        # First numeric claim per scorable feature (overlap spans handled by the
+        # base `score` path; selective scoring focuses on scalar coverage).
+        claimed: dict[str, float] = {}
+        for c in claims:
+            if c.feature in ("overlap_start", "overlap_end"):
+                continue
+            if c.feature in self.TOLERANCES and c.feature not in claimed:
+                claimed[c.feature] = c.value
+
+        per_feature: list[dict] = []
+        n_asserted = n_correct = n_faithful = 0
+        n_reliable = n_reliable_covered = 0
+        n_overclaim = n_good_abstain = n_bad_abstain = 0
+
+        for f in sorted(gt_features):
+            is_reliable = reliable.get(f, True)
+            if is_reliable:
+                n_reliable += 1
+            asserted = f in claimed
+            hedged = f in abstained
+
+            if asserted:
+                n_asserted += 1
+                gt_value = ground_truth[f]
+                err = abs(claimed[f] - gt_value)
+                correct = err <= self.TOLERANCES[f]
+                if correct:
+                    n_correct += 1  # raw numeric accuracy (value within tol)
+                if is_reliable:
+                    outcome = "correct" if correct else "wrong"
+                    if correct:
+                        n_reliable_covered += 1
+                        n_faithful += 1  # asserting a recoverable, correct number
+                else:
+                    # Asserted a number on an ill-posed feature -> over-claim.
+                    # NOT faithful even if the value happens to land in tolerance:
+                    # the failure mode is presenting an unrecoverable estimate as
+                    # fact, so faithfulness-precision penalizes it regardless.
+                    outcome = "overclaim"
+                    n_overclaim += 1
+                per_feature.append({
+                    "feature": f, "outcome": outcome, "reliable": is_reliable,
+                    "claimed": claimed[f], "actual": gt_value,
+                    "error": err, "tolerance": self.TOLERANCES[f],
+                })
+            elif hedged:
+                if is_reliable:
+                    outcome = "abstained_bad"  # ducked a recoverable feature
+                    n_bad_abstain += 1
+                else:
+                    outcome = "abstained_good"  # calibrated hedge — rewarded
+                    n_good_abstain += 1
+                per_feature.append({
+                    "feature": f, "outcome": outcome, "reliable": is_reliable,
+                    "claimed": None, "actual": ground_truth.get(f),
+                })
+            else:
+                outcome = "omitted"
+                per_feature.append({
+                    "feature": f, "outcome": outcome, "reliable": is_reliable,
+                    "claimed": None, "actual": ground_truth.get(f),
+                })
+
+        # Faithfulness-precision over ASSERTED NUMBERS: a number is "good" only if
+        # it is BOTH within tolerance AND for a feature the signal can support.
+        # Over-claims (numbers on ill-posed features) and out-of-tolerance numbers
+        # both count against it. `numeric_accuracy` (below) is the laxer "value
+        # within tolerance, ignoring reliability" rate, surfaced separately.
+        precision = (n_faithful / n_asserted) if n_asserted else 0.0
+        numeric_accuracy = (n_correct / n_asserted) if n_asserted else 0.0
+        # Coverage: of the features the signal can support, how many did we report
+        # correctly? (A correct hedge does not add to coverage; staying silent on a
+        # reliable feature is a coverage miss.)
+        coverage = (n_reliable_covered / n_reliable) if n_reliable else 0.0
+        selective_f1 = (
+            2 * precision * coverage / (precision + coverage)
+            if (precision + coverage) > 0 else 0.0
+        )
+
+        # Calibrated-abstention rate: of all abstentions, how many were warranted?
+        n_abstain = n_good_abstain + n_bad_abstain
+        abstention_precision = (n_good_abstain / n_abstain) if n_abstain else None
+
+        return {
+            "precision": precision,
+            "numeric_accuracy": numeric_accuracy,
+            "coverage": coverage,
+            "selective_f1": selective_f1,
+            "n_asserted": n_asserted,
+            "n_correct": n_correct,
+            "n_faithful": n_faithful,
+            "n_reliable": n_reliable,
+            "n_reliable_covered": n_reliable_covered,
+            "n_overclaim": n_overclaim,
+            "n_good_abstain": n_good_abstain,
+            "n_bad_abstain": n_bad_abstain,
+            "abstention_precision": abstention_precision,
+            "per_feature": per_feature,
+            # Risk-coverage record: each asserted number is a (risk, covered) unit.
+            # risk = 1 if the asserted number is wrong, else 0. Sorting clips/claims
+            # by a confidence proxy and sweeping gives a risk-coverage curve.
+            "risk_coverage": [
+                {
+                    "feature": r["feature"],
+                    "asserted": r["outcome"] in ("correct", "wrong", "overclaim"),
+                    "risk": 1 if r["outcome"] in ("wrong", "overclaim") else 0,
+                }
+                for r in per_feature
+                if r["outcome"] in ("correct", "wrong", "overclaim")
+            ],
         }
