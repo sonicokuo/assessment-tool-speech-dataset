@@ -76,7 +76,25 @@ def score_version(v):
     res = json.load(open(pred))
     total = len(res)
     mc = {e['filename']: claims(e.get('generated') or e.get('generated_clean') or '') for e in res}
+    # overlap_ratio oracle is a MIX property (not a clean-stem feature), so its GT is parsed
+    # from the reference 'target' description, not clean_features.
+    mt = {e['filename']: claims(e.get('target') or '') for e in res}
     feats = {}
+    # overlap_ratio: predicted (generated) vs oracle (reference target text)
+    xo, yo = [], []
+    for fn, cl in mc.items():
+        if 'overlap_ratio' in cl and 'overlap_ratio' in mt.get(fn, {}):
+            xo.append(cl['overlap_ratio']); yo.append(mt[fn]['overlap_ratio'])
+    covo = len(xo) / total if total else 0.0
+    if len(xo) >= 10:
+        xo = np.array(xo); yo = np.array(yo)
+        sro = spearmanr(xo, yo).correlation
+        sdo = float(np.std(yo)); maeo = float(np.mean(np.abs(xo - yo)))
+        feats['overlap_ratio'] = {'srcc': None if sro != sro else round(float(sro), 3),
+                                  'nmae': round(maeo / sdo, 3) if sdo > 1e-9 else None,
+                                  'cov': round(covo, 3), 'n': len(xo), 'gt_sd': round(sdo, 3)}
+    else:
+        feats['overlap_ratio'] = {'srcc': None, 'nmae': None, 'cov': round(covo, 3), 'n': len(xo)}
     for feat in FEAT:
         xs, ys = [], []
         for fn, cl in mc.items():
@@ -112,7 +130,7 @@ os.makedirs(f'{SHARED}/rescore_v21', exist_ok=True)
 json.dump(out, open(f'{SHARED}/rescore_v21/bandfree_all_versions.json', 'w'), indent=1)
 
 # ---- comparable table ----
-order = ['srmr', 'pause_count', 'pause_rate', 'speaking_rate', 'articulation_rate', 'f0_mean', 'f0_sd', 'snr']
+order = ['srmr', 'overlap_ratio', 'pause_count', 'pause_rate', 'speaking_rate', 'articulation_rate', 'f0_mean', 'f0_sd', 'snr']
 hdr = f'{"version":24} {"n":>5} {"meanSRCC":>8} ' + ' '.join(f'{f[:8]:>8}' for f in order)
 print('=== BAND-FREE SFS (SRCC per feature; mean excl. SNR) ===')
 print(hdr)
