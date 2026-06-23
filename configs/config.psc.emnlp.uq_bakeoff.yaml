@@ -1,0 +1,105 @@
+# config.psc.emnlp.uq_bakeoff.yaml — CHEAP decoupled UQ-head training for the
+# UNCERTAINTY-QUANTIFICATION BAKE-OFF (the kill-fast gate before any diffusion work).
+#
+# THE GATE
+# --------
+# Does a CHEAP UQ head (MDN / MC-dropout / deep-ensemble; src/uq_heads.py) beat the
+# INCUMBENT heteroscedastic-sigma head at predicting per-frame SNR-map ERROR, by
+# risk-coverage AURC? If the MDN already matches diffusion's plausible ceiling, diffusion
+# is unjustified and the MDN is the paper. This config describes how to TRAIN the four
+# uncertainty channels cheaply off FROZEN WavLM features, so src/uq_bakeoff.py can score
+# them. NOTHING here trains the 8B LM, unfreezes the encoder, or touches the adapter — the
+# heads are tiny nn.Modules (in_proj -> temporal conv -> per-frame head) that fit in minutes
+# on the EXISTING oracle SNR-map targets.
+#
+# DATA (the SAME canonical SNR-map tuple v24/v25 use; nothing new to build)
+# ------------------------------------------------------------------------
+#   audio frames  : processed_aug/{train,val,test}/*.pt   ->  cached["audio_features"] (T,1024)
+#   oracle target : snr_map_targets_aug/{train,dev,test}  ->  per-frame SNR (dB) + s1-active mask
+#                   (loaded exactly as src/snr_map_validate.py does, via manifest.json).
+# The four heads all consume audio_features and regress the per-frame SNR; only the
+# uncertainty channel differs.
+data_dir: /ocean/projects/cis260125p/shared/data/processed_aug
+snr_map_dir:
+  train: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/train
+  val:   /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/dev
+  test:  /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/test
+
+# ── shared cheap-head trunk geometry (mirrors SupervisedSNRMapHead) ──────────
+snr_map_audio_dim: 1024
+snr_map_hidden: 256
+snr_map_kernel_size: 5
+snr_map_snr_bias: 5.0          # start near the dataset SNR prior (dB), as v25 does
+snr_map_huber_delta: 1.0
+
+# ── per-method UQ knobs ──────────────────────────────────────────────────────
+# MDN: per-frame K-component Gaussian mixture, trained with the masked mixture NLL
+# (MDNSNRMapHead.nll). K=3 is the default multimodal budget.
+mdn_components: 3
+mdn_loss: nll                  # the mixture NLL is the ONLY loss (no Huber)
+
+# MC-dropout: the point regression head with dropout p ACTIVE at inference. Trained with
+# the plain masked Huber (timeline_loss); uncertainty comes from n stochastic passes at
+# eval (MCDropoutSNRMapHead.sample).
+mc_dropout_p: 0.1
+mc_samples: 30                 # forward passes per frame at bake-off time
+
+# Deep ensemble: 5 independent SupervisedSNRMapHead point regressors, identical config but
+# DIFFERENT seeds (different init + data shuffle). Their per-frame disagreement is the
+# ensemble variance (ensemble_uncertainty). 5 seeds is the Lakshminarayanan default.
+ensemble_size: 5
+ensemble_seeds: [11, 23, 37, 53, 73]
+
+# Incumbent (reference): the heteroscedastic per-frame sigma. Realized as a K=1 MDN head
+# (a single Gaussian per frame == predicted mean + log-sigma == the Kendall&Gal /
+# reliability_head law), trained with the SAME masked NLL. sigma = sqrt(predictive var).
+incumbent_components: 1
+
+# ── cheap optimizer (heads only; no LM, no encoder) ──────────────────────────
+optimizer: adamw
+lr_adapter: 0.0003             # the heads' LR (they are small; can go a bit higher than 1e-4)
+weight_decay: 0.01
+grad_clip: 1.0
+batch_size: 16                 # frozen features -> big batches fit easily
+epochs: 8                      # tiny heads converge fast; 8 is generous
+warmup_ratio: 0.03
+lr_scheduler: cosine
+seed: 73
+num_workers: 4
+bf16: false                    # CPU/GPU float32 is fine; the heads are tiny
+eval_every_epoch: 1
+save_dir: /ocean/projects/cis260125p/shared/checkpoints/uq_bakeoff
+
+# ════════════════════════════════════════════════════════════════════════════════
+# HOW TO TRAIN (decoupled; the heads are NOT wired into train.py — they are standalone).
+# A ~50-line driver loops processed_aug clips, reads audio_features + the oracle target,
+# and minimizes the per-head loss. Pseudocode (all on FROZEN features, no LM):
+#
+#   for method in {incumbent(K=1 NLL), mdn(K=3 NLL), mcdropout(Huber+drop), ensemble x5}:
+#       head = <the matching nn.Module from src/uq_heads.py / snr_map_head.py>
+#       opt  = AdamW(head.parameters(), lr=lr_adapter, weight_decay=weight_decay)
+#       for epoch in range(epochs):
+#           for batch of audio_features,(snr_map_target,snr_map_mask):
+#               params/pred = head.forward(audio_features)
+#               loss = head.nll(params,target,mask)          # MDN + incumbent
+#                      OR snrhead.timeline_loss(pred,target,mask)[0]   # mcdropout/ensemble
+#               loss.backward(); clip_grad_norm_(...,grad_clip); opt.step(); opt.zero_grad()
+#       torch.save({"<head>_state_dict": head.state_dict(), "config": cfg}, save_dir/<name>.pt)
+#
+#   Checkpoint layout the bake-off extractor (uq_bakeoff.extract_method_arrays) expects:
+#       save_dir/snr_sigma.pt        {"sigma_head_state_dict", "config"}   (incumbent, K=1)
+#       save_dir/mdn.pt              {"mdn_head_state_dict", "config"}
+#       save_dir/mcdropout.pt        {"mcdropout_head_state_dict", "config"}
+#       save_dir/ensemble/seed*.pt   each {"snr_map_head_state_dict", "config"}
+#
+# THEN score the held-out TEST split:
+#   python src/uq_bakeoff.py \
+#     --checkpoint_dir /ocean/projects/cis260125p/shared/checkpoints/uq_bakeoff \
+#     --processed_dir  /ocean/projects/cis260125p/shared/data/processed_aug/test \
+#     --snr_map_dir    /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/test \
+#     --mc_samples 30 --n_boot 2000 --out uq_bakeoff_test.json
+#
+# The printed table gives AURC per method, dAURC vs the incumbent with the paired 95% CI,
+# Spearman(unc,|err|), 90% coverage + overconfidence flag, and the GO/NO-GO verdict
+# against the +/-0.054 Hoeffding floor (3000 test clips).
+# ════════════════════════════════════════════════════════════════════════════════
