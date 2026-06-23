@@ -345,3 +345,92 @@ class TestRunBakeoff:
         assert "calibration" in s
         # sigma defaulted to sqrt([4,1]) = [2,1]
         assert s["calibration"]["n"] == 2
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# uq_train — the decoupled trainer's loss DECREASES on a synthetic batch (CPU)
+# ════════════════════════════════════════════════════════════════════════════════
+from uq_train import (  # noqa: E402
+    build_head,
+    train_step,
+    compute_loss,
+    collate,
+    CKPT_SPEC,
+)
+
+
+def _synthetic_snr_batch(B=4, T=20, D=16, seed=0):
+    """A learnable synthetic batch: the per-frame SNR target is a fixed linear readout of
+    the features (so a small head CAN fit it and the loss MUST be able to fall), plus a
+    realistic ~80% supervised mask with a padded/masked tail."""
+    g = torch.Generator().manual_seed(seed)
+    af = torch.randn(B, T, D, generator=g)
+    w = torch.randn(D, generator=g)
+    target = af @ w                                  # (B, T) deterministic fn of features
+    mask = torch.ones(B, T)
+    mask[:, int(0.8 * T):] = 0.0                     # mask out the tail (padding-like)
+    return af, target, mask
+
+
+class TestUQTrainer:
+    @pytest.mark.parametrize("method", ["heteroscedastic", "mdn", "mcdropout", "ensemble"])
+    def test_loss_decreases_on_synthetic_batch(self, method):
+        """Each channel's loss must FALL when trained on a fittable synthetic batch — the
+        trainer's gradient points the right way for every head."""
+        torch.manual_seed(0)
+        cfg = {"snr_map_audio_dim": 16, "snr_map_hidden": 32, "snr_map_kernel_size": 5,
+               "snr_map_snr_bias": 0.0, "mdn_components": 3, "mc_dropout_p": 0.1,
+               "snr_map_huber_delta": 1.0}
+        head = build_head(method, cfg, seed=0)
+        opt = torch.optim.AdamW(head.parameters(), lr=1e-2)
+        af, target, mask = _synthetic_snr_batch(seed=1)
+        first = train_step(method, head, opt, af, target, mask)
+        last = first
+        for _ in range(60):
+            last = train_step(method, head, opt, af, target, mask)
+        assert math.isfinite(first) and math.isfinite(last)
+        assert last < first, f"{method}: loss did not decrease ({first:.4f} -> {last:.4f})"
+
+    def test_compute_loss_is_masked(self):
+        """A catastrophic target on MASKED-OUT frames must not change the loss (the trainer
+        only supervises mask=True frames)."""
+        cfg = {"snr_map_audio_dim": 16, "snr_map_hidden": 32, "snr_map_kernel_size": 5,
+               "mdn_components": 2}
+        head = build_head("mdn", cfg, seed=0)
+        af, target, mask = _synthetic_snr_batch(seed=2)
+        l_clean = float(compute_loss("mdn", head, af, target, mask))
+        poisoned = target.clone()
+        poisoned[mask == 0] = 1.0e6                  # garbage, but only on masked-out frames
+        l_pois = float(compute_loss("mdn", head, af, poisoned, mask))
+        assert l_clean == pytest.approx(l_pois, abs=1e-4)
+
+    def test_collate_pads_and_masks_tail(self):
+        """collate right-pads to max T and zero-masks the padded tail."""
+        a = (torch.randn(5, 4), torch.randn(5), torch.ones(5))
+        b = (torch.randn(8, 4), torch.randn(8), torch.ones(8))
+        af, tg, mk = collate([a, b])
+        assert af.shape == (2, 8, 4)
+        assert tg.shape == (2, 8)
+        assert mk.shape == (2, 8)
+        # first example padded from 5 -> 8: tail frames masked 0
+        assert float(mk[0, 5:].sum()) == 0.0
+        assert float(mk[0, :5].sum()) == 5.0
+
+    def test_ckpt_spec_matches_bakeoff_filenames(self):
+        """The trainer writes the exact filenames + state-dict keys uq_bakeoff loads."""
+        assert CKPT_SPEC["heteroscedastic"]["file"] == "snr_sigma.pt"
+        assert CKPT_SPEC["heteroscedastic"]["key"] == "sigma_head_state_dict"
+        assert CKPT_SPEC["mdn"]["file"] == "mdn.pt"
+        assert CKPT_SPEC["mdn"]["key"] == "mdn_head_state_dict"
+        assert CKPT_SPEC["mcdropout"]["file"] == "mcdropout.pt"
+        assert CKPT_SPEC["mcdropout"]["key"] == "mcdropout_head_state_dict"
+        assert CKPT_SPEC["ensemble"]["dir"] == "ensemble"
+        assert CKPT_SPEC["ensemble"]["key"] == "snr_map_head_state_dict"
+
+    def test_heteroscedastic_ckpt_loads_into_k1_mdn(self):
+        """The incumbent head's state_dict must load into the K=1 MDN carrier the bake-off
+        reconstructs it as (uq_bakeoff.extract_method_arrays)."""
+        cfg = {"snr_map_audio_dim": 16, "snr_map_hidden": 32, "snr_map_kernel_size": 5}
+        het = build_head("heteroscedastic", cfg, seed=0)
+        carrier = MDNSNRMapHead(audio_dim=16, n_components=1, hidden=32, kernel_size=5)
+        carrier.load_state_dict(het.state_dict())   # must not raise

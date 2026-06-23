@@ -350,3 +350,65 @@ def ensemble_uncertainty(
     mean = stacked.mean(dim=0)
     var = stacked.var(dim=0, unbiased=False)                        # population (M)
     return mean, var
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Heteroscedastic head (the INCUMBENT baseline to beat)
+# ════════════════════════════════════════════════════════════════════════════════
+class HeteroscedasticSNRMapHead(MDNSNRMapHead):
+    """Per-frame heteroscedastic Gaussian head over per-frame SNR (dB) — the INCUMBENT.
+
+    A single-Gaussian-per-frame predictive law: the network emits, per frame, a mean mu
+    and a log-sigma log_sigma, trained with the masked Gaussian negative-log-likelihood
+    (Nix & Weigend 1994; Kendall & Gal 2017). This is the AQUA-NL reliability-head law
+    (a predicted mean + predicted variance) the bake-off measures every cheap challenger
+    against.
+
+    It is realized as a MDNSNRMapHead with EXACTLY ONE mixture component (K=1). A K=1
+    Gaussian mixture is a single Gaussian (the mixing weight pi=1 is degenerate), so the
+    mixture NLL collapses to the plain Gaussian NLL and `predict`'s law-of-total-variance
+    collapses to Var = sigma^2 (Var[E]=0 with one component). Sharing the MDN carrier
+    means the state_dict is byte-identical to a K=1 MDN, which is precisely how
+    uq_bakeoff.extract_method_arrays loads the incumbent (`snr_sigma.pt` ->
+    MDNSNRMapHead(n_components=1)), so the trained head drops straight into the harness.
+
+    The trunk (in_proj -> temporal conv -> per-frame head) and every method (`forward`,
+    `predict`, `nll`) are inherited unchanged from MDNSNRMapHead; only `n_components` is
+    pinned to 1 and a `sigma`/`predict_sigma` convenience is added.
+
+    Args:
+        audio_dim:   WavLM feature dim feeding the trunk (1024).
+        hidden:      trunk conv hidden width.
+        kernel_size: temporal conv kernel (odd; symmetric padding keeps length T).
+        snr_bias:    initial mean bias (≈ dataset SNR mean in dB) so the head starts near
+                     the prior instead of 0 dB.
+    """
+
+    def __init__(
+        self,
+        audio_dim: int = AUDIO_DIM,
+        hidden: int = 256,
+        kernel_size: int = 5,
+        snr_bias: float = 0.0,
+    ):
+        super().__init__(
+            audio_dim=audio_dim,
+            n_components=1,
+            hidden=hidden,
+            kernel_size=kernel_size,
+            snr_bias=snr_bias,
+        )
+
+    def predict_sigma(
+        self, audio_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, T, audio_dim) -> (mean, sigma), both (B, T).
+
+        Convenience wrapper: forwards, takes the K=1 predictive (mean, variance), and
+        returns the predictive STANDARD DEVIATION sigma = sqrt(variance). For K=1 the
+        total variance equals sigma^2 exactly (Var[E]=0), so this is the predicted
+        per-frame Gaussian sigma — the incumbent's abstention score.
+        """
+        params = self.forward(audio_features)
+        mean, var = self.predict(params)
+        return mean, var.clamp(min=0.0).sqrt()
