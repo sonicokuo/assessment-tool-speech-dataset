@@ -1167,3 +1167,54 @@ PRINCIPLED_TOLERANCE_CONFIG = ToleranceConfig(
         "duration_sec": 0.07,
     },
 )
+
+
+# ── COVERAGE-GUARANTEED (T1-derived) tolerance config ────────────────────────
+# Per-feature perceptual just-noticeable differences (JND_f). These are the
+# perception floor in tau_f = JND_f + z_{1-alpha}*sigma_f (Thm 1.2). Sources:
+# pitch/loudness/duration psychoacoustics; on every continuous SFS feature the
+# measured GT-noise sigma_f DOMINATES the JND, so the band is noise-limited (the
+# JND only matters as a non-zero floor when sigma_f -> 0, e.g. a clean-GT oracle).
+PERCEPTUAL_JND = {
+    "snr": 1.0,              # dB — ~1 dB level JND
+    "hnr": 3.0,              # dB
+    "f0_mean": 1.0,          # Hz — pitch JND ~0.2-1 Hz in speech range
+    "f0_sd": 1.0,            # Hz
+    "f0_std": 1.0,           # Hz (alias)
+    "jitter": 0.3,           # %
+    "shimmer": 0.5,          # %
+    "srmr": 0.5,             # unitless reverberation index
+    "overlap_ratio": 0.05,   # unitless 0-1
+    "speaking_rate": 0.3,    # syl/s
+    "articulation_rate": 0.3,  # syl/s
+    "pause_count": 1.0,      # integer count (off-by-one is annotation noise)
+    "pause_rate": 1.0,       # per min
+    "duration_sec": 0.05,    # s — anchor only (excluded from SFS)
+}
+
+
+def coverage_guaranteed_config(
+    sigma: dict[str, float],
+    jnd: dict[str, float] | None = None,
+    alpha: float = 0.05,
+    family: str = "gaussian",
+    rel_frac: dict[str, float] | None = None,
+) -> "ToleranceConfig":
+    """Build a ToleranceConfig with T1 coverage-guaranteed floors.
+
+    abs_floor[f] = JND_f + k(alpha, family) * sigma_f, where `sigma` is the
+    measured per-feature GT-noise scale (e.g. from
+    `metrics_calibrated.estimate_noise_model(...).sigma()`). `jnd` defaults to
+    PERCEPTUAL_JND. Thin wrapper over
+    `metrics_calibrated.build_coverage_tolerance_config` so the derived band is
+    reachable from the scorer module too. Tolerances are DERIVED from
+    {sigma, JND, alpha}, never hand-set.
+    """
+    try:  # package-relative when imported as src.sfs
+        from .metrics_calibrated import build_coverage_tolerance_config
+    except ImportError:  # flat import when src/ is on sys.path
+        from metrics_calibrated import build_coverage_tolerance_config
+    return build_coverage_tolerance_config(
+        sigma, jnd if jnd is not None else PERCEPTUAL_JND,
+        alpha=alpha, family=family, rel_frac=rel_frac,
+    )

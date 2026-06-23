@@ -35,7 +35,9 @@ the scorer uses, so GT is naturally restricted to parseable, scorable features
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import random
+import statistics as _st
+from dataclasses import dataclass, field
 
 try:  # package-relative when imported as src.metrics_calibrated
     from .sfs import Claim, HybridClaimParser, AbstentionDetector, SFSScorer
@@ -293,3 +295,436 @@ def calibrated_sfs_report(
         "n_correct": tot_c,
     }
     return {"per_feature": per_feature, "aggregate": aggregate}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FORMAL FRAMEWORK (T1-T5): coverage-guaranteed tolerances, observability
+# ceiling, identifiability, bootstrap CIs + multiple-comparison correction.
+#
+# All of this is ADDITIVE: nothing here is invoked by the legacy SFS path, so
+# the no-op contract of `SFSScorer(tol_config=None)` is untouched. The pieces:
+#
+#   normal_quantile / norm_cdf      Phi^{-1}, Phi (no scipy)
+#   estimate_noise_model            sigma_f, bias, kurtosis from two GT sources
+#                                   (Lemma 1.5: sigma = median|D| / 0.9539)
+#   coverage_tolerance              T1: tau_f = JND_f + k(alpha)*sigma_f, with
+#                                   gaussian / chebyshev / vp factor families
+#   build_coverage_tolerance_config a ToleranceConfig DERIVED from {sigma,JND}
+#   p_max_ceiling                   T3a: P_max = 2*Phi(tau/sigma) - 1
+#   identifiability                 T3b: SCORABLE vs UNIDENTIFIABLE on this GT
+#                                   (Fano channel-capacity threshold)
+#   bootstrap_precision_ci          T4/T5: seeded, reproducible CI for precision
+#   bootstrap_skill_ci              seeded CI + paired model-vs-baseline test
+#   holm_correction / bh_correction multiple-comparison across features
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Lemma 1.5 constant: for D = eps1 - eps2 (two independent same-sigma errors),
+# median|D| = sqrt(2)*sigma*Phi^{-1}(0.75) = 0.95387...*sigma under Gaussianity.
+_MEDIAN_ABS_TO_SIGMA = math.sqrt(2.0) * 0.6744897501960817  # 0.9538725...
+
+
+def norm_cdf(z: float) -> float:
+    """Standard normal CDF Phi(z) via erf (no scipy)."""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def normal_quantile(p: float) -> float:
+    """Inverse standard normal CDF Phi^{-1}(p), p in (0,1).
+
+    Acklam's rational approximation; abs error < ~1.15e-9 over (0,1). Used for
+    the z_{1-alpha} tolerance factor and the Lemma-1.5 / T3 ceiling math so the
+    framework has no scipy dependency (matching the rest of this module).
+    """
+    if not (0.0 < p < 1.0):
+        raise ValueError(f"normal_quantile needs p in (0,1), got {p}")
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+
+
+# ── Noise model (Lemma 1.5) ──────────────────────────────────────────────────
+@dataclass
+class NoiseModel:
+    """Empirical measurement-error model for one feature: g_obs = g_true + eps.
+
+    Estimated from two independent extractors on the SAME clips (clean-stem
+    oracle vs mixture estimate). `d = g_a - g_b` is the per-clip disagreement.
+    """
+
+    feature: str
+    n: int
+    bias: float            # mean(d) — signed; eps zero-mean is REJECTED if != 0
+    sigma_random: float    # std(d - bias) / sqrt(2)  (per-estimator sigma)
+    sigma_total: float     # RMS(d) / sqrt(2)         (incl. bias contribution)
+    robust_sigma: float    # 1.4826*MAD(d) / sqrt(2)  (heavy-tail-robust)
+    median_abs_diff: float # median|d|  (the heuristic GT-noise floor)
+    ex_kurtosis: float     # excess kurtosis of d  (>1 => heavy tailed)
+    dynamic_range: float   # p2.5..p97.5 span of g_a (identifiability denom)
+
+    def sigma(self, robust: bool = True) -> float:
+        """Single sigma_f to feed the tolerance/ceiling math. Robust (MAD) by
+        default because every paired SFS feature is heavy-tailed (octave F0
+        errors), so the plain std overstates the Gaussian core."""
+        return self.robust_sigma if robust else self.sigma_random
+
+
+def _percentile(sorted_xs: list[float], p: float) -> float:
+    if not sorted_xs:
+        return float("nan")
+    i = p / 100.0 * (len(sorted_xs) - 1)
+    lo, hi = math.floor(i), math.ceil(i)
+    if lo == hi:
+        return sorted_xs[lo]
+    return sorted_xs[lo] + (sorted_xs[hi] - sorted_xs[lo]) * (i - lo)
+
+
+def estimate_noise_model(feature: str,
+                         vals_a: list[float],
+                         vals_b: list[float],
+                         independent: bool = True) -> NoiseModel:
+    """Fit a NoiseModel for `feature` from two estimators' paired values.
+
+    vals_a, vals_b are aligned per-clip (drop unpaired before calling). Under
+    the additive model with two INDEPENDENT same-sigma estimators,
+    Var(d) = 2*sigma^2 (Lemma 1.5), so per-estimator sigma = std(d)/sqrt(2) and
+    median|d| = 0.9539*sigma. If `independent=False` (e.g. both read the same
+    acoustic content, so the disagreement is dominated by a definitional bias
+    not independent noise), the sqrt(2) split is skipped and sigma is read as
+    the full std(d) — a conservative (larger) band.
+
+    Returns a NoiseModel with bias, sigma (random/total/robust), excess
+    kurtosis, and the dynamic range of `vals_a` for identifiability.
+    """
+    if len(vals_a) != len(vals_b):
+        raise ValueError("vals_a and vals_b must be aligned (same length)")
+    d = [a - b for a, b in zip(vals_a, vals_b)]
+    n = len(d)
+    if n == 0:
+        return NoiseModel(feature, 0, 0.0, 0.0, 0.0, 0.0, 0.0, float("nan"), 0.0)
+    bias = sum(d) / n
+    if n > 1:
+        var = sum((x - bias) ** 2 for x in d) / (n - 1)
+        std = math.sqrt(var)
+    else:
+        std = 0.0
+    rms = math.sqrt(sum(x * x for x in d) / n)
+    med = _st.median(d)
+    mad = _st.median([abs(x - med) for x in d]) * 1.4826
+    median_abs = _st.median([abs(x) for x in d])
+    # excess kurtosis
+    if n > 1 and std > 0:
+        m2 = sum((x - bias) ** 2 for x in d) / n
+        ex_kurt = sum((x - bias) ** 4 for x in d) / n / (m2 * m2) - 3.0
+    else:
+        ex_kurt = float("nan")
+    scale = math.sqrt(2.0) if independent else 1.0
+    sa = sorted(vals_a)
+    dyn = _percentile(sa, 97.5) - _percentile(sa, 2.5)
+    return NoiseModel(
+        feature=feature, n=n, bias=bias,
+        sigma_random=std / scale,
+        sigma_total=rms / scale,
+        robust_sigma=mad / scale,
+        median_abs_diff=median_abs,
+        ex_kurtosis=ex_kurt,
+        dynamic_range=dyn,
+    )
+
+
+# ── T1: coverage-guaranteed tolerance ────────────────────────────────────────
+def _tolerance_factor(alpha: float, family: str) -> float:
+    """k in tau = JND + k*sigma, controlling false-reject at level alpha.
+
+    gaussian   z_{1-alpha} = Phi^{-1}(1-alpha)            (Thm 1.2)
+    chebyshev  1/sqrt(alpha)                              (Thm 1.3, dist-free)
+    vp         (2/3)/sqrt(alpha)  for alpha <= 1/6        (Thm 1.4, unimodal)
+    """
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f"alpha must be in (0,1), got {alpha}")
+    if family == "gaussian":
+        return normal_quantile(1.0 - alpha)
+    if family == "chebyshev":
+        return 1.0 / math.sqrt(alpha)
+    if family == "vp":
+        if alpha > 1.0 / 6.0:
+            raise ValueError("VP factor requires alpha <= 1/6")
+        return (2.0 / 3.0) / math.sqrt(alpha)
+    raise ValueError(f"unknown tolerance family {family!r}")
+
+
+def coverage_tolerance(sigma_f: float, jnd_f: float, alpha: float = 0.05,
+                       family: str = "gaussian") -> float:
+    """T1 band tau_f = JND_f + k(alpha, family) * sigma_f.
+
+    A truly faithful claim (|claim - truth| <= JND_f) is accepted with prob
+    >= 1 - alpha against this band (Thm 1.2a / 1.3 / 1.4). The band is DERIVED
+    from the measured noise scale, not hand-tuned.
+    """
+    return jnd_f + _tolerance_factor(alpha, family) * sigma_f
+
+
+def identifiability_budget(alpha: float, beta: float, family: str = "gaussian") -> float:
+    """The factor (z_{1-alpha}+z_{1-beta}) [gaussian] in the separation
+    condition Delta_f - JND_f >= budget * sigma_f (Thm 1.2b). Both guarantees
+    (false-reject <= alpha, false-accept <= beta) hold iff sigma_f is below
+    (Delta_f - JND_f)/budget."""
+    return _tolerance_factor(alpha, family) + _tolerance_factor(beta, family)
+
+
+def build_coverage_tolerance_config(
+    sigma: dict[str, float],
+    jnd: dict[str, float],
+    alpha: float = 0.05,
+    family: str = "gaussian",
+    rel_frac: dict[str, float] | None = None,
+):
+    """DERIVE a ToleranceConfig whose abs_floor[f] = coverage_tolerance(...).
+
+    This is the constructor the spec asks for: tolerances come out of
+    {sigma_f, JND_f, alpha}, never hand-set. Returns a `sfs.ToleranceConfig`
+    (abs_floor only by default; pass rel_frac to add a relative term on top).
+    Features absent from `sigma` are simply omitted (they fall back to the
+    legacy TOLERANCES floor inside the scorer).
+    """
+    try:  # package-relative
+        from .sfs import ToleranceConfig
+    except ImportError:  # flat
+        from sfs import ToleranceConfig
+    floors = {
+        f: coverage_tolerance(sigma[f], jnd.get(f, 0.0), alpha, family)
+        for f in sigma
+    }
+    return ToleranceConfig(abs_floor=floors, rel_frac=dict(rel_frac or {}))
+
+
+# ── T3a: observability precision ceiling ─────────────────────────────────────
+def p_max_ceiling(sigma_f: float, tau_f: float) -> float:
+    """T3a Gaussian ceiling: P_max = 2*Phi(tau/sigma) - 1.
+
+    The MAX probability ANY estimator (incl. the oracle emitting g_true) has of
+    being accepted against a noisy GT with this band. Reported precision can
+    never exceed this; precision == P_max means the residual misses are entirely
+    GT noise, not model error. sigma_f -> 0 gives 1.0 (noiseless GT)."""
+    if sigma_f <= 0:
+        return 1.0
+    return 2.0 * norm_cdf(tau_f / sigma_f) - 1.0
+
+
+# ── T3b: identifiability (Fano channel-capacity threshold) ───────────────────
+@dataclass
+class Identifiability:
+    feature: str
+    sigma_f: float
+    jnd_f: float
+    dynamic_range: float
+    delta_f: float           # effect size used for the cell width
+    channel_capacity: float  # C_f = 0.5*log2(1 + R^2/(12 sigma^2)) bits
+    n_cells: int             # M_f = ceil(R / (2 Delta))
+    log2_cells: float        # log2(M_f)
+    fano_err_lb: float       # T3b min decode-error lower bound
+    scorable: bool           # C_f >= log2(M_f) -> identifiable on this GT
+
+
+def identifiability(feature: str, sigma_f: float, jnd_f: float,
+                    dynamic_range: float, delta_f: float | None = None) -> Identifiability:
+    """Classify a feature as SCORABLE vs UNIDENTIFIABLE-on-this-GT (T3b).
+
+    Channel model: input g_true constrained to a range R=dynamic_range, additive
+    noise variance sigma_f^2, capacity C_f = 0.5*log2(1 + R^2/(12 sigma^2)) bits
+    (range-limited Gaussian channel, uniform-input worst case). Discretize R into
+    M_f = ceil(R / 2*Delta) cells of half-width Delta (Delta defaults to
+    max(JND, sigma) — the finest distinction the noise permits). Fano:
+        P_err >= 1 - (C_f + 1)/log2(M_f).
+    A feature is scorable iff C_f >= log2(M_f) (the latent cell is recoverable
+    through the noisy GT). f0_mean/f0_sd under heavy overlap are the canonical
+    UNIDENTIFIABLE instances (matches ABSTAINABLE_FEATURES)."""
+    delta = delta_f if delta_f is not None else max(jnd_f, sigma_f)
+    R = max(dynamic_range, 0.0)
+    if sigma_f <= 0:
+        cap = float("inf")
+    else:
+        cap = 0.5 * math.log2(1.0 + (R * R / 12.0) / (sigma_f * sigma_f))
+    M = max(1, math.ceil(R / (2.0 * delta))) if delta > 0 else 1
+    log2M = math.log2(M) if M > 1 else 0.0
+    if log2M <= 0:
+        fano_lb = 0.0
+        scorable = True
+    else:
+        fano_lb = max(0.0, 1.0 - (cap + 1.0) / log2M)
+        # Scorable iff Fano does NOT force a positive decode-error floor, i.e.
+        # the channel can carry log2(M_f) bits up to the +1 Fano slack
+        # (C_f + 1 >= log2 M_f). When that fails, fano_lb > 0 and the latent
+        # cell is provably unrecoverable through the noisy GT (T3b).
+        scorable = fano_lb <= 0.0
+    return Identifiability(
+        feature=feature, sigma_f=sigma_f, jnd_f=jnd_f,
+        dynamic_range=R, delta_f=delta,
+        channel_capacity=cap, n_cells=M, log2_cells=log2M,
+        fano_err_lb=fano_lb, scorable=scorable,
+    )
+
+
+# ── T4 / T5: bootstrap CIs + paired significance + multiple-comparison ───────
+def _precision_of(preds: list[float], gts: list[float],
+                  feature: str, tol_fn) -> float:
+    if not preds:
+        return 0.0
+    return sum(1 for p, g in zip(preds, gts)
+               if abs(p - g) <= tol_fn(feature, g)) / len(preds)
+
+
+def bootstrap_precision_ci(preds: list[float], gts: list[float], feature: str,
+                           tol_fn, n_boot: int = 2000, alpha: float = 0.05,
+                           seed: int = 0) -> dict:
+    """Seeded, reproducible percentile-bootstrap CI for per-feature precision.
+
+    tol_fn(feature, gt) -> tolerance (pass SFSScorer(...)._tolerance, or a
+    closure over coverage_tolerance). Returns {point, lo, hi, n, n_boot, alpha}.
+    Same seed => identical interval (verified in tests)."""
+    n = len(preds)
+    point = _precision_of(preds, gts, feature, tol_fn)
+    if n == 0:
+        return {"point": 0.0, "lo": 0.0, "hi": 0.0, "n": 0,
+                "n_boot": n_boot, "alpha": alpha}
+    rng = random.Random(seed)
+    stats = []
+    idx = range(n)
+    for _ in range(n_boot):
+        sample = [rng.randrange(n) for _ in idx]
+        nc = sum(1 for i in sample
+                 if abs(preds[i] - gts[i]) <= tol_fn(feature, gts[i]))
+        stats.append(nc / n)
+    stats.sort()
+    lo = stats[max(0, int((alpha / 2) * n_boot))]
+    hi = stats[min(n_boot - 1, int((1 - alpha / 2) * n_boot))]
+    return {"point": point, "lo": lo, "hi": hi, "n": n,
+            "n_boot": n_boot, "alpha": alpha}
+
+
+def bootstrap_skill_ci(preds: list[float], gts: list[float], feature: str,
+                       tol_fn, baseline_value: float,
+                       n_boot: int = 2000, alpha: float = 0.05,
+                       seed: int = 0) -> dict:
+    """Seeded bootstrap CI for SKILL = model_precision - baseline_precision and a
+    PAIRED test of skill > 0 (model beats the constant baseline).
+
+    On each bootstrap resample BOTH the model and the constant baseline are
+    re-scored on the IDENTICAL resampled clips (paired), so the skill CI removes
+    the shared base-rate variance (T2/T5). `p_value` is the one-sided bootstrap
+    probability that skill <= 0. Returns point/lo/hi/p_value/n."""
+    n = len(preds)
+    if n == 0:
+        return {"point": 0.0, "lo": 0.0, "hi": 0.0, "p_value": 1.0,
+                "n": 0, "n_boot": n_boot, "alpha": alpha}
+    mp = _precision_of(preds, gts, feature, tol_fn)
+    bp = sum(1 for g in gts
+             if abs(baseline_value - g) <= tol_fn(feature, g)) / n
+    point = mp - bp
+    rng = random.Random(seed)
+    stats = []
+    n_le0 = 0
+    for _ in range(n_boot):
+        sample = [rng.randrange(n) for _ in range(n)]
+        mc = bc = 0
+        for i in sample:
+            tol = tol_fn(feature, gts[i])
+            if abs(preds[i] - gts[i]) <= tol:
+                mc += 1
+            if abs(baseline_value - gts[i]) <= tol:
+                bc += 1
+        s = (mc - bc) / n
+        stats.append(s)
+        if s <= 0:
+            n_le0 += 1
+    stats.sort()
+    lo = stats[max(0, int((alpha / 2) * n_boot))]
+    hi = stats[min(n_boot - 1, int((1 - alpha / 2) * n_boot))]
+    return {"point": point, "lo": lo, "hi": hi,
+            "p_value": n_le0 / n_boot, "n": n,
+            "n_boot": n_boot, "alpha": alpha}
+
+
+def holm_correction(pvals: dict[str, float], alpha: float = 0.05) -> dict:
+    """Holm-Bonferroni step-down across features. Returns
+    {feature: {"p": .., "p_adj": .., "reject": bool}}. Strong FWER control."""
+    items = sorted(pvals.items(), key=lambda kv: kv[1])
+    m = len(items)
+    out: dict[str, dict] = {}
+    prev_adj = 0.0
+    still_rejecting = True
+    for rank, (f, p) in enumerate(items):
+        adj = min(1.0, (m - rank) * p)
+        adj = max(adj, prev_adj)  # enforce monotone non-decreasing adjusted p
+        prev_adj = adj
+        if not (still_rejecting and adj <= alpha):
+            still_rejecting = False
+        out[f] = {"p": p, "p_adj": adj, "reject": still_rejecting}
+    return out
+
+
+def bh_correction(pvals: dict[str, float], alpha: float = 0.05) -> dict:
+    """Benjamini-Hochberg step-up (FDR control). Returns
+    {feature: {"p": .., "p_adj": .., "reject": bool}}."""
+    items = sorted(pvals.items(), key=lambda kv: kv[1])
+    m = len(items)
+    out: dict[str, dict] = {}
+    # adjusted p (monotone from the largest rank down)
+    adj_sorted = [0.0] * m
+    running_min = 1.0
+    for rank in range(m - 1, -1, -1):
+        f, p = items[rank]
+        adj = min(1.0, p * m / (rank + 1))
+        running_min = min(running_min, adj)
+        adj_sorted[rank] = running_min
+    # find largest k with p_(k) <= (k/m)*alpha
+    max_reject_rank = -1
+    for rank, (f, p) in enumerate(items):
+        if p <= (rank + 1) / m * alpha:
+            max_reject_rank = rank
+    for rank, (f, p) in enumerate(items):
+        out[f] = {"p": p, "p_adj": adj_sorted[rank],
+                  "reject": rank <= max_reject_rank}
+    return out
+
+
+# ── T4: AURC selective-risk helpers + finite-sample Hoeffding half-width ──────
+def aurc(confidences: list[float], losses: list[float]) -> float:
+    """Area under the risk-coverage curve (T4a). Sort by DESCENDING confidence,
+    accumulate the running mean loss over the most-confident k, average over
+    coverage. losses are 0/1 (claim wrong=1). Lower AURC = better ordering."""
+    n = len(confidences)
+    if n == 0:
+        return 0.0
+    order = sorted(range(n), key=lambda i: confidences[i], reverse=True)
+    run = 0.0
+    total = 0.0
+    for k, i in enumerate(order, start=1):
+        run += losses[i]
+        total += run / k
+    return total / n
+
+
+def hoeffding_halfwidth(n: int, delta: float = 0.05, n_curves: int = 2) -> float:
+    """T4b leading term: 2*sqrt(log((2*n_curves)/delta)/(2n)). For the AURC
+    gain over random (two curves), at n=18000, delta=0.05 this is ~0.022."""
+    if n <= 0:
+        return float("inf")
+    return 2.0 * math.sqrt(math.log((2 * n_curves) / delta) / (2.0 * n))
