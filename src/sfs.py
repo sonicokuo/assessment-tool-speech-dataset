@@ -1,7 +1,7 @@
 """Signal Faithfulness Score (SFS) — evaluation metric for speech quality descriptions."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from feature_tags import (
     FEATURE_TAGS,
@@ -9,6 +9,53 @@ from feature_tags import (
     extract_value,
     iter_tagged_spans,
 )
+
+
+# ── Principled (relative / noise-floor-calibrated) tolerance config ──────────
+@dataclass
+class ToleranceConfig:
+    """Per-feature relative-tolerance configuration for the PRINCIPLED SFS path.
+
+    The band for a feature `f` against ground-truth value `gt` is
+
+        tol(f, gt) = max(abs_floor[f], rel_frac[f] * |gt|)
+
+    delegated to `metrics_calibrated.relative_tolerance` (the single shared
+    implementation, so the absolute and relative paths can never drift).
+
+    Both dicts default to EMPTY. With empty `rel_frac` every feature gets a
+    relative fraction of 0.0 (NOT the metrics_calibrated.REL_FRAC defaults —
+    see `SFSScorer._tolerance`), and with empty `abs_floor` every feature falls
+    back to its legacy `SFSScorer.TOLERANCES` absolute floor. So a bare
+    `ToleranceConfig()` is an EXACT no-op: it reproduces the legacy absolute
+    tolerance for every feature, claim-for-claim.
+
+    Attributes:
+        abs_floor: feature -> absolute floor (overrides the legacy TOLERANCES
+                   floor for that feature). Features absent here keep their
+                   legacy `SFSScorer.TOLERANCES` value as the floor.
+        rel_frac:  feature -> relative fraction of |gt|. Features absent here
+                   contribute 0.0 (so the absolute floor binds) — this is what
+                   makes the empty config a true no-op.
+    """
+
+    abs_floor: dict = field(default_factory=dict)
+    rel_frac: dict = field(default_factory=dict)
+
+    def tolerance(self, feature: str, gt_value: float) -> float:
+        """max(abs_floor[f] or legacy floor, rel_frac[f] (default 0) * |gt|)."""
+        # Lazy import avoids a circular import (metrics_calibrated imports from sfs).
+        try:  # package-relative when imported as src.sfs
+            from .metrics_calibrated import relative_tolerance
+        except ImportError:  # flat import when src/ is on sys.path
+            from metrics_calibrated import relative_tolerance
+        floor = self.abs_floor.get(feature, SFSScorer.TOLERANCES.get(feature, 0.0))
+        return relative_tolerance(
+            feature,
+            gt_value,
+            abs_tol={feature: floor},
+            rel_frac={feature: self.rel_frac.get(feature, 0.0)},
+        )
 
 
 # ── Components ──────────────────────────────────────────────
@@ -488,6 +535,45 @@ class SFSScorer:
     # Overlap uses IoU instead of absolute tolerance
     OVERLAP_IOU_THRESHOLD = 0.8
 
+    def __init__(self, tol_config: "ToleranceConfig | None" = None) -> None:
+        """Args:
+            tol_config: optional PRINCIPLED relative-tolerance config. When None
+                (the default, and what every existing call site uses), the
+                scorer is an EXACT replica of the legacy absolute-tolerance
+                behavior — `_tolerance` returns `self.TOLERANCES[feature]`
+                verbatim. When provided, the within-tolerance band becomes
+                `tol(f, gt) = max(abs_floor[f], rel_frac[f]*|gt|)`.
+        """
+        self.tol_config = tol_config
+
+    def _tolerance(self, feature: str, gt_value: float) -> float:
+        """SINGLE within-tolerance source for both `score` and `score_selective`.
+
+        - tol_config is None  -> return self.TOLERANCES[feature] VERBATIM
+          (exact legacy no-op; identical float object semantics, no arithmetic).
+        - tol_config provided  -> route through
+          metrics_calibrated.relative_tolerance with
+              abs_tol = abs_floor.get(feature, self.TOLERANCES[feature])
+              rel_frac = rel_frac.get(feature, 0.0)   # NOTE: forced 0.0, NOT the
+                                                       # metrics_calibrated.REL_FRAC
+                                                       # default, so an empty config
+                                                       # is a true no-op.
+        """
+        if self.tol_config is None:
+            return self.TOLERANCES[feature]
+        # Lazy import to avoid the metrics_calibrated <-> sfs circular import.
+        try:  # package-relative when imported as src.sfs
+            from .metrics_calibrated import relative_tolerance
+        except ImportError:  # flat import when src/ is on sys.path
+            from metrics_calibrated import relative_tolerance
+        floor = self.tol_config.abs_floor.get(feature, self.TOLERANCES[feature])
+        frac = self.tol_config.rel_frac.get(feature, 0.0)
+        return relative_tolerance(
+            feature, gt_value,
+            abs_tol={feature: floor},
+            rel_frac={feature: frac},
+        )
+
     def score(
         self,
         claims: list[Claim],
@@ -512,7 +598,7 @@ class SFSScorer:
 
             if claim.feature in ground_truth and claim.feature in self.TOLERANCES:
                 gt_value = ground_truth[claim.feature]
-                tolerance = self.TOLERANCES[claim.feature]
+                tolerance = self._tolerance(claim.feature, gt_value)
                 error = abs(claim.value - gt_value)
                 correct = error <= tolerance
 
@@ -719,7 +805,8 @@ class SFSScorer:
                 n_asserted += 1
                 gt_value = ground_truth[f]
                 err = abs(claimed[f] - gt_value)
-                correct = err <= self.TOLERANCES[f]
+                tol = self._tolerance(f, gt_value)
+                correct = err <= tol
                 if correct:
                     n_correct += 1  # raw numeric accuracy (value within tol)
                 if is_reliable:
@@ -737,7 +824,7 @@ class SFSScorer:
                 per_feature.append({
                     "feature": f, "outcome": outcome, "reliable": is_reliable,
                     "claimed": claimed[f], "actual": gt_value,
-                    "error": err, "tolerance": self.TOLERANCES[f],
+                    "error": err, "tolerance": tol,
                 })
             elif hedged:
                 if is_reliable:
@@ -805,3 +892,278 @@ class SFSScorer:
                 if r["outcome"] in ("correct", "wrong", "overclaim")
             ],
         }
+
+    # ── Baseline-relative + robustness-sweep convenience methods ─────────────
+    # The PROVEN drivers / tests call the module-level `baseline_relative_sfs`
+    # and `tolerance_sweep` (below) over a `{feature: (preds, gts)}` pairs dict.
+    # These instance methods are thin pass-throughs so the metric can also be
+    # reached via the scorer object, honoring the "method on SFSScorer" spec
+    # wording without breaking the pairs-based call sites.
+    def baseline_relative_sfs(self, pairs: dict, baseline_kind="mode") -> dict:
+        """Instance shim for the module-level `baseline_relative_sfs`, using THIS
+        scorer's `tol_config` as the scoring band."""
+        return baseline_relative_sfs(
+            pairs, tol_config=self.tol_config, baseline_kind=baseline_kind,
+        )
+
+    def tolerance_sweep(self, pairs: dict,
+                        multipliers=(0.5, 1.0, 2.0, 4.0),
+                        baseline_kind="mode") -> dict:
+        """Instance shim for the module-level `tolerance_sweep`, using THIS
+        scorer's `tol_config` as the base band."""
+        return tolerance_sweep(
+            pairs, base_config=self.tol_config, multipliers=multipliers,
+            baseline_kind=baseline_kind,
+        )
+
+
+# ── Baseline-relative SFS (skill = precision - constant-predictor precision) ──
+def _baseline_predictor(values: list[float], kind: str = "mode") -> float:
+    """The CONSTANT/MODE predictor's single emitted value for one feature.
+
+    kind="mode"   -> the most frequent value, ties broken by FIRST occurrence in
+                     the original list order. On an all-distinct list this is the
+                     first element (every value is equally "modal"). This matches
+                     the hand-checked test cases.
+    kind="median" -> the positional middle of the sorted values (lower-middle for
+                     an even count, i.e. element at index n//2 of the sorted list,
+                     consistent with the odd-length test fixtures).
+    """
+    if not values:
+        return 0.0
+    if kind == "median":
+        s = sorted(values)
+        return s[len(s) // 2]
+    # mode: highest count, earliest-first tiebreak.
+    counts: dict = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    best_v = values[0]
+    best_c = counts[best_v]
+    for v in values:  # iterate in original order -> earliest modal value wins ties
+        if counts[v] > best_c:
+            best_v, best_c = v, counts[v]
+    return best_v
+
+
+def _resolve_kind(baseline_kind, feature: str) -> str:
+    """`baseline_kind` may be a single str (applied to every feature) or a
+    per-feature {feature: kind} dict (default "mode" for features absent)."""
+    if isinstance(baseline_kind, dict):
+        return baseline_kind.get(feature, "mode")
+    return baseline_kind
+
+
+def _precision_under(scorer: "SFSScorer", feature: str,
+                     preds: list[float], gts: list[float]) -> float:
+    """Fraction of (pred, gt) pairs within `scorer`'s band for `feature`."""
+    if not preds:
+        return 0.0
+    n_ok = sum(
+        1 for p, g in zip(preds, gts)
+        if abs(p - g) <= scorer._tolerance(feature, g)
+    )
+    return n_ok / len(preds)
+
+
+def baseline_relative_sfs(pairs: dict,
+                          tol_config: "ToleranceConfig | None" = None,
+                          baseline_kind="mode") -> dict:
+    """Baseline-relative SFS over a `{feature: (preds, gts)}` pairs dict.
+
+    For each feature and for the pooled set we report
+
+        precision           model claims within tolerance / n
+        baseline_precision  a CONSTANT predictor (the per-feature mode or median
+                            of the GT) within the SAME tolerance / n
+        skill = precision - baseline_precision
+
+    Raw precision conflates model skill with a feature's base rate: a constant
+    predictor that always emits the modal/median GT can score near-perfect
+    precision on a low-variance feature (the pause_count artifact). `skill`
+    subtracts that floor so a headline number reflects information over a
+    trivial predictor.
+
+    The baseline is scored under the IDENTICAL tolerance band as the model (the
+    band can vary per clip when `tol_config` uses a relative term, since it
+    depends on each clip's GT magnitude).
+
+    Args:
+        pairs:        {feature: ([pred,...], [gt,...])}, e.g. from
+                      metrics_calibrated.collect_pairs.
+        tol_config:   None -> legacy absolute TOLERANCES; else the principled
+                      relative band.
+        baseline_kind: "mode" / "median", or a per-feature dict. Mode for
+                      discrete counts (pause_count), median for continuous
+                      features is the paper convention.
+
+    Returns:
+        {"per_feature": {feature: {...}}, "aggregate": {...}}
+    """
+    scorer = SFSScorer(tol_config=tol_config)
+    per_feature: dict = {}
+    pooled_correct = pooled_base = pooled_n = 0
+
+    for feature in sorted(pairs):
+        preds, gts = pairs[feature]
+        n = len(preds)
+        kind = _resolve_kind(baseline_kind, feature)
+        base_val = _baseline_predictor(gts, kind)
+
+        n_correct = sum(
+            1 for p, g in zip(preds, gts)
+            if abs(p - g) <= scorer._tolerance(feature, g)
+        )
+        n_base = sum(
+            1 for g in gts
+            if abs(base_val - g) <= scorer._tolerance(feature, g)
+        )
+        precision = n_correct / n if n else 0.0
+        baseline_precision = n_base / n if n else 0.0
+        per_feature[feature] = {
+            "feature": feature,
+            "n": n,
+            "precision": precision,
+            "baseline_precision": baseline_precision,
+            "skill": precision - baseline_precision,
+            "baseline_value": base_val,
+            "baseline_kind": kind,
+            "n_correct": n_correct,
+            "n_baseline_correct": n_base,
+        }
+        pooled_correct += n_correct
+        pooled_base += n_base
+        pooled_n += n
+
+    aggregate = {
+        "n": pooled_n,
+        "precision": pooled_correct / pooled_n if pooled_n else 0.0,
+        "baseline_precision": pooled_base / pooled_n if pooled_n else 0.0,
+        "skill": (pooled_correct - pooled_base) / pooled_n if pooled_n else 0.0,
+        "n_correct": pooled_correct,
+        "n_baseline_correct": pooled_base,
+    }
+    return {"per_feature": per_feature, "aggregate": aggregate}
+
+
+def _scaled_config(base_config: "ToleranceConfig | None", mult: float) -> "ToleranceConfig":
+    """Scale a tolerance band by `mult`: both the absolute floor AND the relative
+    fraction are multiplied, so the WHOLE band widens/narrows uniformly.
+
+    base_config is None  -> start from the legacy absolute TOLERANCES (rel_frac
+    implicitly 0), so at mult=1.0 the scaled config reproduces the legacy
+    absolute path exactly.
+    """
+    if base_config is None:
+        abs_floor = dict(SFSScorer.TOLERANCES)
+        rel_frac: dict = {}
+    else:
+        # Start every legacy floor from TOLERANCES, then override with the
+        # config's explicit floors, so a feature absent from abs_floor still
+        # scales its legacy floor.
+        abs_floor = dict(SFSScorer.TOLERANCES)
+        abs_floor.update(base_config.abs_floor)
+        rel_frac = dict(base_config.rel_frac)
+    return ToleranceConfig(
+        abs_floor={f: v * mult for f, v in abs_floor.items()},
+        rel_frac={f: v * mult for f, v in rel_frac.items()},
+    )
+
+
+def tolerance_sweep(pairs: dict,
+                    base_config: "ToleranceConfig | None" = None,
+                    multipliers=(0.5, 1.0, 2.0, 4.0),
+                    baseline_kind="mode") -> dict:
+    """Robustness curve: per-feature + pooled precision AND model-vs-baseline
+    skill across a band of tolerance multipliers.
+
+    Each multiplier scales the ENTIRE band (abs_floor and rel_frac) by the same
+    factor. Raw precision is non-decreasing in the multiplier by construction (a
+    wider band only ever converts wrong claims to correct). Skill is NOT
+    monotone (a looser band also helps the constant baseline), which is exactly
+    the diagnostic value of the sweep.
+
+    Args:
+        pairs:        {feature: ([pred,...], [gt,...])}.
+        base_config:  None -> legacy absolute TOLERANCES (so mult=1.0 == legacy);
+                      else the principled config to scale.
+        multipliers:  the tolerance scale factors to sweep.
+        baseline_kind: forwarded to baseline_relative_sfs.
+
+    Returns:
+        {
+          "per_feature": {feature: [ {multiplier, precision, baseline_precision,
+                                      skill, baseline_value, n}, ... ]},
+          "aggregate":   [ {multiplier, precision, baseline_precision, skill,
+                            n}, ... ],
+        }
+    """
+    per_feature: dict = {}
+    aggregate: list = []
+    for mult in multipliers:
+        cfg = _scaled_config(base_config, mult)
+        rep = baseline_relative_sfs(pairs, tol_config=cfg, baseline_kind=baseline_kind)
+        for feature, fr in rep["per_feature"].items():
+            per_feature.setdefault(feature, []).append({
+                "multiplier": mult,
+                "precision": fr["precision"],
+                "baseline_precision": fr["baseline_precision"],
+                "skill": fr["skill"],
+                "baseline_value": fr["baseline_value"],
+                "n": fr["n"],
+            })
+        ar = rep["aggregate"]
+        aggregate.append({
+            "multiplier": mult,
+            "precision": ar["precision"],
+            "baseline_precision": ar["baseline_precision"],
+            "skill": ar["skill"],
+            "n": ar["n"],
+        })
+    return {"per_feature": per_feature, "aggregate": aggregate}
+
+
+# ── FINAL principled tolerance values: tol = max(JND, GTnoise) ───────────────
+# abs_floor[f] = max(perceptual JND_f, GT-noise floor_f), where the GT-noise
+# floor is the median |clean-stem-oracle - mixture-estimate| disagreement for
+# that feature. rel_frac[f] is the dominating relative (GT-noise rel-median)
+# term where feature magnitude varies widely, and 0.0 for counts / GT-noise-
+# limited / metadata features. Across all twelve scored features the GT-noise
+# term dominates the JND (verified). snr is the limiting case: GTnoise 13.65 dB
+# >> 1 dB JND, so its absolute floor binds and rel_frac is 0.
+#
+# Use as:  scorer = SFSScorer(PRINCIPLED_TOLERANCE_CONFIG)
+PRINCIPLED_TOLERANCE_CONFIG = ToleranceConfig(
+    abs_floor={
+        "snr": 13.65,            # max(JND 1.0, GTnoise 13.65) -> GT-noise-limited
+        "hnr": 3.09,             # max(JND 3.0, GTnoise 3.09)
+        "f0_mean": 12.88,        # max(JND 1.0, GTnoise 12.88)
+        "f0_sd": 11.14,          # max(JND 1.0, GTnoise 11.14)
+        "f0_std": 11.14,         # alias of f0_sd
+        "jitter": 0.40,          # max(JND 0.3, GTnoise 0.40)
+        "shimmer": 3.31,         # max(JND 0.5, GTnoise 3.31)
+        "srmr": 2.10,            # max(JND 0.5, GTnoise 2.10)
+        "overlap_ratio": 0.446,  # max(JND 0.05, GTnoise 0.446)
+        "speaking_rate": 1.17,   # max(JND 0.3, GTnoise 1.17)
+        "articulation_rate": 0.495,  # max(JND 0.3, GTnoise 0.495) ~ AT floor
+        "pause_count": 2.0,      # max(JND 1, GTnoise 2.0) integer count
+        "pause_rate": 13.35,     # max(JND 1.0, GTnoise 13.35)
+        "duration_sec": 0.05,    # excluded from SFS by design; anchor only
+    },
+    rel_frac={
+        "snr": 0.0,              # GT-noise-limited: absolute floor binds
+        "hnr": 0.27,
+        "f0_mean": 0.08,
+        "f0_sd": 0.25,
+        "f0_std": 0.25,
+        "jitter": 0.50,
+        "shimmer": 0.40,
+        "srmr": 0.30,
+        "overlap_ratio": 0.58,
+        "speaking_rate": 0.23,
+        "articulation_rate": 0.073,
+        "pause_count": 0.0,      # discrete: ±2 absolute only
+        "pause_rate": 0.67,
+        "duration_sec": 0.07,
+    },
+)
