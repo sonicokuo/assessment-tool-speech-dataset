@@ -1,4 +1,15 @@
-"""Signal Faithfulness Score (SFS) — evaluation metric for speech quality descriptions."""
+"""Signal Faithfulness Score (SFS) — evaluation metric for speech quality descriptions.
+
+SFS MEANS THE PRINCIPLED COVERAGE BAND. `SFSScorer()` with no arguments scores
+against the Tier-3 coverage-derived tolerance `DEFAULT_TOLERANCE_CONFIG`, built
+from the measured per-feature GT-noise model (sigma_f) + perceptual JND_f +
+alpha=0.05 + the distribution family the measured tail demands. The legacy
+hand-picked absolute tolerances (`SFSScorer.TOLERANCES`, the old +-2 dB / +-5 Hz
+dict) are a BACK-COMPAT SHIM ONLY, reachable via `SFSScorer(legacy=True)`; they
+are not the meaning of SFS. Magnitude-dependence of the band is sourced from the
+noise model's relative sigma (heteroscedastic features), not a hand-set rel_frac
+(the ToleranceConfig.rel_frac field is retained only as a deprecated alias).
+"""
 
 import re
 from dataclasses import dataclass, field
@@ -34,9 +45,16 @@ class ToleranceConfig:
         abs_floor: feature -> absolute floor (overrides the legacy TOLERANCES
                    floor for that feature). Features absent here keep their
                    legacy `SFSScorer.TOLERANCES` value as the floor.
-        rel_frac:  feature -> relative fraction of |gt|. Features absent here
-                   contribute 0.0 (so the absolute floor binds) — this is what
-                   makes the empty config a true no-op.
+        rel_frac:  DEPRECATED back-compat alias. feature -> relative fraction of
+                   |gt|. Features absent here contribute 0.0 (so the absolute
+                   floor binds) — this is what makes the empty config a true
+                   no-op. In Tier-3, magnitude-dependence of the band is sourced
+                   from the noise model's relative sigma (rel_sigma) and folded
+                   INTO the band via `build_coverage_tolerance_config_from_models`
+                   (which sets rel_frac = k*rel_sigma); this field is no longer
+                   the mechanism for heteroscedasticity, only the carrier the
+                   builder writes into. Hand-setting it remains supported for
+                   back-compat but is discouraged.
     """
 
     abs_floor: dict = field(default_factory=dict)
@@ -535,29 +553,58 @@ class SFSScorer:
     # Overlap uses IoU instead of absolute tolerance
     OVERLAP_IOU_THRESHOLD = 0.8
 
-    def __init__(self, tol_config: "ToleranceConfig | None" = None) -> None:
+    def __init__(self, tol_config="__UNSET__", legacy: bool = False) -> None:
         """Args:
-            tol_config: optional PRINCIPLED relative-tolerance config. When None
-                (the default, and what every existing call site uses), the
-                scorer is an EXACT replica of the legacy absolute-tolerance
-                behavior — `_tolerance` returns `self.TOLERANCES[feature]`
-                verbatim. When provided, the within-tolerance band becomes
-                `tol(f, gt) = max(abs_floor[f], rel_frac[f]*|gt|)`.
+            tol_config: a PRINCIPLED relative-tolerance config.
+                * OMITTED entirely (`SFSScorer()`, and `legacy` False) -> the
+                  scorer DEFAULTS to the Tier-3 coverage-derived band
+                  `DEFAULT_TOLERANCE_CONFIG`. THIS is what "SFS" now means (a
+                  principled coverage band built from measured sigma_f + JND +
+                  alpha=0.05 + the family the tail demands).
+                * an explicit ToleranceConfig -> that config's band is used.
+                * an EXPLICIT None (`SFSScorer(tol_config=None)`) -> the legacy
+                  absolute-tolerance band, identical to `legacy=True`. This
+                  preserves the old `tol_config=None == legacy` contract for
+                  module-level helpers (baseline_relative_sfs / tolerance_sweep)
+                  and callers that pass None through. The DISTINCTION between
+                  "omitted" (principled default) and "explicit None" (legacy) is
+                  carried by an internal sentinel so the directed default flip
+                  does not silently change those legacy call sites.
+            legacy: back-compat shim. `SFSScorer(legacy=True)` restores the EXACT
+                legacy absolute-tolerance behavior — `_tolerance` returns
+                `self.TOLERANCES[feature]` verbatim (identical float semantics,
+                no arithmetic). NOT the meaning of SFS. `legacy=True` with an
+                explicit (non-None) tol_config is rejected.
         """
-        self.tol_config = tol_config
+        explicit_config = tol_config not in ("__UNSET__", None)
+        if legacy and explicit_config:
+            raise ValueError(
+                "SFSScorer(legacy=True) is mutually exclusive with tol_config")
+        if legacy or tol_config is None:
+            # explicit None OR legacy=True -> legacy absolute band (no-op path)
+            self.legacy = True
+            self.tol_config = None
+        elif explicit_config:
+            self.legacy = False
+            self.tol_config = tol_config
+        else:
+            # omitted entirely -> the Tier-3 principled default (lazy-built once)
+            self.legacy = False
+            self.tol_config = _get_default_tolerance_config()
 
     def _tolerance(self, feature: str, gt_value: float) -> float:
         """SINGLE within-tolerance source for both `score` and `score_selective`.
 
-        - tol_config is None  -> return self.TOLERANCES[feature] VERBATIM
-          (exact legacy no-op; identical float object semantics, no arithmetic).
-        - tol_config provided  -> route through
-          metrics_calibrated.relative_tolerance with
+        - legacy=True (tol_config None)  -> return self.TOLERANCES[feature]
+          VERBATIM (exact legacy no-op; identical float semantics, no arithmetic).
+        - tol_config set (the DEFAULT is the Tier-3 coverage band) -> route
+          through metrics_calibrated.relative_tolerance with
               abs_tol = abs_floor.get(feature, self.TOLERANCES[feature])
-              rel_frac = rel_frac.get(feature, 0.0)   # NOTE: forced 0.0, NOT the
-                                                       # metrics_calibrated.REL_FRAC
-                                                       # default, so an empty config
-                                                       # is a true no-op.
+              rel_frac = rel_frac.get(feature, 0.0)   # forced 0.0 default so an
+                                                       # empty config is a true
+                                                       # no-op; the deprecated
+                                                       # rel_frac alias only kicks
+                                                       # in when explicitly set.
         """
         if self.tol_config is None:
             return self.TOLERANCES[feature]
@@ -1218,3 +1265,104 @@ def coverage_guaranteed_config(
         sigma, jnd if jnd is not None else PERCEPTUAL_JND,
         alpha=alpha, family=family, rel_frac=rel_frac,
     )
+
+
+# ── DEFAULT (Tier-3) coverage band — THIS is the meaning of SFS ──────────────
+# These per-feature noise-model parameters are MEASURED (not hand-set) by
+# `metrics_calibrated.estimate_noise_model` on the full paired clean-stem-oracle
+# vs mixture-estimate corpus (test+dev, n up to 6000), the same fit the
+# deterministic driver scripts/rescore_v21_formal.py pins. The DEFAULT SFS band
+# is then DERIVED as tau_f = JND_f + k(alpha=0.05, family_f) * sigma_f, with:
+#   * sigma_f = robust (MAD-based) per-estimator scale (heavy-tail-robust),
+#   * family_f selected by the measured excess kurtosis of each feature's GT
+#     disagreement (heavy-tailed -> distribution-free VP, light -> two-sided
+#     Gaussian) via metrics_calibrated.select_family,
+#   * heteroscedasticity folded INTO sigma: for a feature whose disagreement
+#     grows with magnitude, rel_frac_f = k * rel_sigma_f, so the scorer's
+#     max(abs_floor, rel_frac*|gt|) reproduces JND + k*max(sigma_const,
+#     rel_sigma*|gt|). The magnitude-dependence comes from sigma, NOT a hand-set
+#     rel_frac (Tier-3 standardization).
+# Features with no second estimator (hnr, jitter, shimmer, overlap_ratio) have
+# no measurable GT-noise sigma here, so they fall back to their legacy
+# SFSScorer.TOLERANCES floor inside the scorer (abs_floor omitted below).
+MEASURED_GT_SIGMA = {       # robust per-estimator sigma_f (clean-GT framing)
+    "snr": 6.4122,
+    "srmr": 3.1401,
+    "f0_mean": 18.9281,
+    "f0_sd": 15.0859,
+    "f0_std": 15.0859,      # alias of f0_sd
+    "speaking_rate": 0.5745,
+    "articulation_rate": 0.6138,
+    "pause_count": 1.0484,
+    "pause_rate": 8.6762,
+}
+MEASURED_GT_REL_SIGMA = {   # relative (heteroscedastic) per-estimator scale
+    "snr": 0.8670,
+    "srmr": 0.3808,
+    "f0_mean": 0.1124,
+    "f0_sd": 0.4257,
+    "f0_std": 0.4257,
+    "speaking_rate": 0.1075,
+    "articulation_rate": 0.0906,
+    "pause_count": 0.6989,
+    "pause_rate": 0.6989,
+}
+# heteroscedastic? (corr(|d|,|gt|) > 0.2 AND rel_sigma>0). Only these features
+# contribute a rel_frac term to the default band; the rest are constant-floor.
+MEASURED_GT_HETERO = {
+    "snr": True, "srmr": True, "f0_mean": True, "f0_sd": False, "f0_std": False,
+    "speaking_rate": False, "articulation_rate": False,
+    "pause_count": True, "pause_rate": True,
+}
+# family selected by measured excess kurtosis (select_family, threshold 1.0).
+MEASURED_GT_FAMILY = {
+    "snr": "vp", "srmr": "gaussian", "f0_mean": "vp", "f0_sd": "vp",
+    "f0_std": "vp", "speaking_rate": "gaussian", "articulation_rate": "vp",
+    "pause_count": "vp", "pause_rate": "gaussian",
+}
+
+
+def _build_default_tolerance_config(alpha: float = 0.05) -> "ToleranceConfig":
+    """Construct the DEFAULT (Tier-3) coverage band from the MEASURED noise
+    model: abs_floor = JND + k(alpha, family)*sigma; rel_frac = k*rel_sigma for
+    heteroscedastic features only. Deterministic (no data read at import; the
+    measured constants above are baked in), so SFSScorer() means exactly this
+    band every run."""
+    try:  # package-relative
+        from .metrics_calibrated import _tolerance_factor
+    except ImportError:  # flat
+        from metrics_calibrated import _tolerance_factor
+    abs_floor: dict = {}
+    rel_frac: dict = {}
+    for f, sig in MEASURED_GT_SIGMA.items():
+        fam = MEASURED_GT_FAMILY.get(f, "gaussian")
+        k = _tolerance_factor(alpha, fam)
+        abs_floor[f] = PERCEPTUAL_JND.get(f, 0.0) + k * sig
+        if MEASURED_GT_HETERO.get(f) and MEASURED_GT_REL_SIGMA.get(f, 0.0) > 0.0:
+            rel_frac[f] = k * MEASURED_GT_REL_SIGMA[f]
+    return ToleranceConfig(abs_floor=abs_floor, rel_frac=rel_frac)
+
+
+# THE default band SFSScorer() uses. "SFS" == this principled coverage band.
+# Built LAZILY (PEP 562 module __getattr__) on first access, then cached as a
+# stable module attribute, so `sfs.DEFAULT_TOLERANCE_CONFIG` and the `is`
+# identity in SFSScorer() are constant. Lazy build avoids a circular import:
+# metrics_calibrated imports from sfs at its top, so if sfs eagerly imported
+# `_tolerance_factor` at import time the cycle would dead-lock when
+# metrics_calibrated is the entry module. By the time anything accesses
+# DEFAULT_TOLERANCE_CONFIG both modules are fully initialized.
+_DEFAULT_TOLERANCE_CONFIG_CACHE = None
+
+
+def _get_default_tolerance_config() -> "ToleranceConfig":
+    global _DEFAULT_TOLERANCE_CONFIG_CACHE
+    if _DEFAULT_TOLERANCE_CONFIG_CACHE is None:
+        _DEFAULT_TOLERANCE_CONFIG_CACHE = _build_default_tolerance_config()
+    return _DEFAULT_TOLERANCE_CONFIG_CACHE
+
+
+def __getattr__(name):
+    # PEP 562: resolve module-level DEFAULT_TOLERANCE_CONFIG on first access.
+    if name == "DEFAULT_TOLERANCE_CONFIG":
+        return _get_default_tolerance_config()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

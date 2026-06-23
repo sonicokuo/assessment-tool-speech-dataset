@@ -13,17 +13,25 @@ Two additions on top of the absolute-tolerance SFS in `src/sfs.py`:
    model's predicted X track the true X", and they do NOT depend on a tolerance
    threshold (unlike binary SFS). They complement SFS rather than replace it.
 
-2. RELATIVE / tolerance-CALIBRATED SFS.
+2. TIER-3 COVERAGE-GUARANTEED SFS (the DEFAULT meaning of SFS).
    The legacy SFS uses a single absolute tolerance per feature (`±2 dB` SNR,
    `±5 Hz` F0). That under-credits high-magnitude clips (a 2 dB miss on a 35 dB
-   SNR is proportionally tiny) and over-credits low-magnitude ones. The
-   calibrated path uses a per-feature tolerance
+   SNR is proportionally tiny) and over-credits low-magnitude ones. Tier-3
+   derives the band from the MEASURED GT-noise model:
 
-       tol(f, gt) = max(abs_tol[f], rel_frac[f] * |gt|)
+       tau_f(|gt|) = JND_f + k(alpha, family_f) * sigma_f(|gt|)
 
-   so the band widens proportionally with the GT magnitude while never falling
-   below a sensible floor. `abs_tol` defaults to `SFSScorer.TOLERANCES`; the old
-   absolute path stays available (rel_frac=0 reproduces it exactly).
+   where sigma_f is the measured per-estimator noise scale, family_f is chosen
+   per feature by its measured tail (heavy-tailed -> distribution-free VP /
+   Chebyshev, light -> two-sided Gaussian), and HETEROSCEDASTICITY is folded
+   into sigma itself: sigma_f(|gt|) = max(sigma_const, rel_sigma*|gt|). The
+   magnitude-dependence therefore comes from sigma, NOT a separate hand-set
+   rel_frac. The old `rel_frac` term in ToleranceConfig is retained ONLY as a
+   deprecated back-compat alias; new configs are built by
+   `build_coverage_tolerance_config_from_models`, which emits the rel_frac that
+   exactly reproduces k*rel_sigma so the magnitude-dependence is sourced from
+   the noise model. The legacy absolute path stays available as a labeled
+   compatibility shim (SFSScorer(legacy=True)).
 
 Both helpers consume the SAME `inference_results.json` schema the rest of the
 pipeline writes: a list of {"filename", "generated", "target", ...}. Ground
@@ -378,12 +386,37 @@ class NoiseModel:
     median_abs_diff: float # median|d|  (the heuristic GT-noise floor)
     ex_kurtosis: float     # excess kurtosis of d  (>1 => heavy tailed)
     dynamic_range: float   # p2.5..p97.5 span of g_a (identifiability denom)
+    rel_sigma: float = 0.0       # robust per-estimator sigma of the RELATIVE
+                                 # disagreement d/|gt| (heteroscedastic scale).
+                                 # 0.0 => homoscedastic (no magnitude growth).
+    heteroscedastic: bool = False  # set when the data shows magnitude-growth of
+                                   # the disagreement (corr(|d|,|gt|) above thr).
 
     def sigma(self, robust: bool = True) -> float:
         """Single sigma_f to feed the tolerance/ceiling math. Robust (MAD) by
         default because every paired SFS feature is heavy-tailed (octave F0
         errors), so the plain std overstates the Gaussian core."""
         return self.robust_sigma if robust else self.sigma_random
+
+    def sigma_at(self, gt_value: float, robust: bool = True) -> float:
+        """Magnitude-DEPENDENT sigma_f(|gt|) for a heteroscedastic feature.
+
+        Tier-3 standardizes magnitude-dependence INTO sigma rather than a
+        separate rel_frac knob: where the GT disagreement grows with the value
+        (heteroscedastic), the per-estimator scale is
+
+            sigma_f(|gt|) = max( sigma_homoscedastic , rel_sigma * |gt| )
+
+        so the coverage band tau = JND + k*sigma_f(|gt|) widens with magnitude
+        THROUGH sigma. A homoscedastic feature (rel_sigma == 0 or not flagged)
+        returns the constant `sigma()` exactly, so nothing changes for those.
+        This replaces the old ad-hoc `rel_frac * |gt|` term as the mechanism for
+        heteroscedasticity (rel_frac is retained only as a deprecated no-op
+        alias for back-compat)."""
+        base = self.sigma(robust=robust)
+        if not self.heteroscedastic or self.rel_sigma <= 0.0:
+            return base
+        return max(base, self.rel_sigma * abs(gt_value))
 
 
 def _percentile(sorted_xs: list[float], p: float) -> float:
@@ -399,7 +432,8 @@ def _percentile(sorted_xs: list[float], p: float) -> float:
 def estimate_noise_model(feature: str,
                          vals_a: list[float],
                          vals_b: list[float],
-                         independent: bool = True) -> NoiseModel:
+                         independent: bool = True,
+                         hetero_corr_threshold: float = 0.2) -> NoiseModel:
     """Fit a NoiseModel for `feature` from two estimators' paired values.
 
     vals_a, vals_b are aligned per-clip (drop unpaired before calling). Under
@@ -410,8 +444,18 @@ def estimate_noise_model(feature: str,
     not independent noise), the sqrt(2) split is skipped and sigma is read as
     the full std(d) — a conservative (larger) band.
 
+    HETEROSCEDASTICITY (Tier-3): we also estimate a RELATIVE per-estimator scale
+    `rel_sigma` = robust MAD of the per-clip relative disagreement d/|gt_ref|
+    (gt_ref = mean of the two estimates), divided by the same sqrt(2) split. A
+    feature is flagged `heteroscedastic` when Spearman corr(|d|, |gt_ref|)
+    exceeds `hetero_corr_threshold` AND rel_sigma > 0. Downstream,
+    `NoiseModel.sigma_at(|gt|)` then widens the band with magnitude THROUGH
+    sigma (= max(const sigma, rel_sigma*|gt|)), which is how Tier-3 captures
+    magnitude-dependence instead of the deprecated rel_frac term.
+
     Returns a NoiseModel with bias, sigma (random/total/robust), excess
-    kurtosis, and the dynamic range of `vals_a` for identifiability.
+    kurtosis, rel_sigma + heteroscedastic flag, and the dynamic range of
+    `vals_a` for identifiability.
     """
     if len(vals_a) != len(vals_b):
         raise ValueError("vals_a and vals_b must be aligned (same length)")
@@ -438,6 +482,25 @@ def estimate_noise_model(feature: str,
     scale = math.sqrt(2.0) if independent else 1.0
     sa = sorted(vals_a)
     dyn = _percentile(sa, 97.5) - _percentile(sa, 2.5)
+
+    # ── heteroscedastic (relative) scale ─────────────────────────────────────
+    # reference magnitude per clip = mean of the two estimates (symmetric, and
+    # never zero unless both are zero). relative disagreement r = d / |gt_ref|.
+    gt_ref = [0.5 * (a + b) for a, b in zip(vals_a, vals_b)]
+    rels = [di / abs(g) for di, g in zip(d, gt_ref) if abs(g) > 1e-9]
+    if len(rels) > 1:
+        rmed = _st.median(rels)
+        rel_mad = _st.median([abs(x - rmed) for x in rels]) * 1.4826
+        rel_sigma = rel_mad / scale
+    else:
+        rel_sigma = 0.0
+    # heteroscedasticity test: does |d| grow with |gt_ref|? (Spearman, robust)
+    abs_d = [abs(x) for x in d]
+    abs_g = [abs(x) for x in gt_ref]
+    sp = spearman(abs_d, abs_g)
+    heteroscedastic = (sp is not None and sp > hetero_corr_threshold
+                       and rel_sigma > 0.0)
+
     return NoiseModel(
         feature=feature, n=n, bias=bias,
         sigma_random=std / scale,
@@ -446,21 +509,40 @@ def estimate_noise_model(feature: str,
         median_abs_diff=median_abs,
         ex_kurtosis=ex_kurt,
         dynamic_range=dyn,
+        rel_sigma=rel_sigma,
+        heteroscedastic=heteroscedastic,
     )
 
 
 # ── T1: coverage-guaranteed tolerance ────────────────────────────────────────
 def _tolerance_factor(alpha: float, family: str) -> float:
-    """k in tau = JND + k*sigma, controlling false-reject at level alpha.
+    """k in tau = JND + k*sigma, giving a TRUE two-sided false-reject <= alpha.
 
-    gaussian   z_{1-alpha} = Phi^{-1}(1-alpha)            (Thm 1.2)
-    chebyshev  1/sqrt(alpha)                              (Thm 1.3, dist-free)
-    vp         (2/3)/sqrt(alpha)  for alpha <= 1/6        (Thm 1.4, unimodal)
+    The acceptance event is |delta - eps| <= tau where eps is the GT noise and
+    |delta| <= JND for a faithful claim. The worst-case faithful claim sits at
+    delta = +-JND, so the eps that pushes the OBSERVED error outside tau can
+    arrive from EITHER tail. A one-sided z_{1-alpha} factor only bounds ONE
+    tail at alpha and lets the opposite tail re-enter, so the true worst-case
+    false-reject is up to 2*alpha (the documented T1 defect, now pinned FIXED in
+    tests/test_formal_sfs.py::TestT1WorstCaseCoverageFixed). The fix is to
+    split alpha across both tails:
+
+    gaussian   z_{1-alpha/2} = Phi^{-1}(1-alpha/2)         (Thm 1.2a, fixed)
+               -> worst-case false-reject <= alpha at EVERY faithful delta.
+    chebyshev  1/sqrt(alpha)                               (Thm 1.3, dist-free)
+    vp         (2/3)/sqrt(alpha)  for alpha <= 1/6          (Thm 1.4, unimodal)
+
+    Chebyshev and VP are ALREADY two-sided (they bound P(|eps| > k*sigma)
+    symmetrically), so they are UNCHANGED. Only the Gaussian family carried the
+    one-sided bug; it now uses the alpha/2 quantile. Heavy-tailed features
+    (excess kurtosis > 1 per estimate_noise_model) should select chebyshev / vp
+    regardless, since the Gaussian quantile under-covers their tails.
     """
     if not (0.0 < alpha < 1.0):
         raise ValueError(f"alpha must be in (0,1), got {alpha}")
     if family == "gaussian":
-        return normal_quantile(1.0 - alpha)
+        # two-sided: split alpha across both tails -> z_{1-alpha/2}
+        return normal_quantile(1.0 - alpha / 2.0)
     if family == "chebyshev":
         return 1.0 / math.sqrt(alpha)
     if family == "vp":
@@ -475,18 +557,58 @@ def coverage_tolerance(sigma_f: float, jnd_f: float, alpha: float = 0.05,
     """T1 band tau_f = JND_f + k(alpha, family) * sigma_f.
 
     A truly faithful claim (|claim - truth| <= JND_f) is accepted with prob
-    >= 1 - alpha against this band (Thm 1.2a / 1.3 / 1.4). The band is DERIVED
-    from the measured noise scale, not hand-tuned.
+    >= 1 - alpha against this band, two-sided (Thm 1.2a / 1.3 / 1.4). The
+    Gaussian factor is z_{1-alpha/2} (two-sided), so the worst-case faithful
+    claim at delta = +-JND is still accepted with prob >= 1 - alpha. The band
+    is DERIVED from the measured noise scale, not hand-tuned.
     """
     return jnd_f + _tolerance_factor(alpha, family) * sigma_f
+
+
+def select_family(ex_kurtosis: float, kurt_threshold: float = 1.0,
+                  unimodal: bool = True) -> str:
+    """Pick the distribution-free band a feature's measured tail demands.
+
+    estimate_noise_model reports excess kurtosis of the GT disagreement. When
+    it exceeds `kurt_threshold` (every paired SFS feature does, F0 worst at
+    ~6.5) the Gaussian z-quantile under-covers the tail, so we fall back to a
+    distribution-free factor: Vysochanskii-Petunin if the error law is unimodal
+    (tighter, valid for any unimodal law), else Chebyshev (no shape assumption).
+    A light-tailed feature (exKurt <= threshold) keeps the two-sided Gaussian
+    band. nan kurtosis (degenerate / n<2) defaults to the conservative
+    distribution-free choice.
+    """
+    if ex_kurtosis != ex_kurtosis:  # nan
+        return "vp" if unimodal else "chebyshev"
+    if ex_kurtosis > kurt_threshold:
+        return "vp" if unimodal else "chebyshev"
+    return "gaussian"
+
+
+def _one_sided_factor(alpha: float, family: str) -> float:
+    """The ONE-SIDED tail factor: gaussian z_{1-alpha} = Phi^{-1}(1-alpha).
+
+    Distinct from `_tolerance_factor`, whose Gaussian arm is two-sided
+    (z_{1-alpha/2}) because the coverage band must hold against worst-case
+    faithful claims at delta=+-JND. The separation / Fano budget below is a sum
+    of two genuinely ONE-SIDED guarantees (a false-reject tail at one boundary,
+    a false-accept tail at the other), so it keeps the one-sided z_{1-alpha}.
+    Chebyshev / VP are symmetric and so coincide for both factors.
+    """
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f"alpha must be in (0,1), got {alpha}")
+    if family == "gaussian":
+        return normal_quantile(1.0 - alpha)
+    return _tolerance_factor(alpha, family)
 
 
 def identifiability_budget(alpha: float, beta: float, family: str = "gaussian") -> float:
     """The factor (z_{1-alpha}+z_{1-beta}) [gaussian] in the separation
     condition Delta_f - JND_f >= budget * sigma_f (Thm 1.2b). Both guarantees
     (false-reject <= alpha, false-accept <= beta) hold iff sigma_f is below
-    (Delta_f - JND_f)/budget."""
-    return _tolerance_factor(alpha, family) + _tolerance_factor(beta, family)
+    (Delta_f - JND_f)/budget. These are ONE-SIDED tails (one per boundary), so
+    this uses the one-sided z_{1-alpha}, NOT the two-sided coverage factor."""
+    return _one_sided_factor(alpha, family) + _one_sided_factor(beta, family)
 
 
 def build_coverage_tolerance_config(
@@ -513,6 +635,51 @@ def build_coverage_tolerance_config(
         for f in sigma
     }
     return ToleranceConfig(abs_floor=floors, rel_frac=dict(rel_frac or {}))
+
+
+def build_coverage_tolerance_config_from_models(
+    models: dict,                       # feature -> NoiseModel
+    jnd: dict[str, float],
+    alpha: float = 0.05,
+    family: str | None = None,          # None => per-feature select_family(tail)
+    robust: bool = True,
+    kurt_threshold: float = 1.0,
+):
+    """DERIVE a Tier-3 ToleranceConfig directly from measured NoiseModels.
+
+    For each feature the band is tau_f(|gt|) = JND_f + k(alpha, fam_f)*sigma_f(|gt|):
+      * fam_f is chosen per feature by `select_family(model.ex_kurtosis)` when
+        `family is None` (heavy-tailed -> VP/Chebyshev, light -> Gaussian), so the
+        distribution-free band is used exactly where the tail demands it.
+      * magnitude-dependence is folded INTO sigma: when a model is
+        `heteroscedastic`, sigma_f(|gt|) = max(sigma_const, rel_sigma*|gt|), so
+        the ToleranceConfig gets abs_floor = JND + k*sigma_const AND
+        rel_frac = k*rel_sigma. Then the scorer's
+        max(abs_floor, rel_frac*|gt|) reproduces JND + k*max(sigma_const,
+        rel_sigma*|gt|) in BOTH regimes (the JND is folded into abs_floor; for a
+        heteroscedastic feature it sits inside the small-magnitude floor). For a
+        homoscedastic feature rel_frac is 0 and the band is the constant floor.
+
+    This is the Tier-3 standardization: magnitude-dependence comes from sigma
+    (the relative noise scale), NOT a separately hand-set rel_frac.
+    """
+    try:  # package-relative
+        from .sfs import ToleranceConfig
+    except ImportError:  # flat
+        from sfs import ToleranceConfig
+    abs_floor: dict[str, float] = {}
+    rel_frac: dict[str, float] = {}
+    for f, m in models.items():
+        if m is None:
+            continue
+        fam = family if family is not None else select_family(
+            m.ex_kurtosis, kurt_threshold=kurt_threshold)
+        k = _tolerance_factor(alpha, fam)
+        sig_const = m.sigma(robust=robust)
+        abs_floor[f] = jnd.get(f, 0.0) + k * sig_const
+        if m.heteroscedastic and m.rel_sigma > 0.0:
+            rel_frac[f] = k * m.rel_sigma
+    return ToleranceConfig(abs_floor=abs_floor, rel_frac=rel_frac)
 
 
 # ── T3a: observability precision ceiling ─────────────────────────────────────

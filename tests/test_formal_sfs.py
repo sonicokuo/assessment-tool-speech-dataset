@@ -30,14 +30,17 @@ from sfs import (  # noqa: E402
     AbstentionDetector,
     coverage_guaranteed_config,
     PERCEPTUAL_JND,
+    DEFAULT_TOLERANCE_CONFIG,
 )
 from metrics_calibrated import (  # noqa: E402
     norm_cdf,
     normal_quantile,
     estimate_noise_model,
     coverage_tolerance,
+    select_family,
     identifiability_budget,
     build_coverage_tolerance_config,
+    build_coverage_tolerance_config_from_models,
     p_max_ceiling,
     identifiability,
     bootstrap_precision_ci,
@@ -72,13 +75,16 @@ class TestPrimitives:
         assert abs(normal_quantile(0.95) - 1.6448536) < 1e-5
 
     def test_tolerance_factor_families(self):
-        # gaussian 1.645, chebyshev 4.472, vp 2.981 at alpha=0.05
-        assert abs(coverage_tolerance(1.0, 0.0, 0.05, "gaussian") - 1.6448536) < 1e-4
+        # TWO-SIDED FIX: gaussian is now z_{1-alpha/2}=1.95996 (not the one-sided
+        # 1.645); chebyshev 4.472, vp 2.981 unchanged (already two-sided).
+        assert abs(coverage_tolerance(1.0, 0.0, 0.05, "gaussian") - 1.9599640) < 1e-4
         assert abs(coverage_tolerance(1.0, 0.0, 0.05, "chebyshev") - 4.472136) < 1e-4
         assert abs(coverage_tolerance(1.0, 0.0, 0.05, "vp") - 2.981424) < 1e-4
 
     def test_identifiability_budget(self):
-        # z_.95 + z_.95 = 3.29 at alpha=beta=0.05
+        # the SEPARATION budget keeps the ONE-SIDED z_.95 per boundary (a
+        # false-reject tail + a false-accept tail), so z_.95 + z_.95 = 3.29 at
+        # alpha=beta=0.05 — distinct from the two-sided coverage factor above.
         b = identifiability_budget(0.05, 0.05, "gaussian")
         assert abs(b - 2 * 1.6448536) < 1e-4
 
@@ -126,15 +132,12 @@ class TestCoverageMonteCarlo:
         tau = coverage_tolerance(sigma, 0.0, alpha, "gaussian")
         eps = [rng.gauss(0.0, sigma) for _ in range(200000)]
         acc = self._empirical_accept(eps, tau)
-        # Gaussian band: two-sided accept ~ 1 - 2*(alpha/... ) ; the one-sided
-        # guarantee is >= 1 - alpha. tau = z_.95 sigma -> accept = 2*Phi(z_.95)-1
-        # = 0.90, which is >= 1 - alpha = 0.95? No: the PROOF's operational
-        # guarantee is the one-sided right tail <= alpha. Empirically the
-        # two-sided accept is 2*Phi(1.645)-1 = 0.90; each tail is 0.05 = alpha.
-        # So the *false-reject on the binding side* is ~alpha:
+        # TWO-SIDED FIX: tau = z_{1-alpha/2}*sigma, so the two-sided accept is
+        # 2*Phi(z_.975)-1 = 1 - alpha = 0.95, and EACH tail is alpha/2 = 0.025.
         right_tail = sum(1 for e in eps if e > tau) / len(eps)
-        assert abs(right_tail - alpha) < 0.01
-        # and overall accept matches the closed form 2*Phi(tau/sigma)-1
+        assert abs(right_tail - alpha / 2.0) < 0.01
+        # overall accept is the true 1 - alpha (= 2*Phi(tau/sigma)-1)
+        assert abs(acc - (1.0 - alpha)) < 0.01
         assert abs(acc - (2 * norm_cdf(tau / sigma) - 1.0)) < 0.01
 
     def test_chebyshev_is_conservative_on_heavy_tail(self):
@@ -221,25 +224,49 @@ class TestIdentifiability:
         assert a.channel_capacity > b.channel_capacity
 
 
-# ── (d) NO-OP preserved ───────────────────────────────────────────────────────
-class TestNoOpPreserved:
+# ── (d) LEGACY SHIM preserved (back-compat only) ─────────────────────────────
+# The DEFAULT meaning of SFS is now the Tier-3 coverage band; the legacy
+# hand-picked absolute tolerances are reachable ONLY via SFSScorer(legacy=True).
+# These tests pin that the shim still reproduces the old ±2 dB / ±5 Hz behavior
+# byte-for-byte, AND that the default scorer is NOT the legacy band.
+class TestLegacyShimPreserved:
     def _claims(self, **kw):
         return [Claim(f, v, "", "") for f, v in kw.items()]
 
-    def test_legacy_scorer_unchanged(self):
-        """Adding the framework module must not change SFSScorer(None)."""
-        scorer = SFSScorer()  # tol_config=None
+    def test_legacy_shim_unchanged(self):
+        """SFSScorer(legacy=True) must reproduce the old absolute band exactly."""
+        scorer = SFSScorer(legacy=True)
         gt = {"snr": 30.0, "f0_mean": 200.0}
         # snr ±2, f0 ±5 from TOLERANCES
         r = scorer.score(self._claims(snr=31.0, f0_mean=203.0), gt)
         assert r["precision"] == 1.0  # both within legacy band
         r2 = scorer.score(self._claims(snr=35.0), {"snr": 30.0})
-        assert r2["precision"] == 0.0
+        assert r2["precision"] == 0.0  # 5 dB miss > ±2 legacy band
+
+    def test_default_is_tier3_not_legacy(self):
+        """SFSScorer() now means the PRINCIPLED coverage band, NOT the legacy
+        ±2 dB dict. A 35 dB claim against a 30 dB GT is OUT of the legacy band
+        but WELL INSIDE the principled (GT-noise-derived) band, so the default
+        accepts where the legacy shim rejects."""
+        default = SFSScorer()           # Tier-3 coverage band
+        legacy = SFSScorer(legacy=True)  # old ±2 dB
+        gt = {"snr": 30.0}
+        c = [Claim("snr", 35.0, "dB", "")]
+        assert default.score(c, gt)["precision"] == 1.0   # inside principled band
+        assert legacy.score(c, gt)["precision"] == 0.0    # outside legacy band
+        # the default band is the explicit DEFAULT_TOLERANCE_CONFIG object
+        assert default.tol_config is DEFAULT_TOLERANCE_CONFIG
+        assert legacy.tol_config is None
+
+    def test_legacy_and_tol_config_mutually_exclusive(self):
+        import pytest
+        with pytest.raises(ValueError):
+            SFSScorer(tol_config=ToleranceConfig(), legacy=True)
 
     def test_empty_coverage_config_paths_dont_touch_legacy(self):
-        """A coverage config with sigma=0, JND=legacy floors equals legacy
+        """A coverage config with sigma=0, JND=legacy floors equals the legacy
         absolute path (a constructive no-op witness)."""
-        legacy = SFSScorer()
+        legacy = SFSScorer(legacy=True)
         # sigma=0 => tau = JND; set JND to the legacy TOLERANCES so it matches.
         sigma = {f: 0.0 for f in ("snr", "f0_mean")}
         jnd = {"snr": SFSScorer.TOLERANCES["snr"],
@@ -253,14 +280,15 @@ class TestNoOpPreserved:
                     == derived.score(c, gt)["precision"])
 
     def test_bare_tolerance_config_still_noop(self):
-        """Sanity: the framework additions didn't break the existing no-op."""
-        legacy = SFSScorer()
-        principled = SFSScorer(tol_config=ToleranceConfig())
+        """A bare ToleranceConfig() (empty abs_floor + rel_frac) still reproduces
+        the legacy absolute band claim-for-claim (the documented no-op)."""
+        legacy = SFSScorer(legacy=True)
+        bare = SFSScorer(tol_config=ToleranceConfig())
         for f0 in (198.0, 200.0, 204.0, 205.0, 206.0):
             gt = {"f0_mean": 200.0}
             c = [Claim("f0_mean", f0, "Hz", "")]
             assert (legacy.score(c, gt)["precision"]
-                    == principled.score(c, gt)["precision"])
+                    == bare.score(c, gt)["precision"])
 
 
 # ── (b) skill NO-GAMING (T2c) ─────────────────────────────────────────────────
@@ -418,50 +446,63 @@ class TestEndToEndDerivedBand:
         cfg = coverage_guaranteed_config({"snr": nm.sigma(robust=False)},
                                          alpha=0.05, family="gaussian")
         scorer = SFSScorer(tol_config=cfg)
-        # band ~ JND(1.0) + 1.645*2.5 ~ 5.1; a 4 dB miss is accepted, 8 dB not
+        # band ~ JND(1.0) + z_.975*2.5 ~ 1.0 + 1.96*2.5 ~ 5.9; a 4 dB miss is
+        # accepted, 8 dB not (two-sided gaussian factor)
         gt = {"snr": 30.0}
         assert scorer.score([Claim("snr", 34.0, "dB", "")], gt)["precision"] == 1.0
         assert scorer.score([Claim("snr", 39.0, "dB", "")], gt)["precision"] == 0.0
 
 
-# ── ADVERSARIAL: the T1 one-sided coverage statement is WRONG; only the ───────
-# two-sided 1-2alpha holds for the JND + z_{1-alpha}*sigma band. These tests
-# PIN the defect (and the z_{1-alpha/2} fix) so the prose is corrected.
-class TestT1WorstCaseCoverageDefect:
+# ── FIX VERIFIED: the T1 Gaussian band is now TWO-SIDED (z_{1-alpha/2}), so a ──
+# faithful claim within JND is accepted with prob >= 1-alpha at EVERY delta in
+# [-JND, JND] (true coverage). These tests PIN the FIXED behavior: the worst-
+# case faithful false-reject is now <= alpha, and the old one-sided z_{1-alpha}
+# band (which under-covered) is shown to fail the same check.
+class TestT1WorstCaseCoverageFixed:
     def _false_reject(self, eps, delta, tau):
         # accept iff |delta - eps| <= tau
         return sum(1 for e in eps if abs(delta - e) > tau) / len(eps)
 
-    def test_gaussian_band_overcovers_only_at_center(self):
-        """At delta=0 the binding right tail is ~alpha (the prior test's case),
-        but the WORST-CASE faithful claim delta=+JND has total false-reject
-        STRICTLY ABOVE alpha because the dropped opposite tail re-enters. This
-        is the proof gap: Thm 1.2a's one-sided '>= 1-alpha' is false; only the
-        two-sided '>= 1-2alpha' holds."""
+    def test_fixed_gaussian_band_covers_worst_case(self):
+        """With the two-sided fix, coverage_tolerance(...,'gaussian') uses
+        z_{1-alpha/2}, so the WORST-CASE faithful claim delta=+JND has total
+        false-reject <= alpha (true coverage), not the old > alpha defect."""
         rng = random.Random(11)
         sigma, jnd, alpha = 3.0, 1.0, 0.05
         tau = coverage_tolerance(sigma, jnd, alpha, "gaussian")
         eps = [rng.gauss(0.0, sigma) for _ in range(300000)]
-        fr_center = self._false_reject(eps, 0.0, tau)
-        fr_worst = self._false_reject(eps, jnd, tau)
-        # center is comfortably under alpha; worst case EXCEEDS alpha
-        assert fr_center < alpha
-        assert fr_worst > alpha, (
-            f"worst-case faithful FR={fr_worst:.4f} should exceed alpha={alpha}; "
-            "if this ever passes, the one-sided guarantee would be safe")
-        # but BOTH respect the honest two-sided bound 2*alpha
-        assert fr_worst <= 2 * alpha + 0.005
+        # false-reject is <= alpha at EVERY faithful delta in [-JND, JND]
+        for delta in (-jnd, -jnd / 2, 0.0, jnd / 2, jnd):
+            fr = self._false_reject(eps, delta, tau)
+            assert fr <= alpha + 0.003, (
+                f"faithful delta={delta} FR={fr:.4f} must be <= alpha={alpha} "
+                "after the two-sided fix")
 
-    def test_alpha_half_band_restores_true_coverage(self):
-        """tau = JND + z_{1-alpha/2}*sigma gives a TRUE two-sided 1-alpha
-        guarantee: false-reject <= alpha at EVERY faithful delta in [-JND, JND]."""
-        rng = random.Random(13)
+    def test_old_one_sided_band_would_undercover(self):
+        """Demonstrate WHY the fix was needed: the OLD one-sided band
+        tau_old = JND + z_{1-alpha}*sigma lets the worst-case faithful claim
+        (delta=+JND) false-reject STRICTLY ABOVE alpha (the dropped tail
+        re-enters). The new two-sided band closes this gap."""
+        rng = random.Random(11)
+        sigma, jnd, alpha = 3.0, 1.0, 0.05
+        z_one = normal_quantile(1.0 - alpha)        # old one-sided factor
+        tau_old = jnd + z_one * sigma
+        tau_new = coverage_tolerance(sigma, jnd, alpha, "gaussian")
+        assert tau_new > tau_old                    # fix widened the band
+        eps = [rng.gauss(0.0, sigma) for _ in range(300000)]
+        fr_old_worst = self._false_reject(eps, jnd, tau_old)
+        fr_new_worst = self._false_reject(eps, jnd, tau_new)
+        assert fr_old_worst > alpha                 # old band under-covers
+        assert fr_new_worst <= alpha + 0.003        # fixed band covers
+        # both still respect the honest two-sided 2*alpha bound
+        assert fr_old_worst <= 2 * alpha + 0.005
+
+    def test_alpha_half_band_equals_coverage_tolerance(self):
+        """coverage_tolerance gaussian IS the z_{1-alpha/2} band now."""
         sigma, jnd, alpha = 3.0, 1.0, 0.05
         z_half = normal_quantile(1.0 - alpha / 2.0)
-        tau = jnd + z_half * sigma
-        eps = [rng.gauss(0.0, sigma) for _ in range(300000)]
-        for delta in (-jnd, -jnd / 2, 0.0, jnd / 2, jnd):
-            assert self._false_reject(eps, delta, tau) <= alpha + 0.003
+        assert abs(coverage_tolerance(sigma, jnd, alpha, "gaussian")
+                   - (jnd + z_half * sigma)) < 1e-9
 
 
 # ── ADVERSARIAL: the Fano +1 slack makes identifiability VACUOUS for M<=2 ─────
@@ -483,3 +524,115 @@ class TestT3bFanoBinaryVacuity:
                                dynamic_range=14.0, delta_f=14.0 / 6)
         assert idn3.n_cells >= 3
         assert idn3.scorable is False
+
+
+# ── per-feature family selection by measured tail ────────────────────────────
+class TestFamilySelection:
+    def test_heavy_tail_picks_distribution_free(self):
+        # exKurt > 1 -> distribution-free (VP if unimodal, else Chebyshev)
+        assert select_family(6.49) == "vp"               # F0-like heavy tail
+        assert select_family(6.49, unimodal=False) == "chebyshev"
+
+    def test_light_tail_keeps_gaussian(self):
+        assert select_family(0.35) == "gaussian"         # speaking-rate-like
+        assert select_family(0.84) == "gaussian"
+
+    def test_nan_defaults_distribution_free(self):
+        assert select_family(float("nan")) == "vp"
+        assert select_family(float("nan"), unimodal=False) == "chebyshev"
+
+
+# ── heteroscedasticity folded INTO sigma (Tier-3 standardization) ────────────
+class TestHeteroscedasticSigma:
+    def test_relative_sigma_estimated_and_flagged(self):
+        """A multiplicative-error feature (eps ~ |gt| * N) is flagged
+        heteroscedastic and its rel_sigma > 0; sigma_at widens with |gt|."""
+        rng = random.Random(0)
+        true = [rng.uniform(50.0, 300.0) for _ in range(8000)]
+        # multiplicative per-estimator noise: |error| grows with the value
+        a = [t * (1.0 + rng.gauss(0.0, 0.1)) for t in true]
+        b = [t * (1.0 + rng.gauss(0.0, 0.1)) for t in true]
+        nm = estimate_noise_model("f0_mean", a, b, independent=True)
+        assert nm.heteroscedastic
+        assert nm.rel_sigma > 0.0
+        # sigma_at grows with |gt| through the relative term
+        s_low = nm.sigma_at(60.0)
+        s_high = nm.sigma_at(280.0)
+        assert s_high > s_low
+
+    def test_homoscedastic_sigma_at_is_constant(self):
+        """Additive constant-sigma noise is NOT flagged heteroscedastic, so
+        sigma_at returns the constant sigma at every magnitude."""
+        rng = random.Random(1)
+        true = [rng.uniform(0.0, 100.0) for _ in range(8000)]
+        a = [t + rng.gauss(0.0, 2.0) for t in true]
+        b = [t + rng.gauss(0.0, 2.0) for t in true]
+        nm = estimate_noise_model("snr", a, b, independent=True)
+        assert not nm.heteroscedastic
+        assert nm.sigma_at(10.0) == nm.sigma_at(90.0) == nm.sigma()
+
+
+# ── Tier-3 config built from measured noise models ───────────────────────────
+class TestModelDerivedConfig:
+    def test_family_selected_per_feature(self):
+        """build_..._from_models picks the family per measured tail: a heavy-
+        tailed feature gets the (larger) distribution-free band, a light-tailed
+        one the Gaussian band, even at the SAME sigma."""
+        rng = random.Random(2)
+        # heavy-tailed disagreement
+        true_h = [rng.uniform(50, 300) for _ in range(8000)]
+        heavy = _heavy_tailed(rng, 4.0, 8000)
+        a_h = [t + e for t, e in zip(true_h, heavy)]
+        b_h = [t for t in true_h]
+        nm_h = estimate_noise_model("f0_mean", a_h, b_h, independent=False)
+        # light-tailed disagreement, same nominal sigma scale
+        a_l = [t + rng.gauss(0, 4.0) for t in true_h]
+        b_l = [t for t in true_h]
+        nm_l = estimate_noise_model("speaking_rate", a_l, b_l, independent=False)
+        cfg = build_coverage_tolerance_config_from_models(
+            {"f0_mean": nm_h, "speaking_rate": nm_l},
+            jnd={"f0_mean": 1.0, "speaking_rate": 0.3}, alpha=0.05)
+        # heavy-tailed feature must have a LARGER factor (VP 2.98 > gaussian 1.96)
+        assert nm_h.ex_kurtosis > 1.0
+        assert nm_l.ex_kurtosis <= 1.0 or select_family(nm_l.ex_kurtosis) == "gaussian"
+        # both features present with positive floors
+        assert cfg.abs_floor["f0_mean"] > 0
+        assert cfg.abs_floor["speaking_rate"] > 0
+
+    def test_heteroscedastic_feature_gets_rel_frac(self):
+        rng = random.Random(3)
+        true = [rng.uniform(50.0, 300.0) for _ in range(8000)]
+        a = [t * (1.0 + rng.gauss(0.0, 0.1)) for t in true]
+        b = [t * (1.0 + rng.gauss(0.0, 0.1)) for t in true]
+        nm = estimate_noise_model("f0_mean", a, b, independent=True)
+        cfg = build_coverage_tolerance_config_from_models(
+            {"f0_mean": nm}, jnd={"f0_mean": 1.0}, alpha=0.05)
+        # heteroscedastic -> rel_frac = k * rel_sigma > 0
+        assert cfg.rel_frac.get("f0_mean", 0.0) > 0.0
+        # and the band reproduces JND + k*max(sigma_const, rel_sigma*|gt|) via
+        # max(abs_floor, rel_frac*|gt|): at a large |gt| the relative term binds
+        scorer = SFSScorer(tol_config=cfg)
+        tol_big = scorer._tolerance("f0_mean", 280.0)
+        tol_small = scorer._tolerance("f0_mean", 60.0)
+        assert tol_big > tol_small
+
+
+# ── DEFAULT band = the Tier-3 principled coverage band ───────────────────────
+class TestDefaultIsPrincipled:
+    def test_default_config_has_principled_floors(self):
+        """DEFAULT_TOLERANCE_CONFIG is the coverage band, NOT the legacy dict:
+        every covered floor is far wider than the legacy TOLERANCES value (the
+        measured GT noise dominates the hand-picked ±2 dB band)."""
+        cfg = DEFAULT_TOLERANCE_CONFIG
+        # snr legacy floor is 2.0; principled floor is the GT-noise-derived band
+        assert cfg.abs_floor["snr"] > SFSScorer.TOLERANCES["snr"]
+        assert cfg.abs_floor["f0_mean"] > SFSScorer.TOLERANCES["f0_mean"]
+        # heteroscedastic features carry a rel_frac term; f0_sd (homoscedastic)
+        # does not
+        assert "snr" in cfg.rel_frac and cfg.rel_frac["snr"] > 0
+        assert cfg.rel_frac.get("f0_sd", 0.0) == 0.0
+
+    def test_default_scorer_uses_default_config(self):
+        s = SFSScorer()
+        assert s.tol_config is DEFAULT_TOLERANCE_CONFIG
+        assert s.legacy is False

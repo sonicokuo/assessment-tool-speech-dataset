@@ -44,8 +44,10 @@ class TestRelativeToleranceNoOp:
         return cs
 
     def test_no_config_is_legacy(self):
-        """Default scorer (no tol_config) == the original TOLERANCES path."""
-        scorer = SFSScorer()
+        """Legacy shim == the original TOLERANCES path. (SFS now DEFAULTS to the
+        Tier-3 principled band; the legacy absolute band is the back-compat
+        shim, reached via legacy=True or an explicit tol_config=None.)"""
+        scorer = SFSScorer(legacy=True)
         # snr tol = 2.0: 31.0 vs gt 30.0 -> err 1.0 <= 2.0 correct;
         # 35.0 vs gt 30.0 -> err 5.0 > 2.0 wrong.
         gt = {"snr": 30.0}
@@ -55,7 +57,7 @@ class TestRelativeToleranceNoOp:
     def test_rel_frac_zero_reproduces_absolute_exactly(self):
         """A ToleranceConfig with empty rel_frac is a TRUE no-op vs the default
         scorer on a battery of features/values (per-claim correctness identical)."""
-        legacy = SFSScorer()
+        legacy = SFSScorer(legacy=True)
         principled = SFSScorer(tol_config=ToleranceConfig())  # no rel_frac, no floors
         cases = [
             ({"snr": 30.0}, [Claim("snr", v, "dB", "") for v in (28.0, 31.9, 32.1, 35.0)]),
@@ -72,7 +74,7 @@ class TestRelativeToleranceNoOp:
 
     def test_explicit_rel_frac_zero_table_is_noop(self):
         """rel_frac dict with explicit 0.0 entries also reproduces absolute."""
-        legacy = SFSScorer()
+        legacy = SFSScorer(legacy=True)
         cfg = ToleranceConfig(rel_frac={"snr": 0.0, "f0_mean": 0.0})
         principled = SFSScorer(tol_config=cfg)
         gt = {"snr": 30.0}

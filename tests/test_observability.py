@@ -223,7 +223,9 @@ class TestAbstentionDetector:
 # ── Selective scoring ────────────────────────────────────────────────────────
 class TestSelectiveScoring:
     def setup_method(self):
-        self.sc = SFSScorer()
+        # legacy absolute band: this suite pins ±tol wrong-number penalization
+        # (SFS now defaults to the Tier-3 principled band; shim it here).
+        self.sc = SFSScorer(legacy=True)
 
     def test_good_abstention_rewarded(self):
         text = ("The SNR is 13.17 dB, a moderate noise level. The SRMR is 5.36. "
@@ -327,7 +329,8 @@ class TestSelectiveScoring:
 # ── Back-compat: the OLD score path must be unchanged ────────────────────────
 class TestBackCompat:
     def setup_method(self):
-        self.sc = SFSScorer()
+        # this suite asserts the OLD score path is unchanged -> legacy shim.
+        self.sc = SFSScorer(legacy=True)
 
     def test_old_score_path_unchanged(self):
         claims = ClaimParser().parse(

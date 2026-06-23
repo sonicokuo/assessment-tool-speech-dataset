@@ -226,7 +226,9 @@ class TestClaimParser:
 
 class TestSFSScorer:
     def setup_method(self):
-        self.scorer = SFSScorer()
+        # legacy band: this suite pins the original absolute ±tol contract
+        # (SFS now defaults to the Tier-3 principled band; use the shim here).
+        self.scorer = SFSScorer(legacy=True)
 
     def test_perfect_score(self):
         claims = [Claim("f0_mean", 187.0, "Hz", "F0 = 187 Hz")]
