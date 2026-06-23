@@ -726,15 +726,17 @@ python scripts/faithfulness_study.py --config configs/config.psc.emnlp.yaml \
   --attention_dir $(dirname $RES)/attention \
   --output     $(dirname $RES)/faithfulness.json --top_k_mask 5
 
-# SFS-vs-human correlation — validates that SFS tracks human judgement.
+# SFS-vs-LLM-judge correlation. The rho=0.69 result was produced with an LLM judge
+# (Claude), NOT human raters; a real human study is still an open gap, and tolerances
+# must NOT be tuned to this judge (the judge is an LLM, so that loop is circular).
 # Two phases:
-python scripts/sfs_human_correlation.py --mode prepare \
+python scripts/sfs_judge_correlation.py --mode prepare \
   --inference_results $RES \
-  --output_csv $(dirname $RES)/human_ratings.csv --n 50
-# (open the CSV, fill the `human_rating` column 1-5, then:)
-python scripts/sfs_human_correlation.py --mode analyze \
-  --rated_csv  $(dirname $RES)/human_ratings.csv \
-  --output_md  $(dirname $RES)/sfs_human_correlation.md
+  --output_csv $(dirname $RES)/judge_ratings.csv --n 50
+# (fill the `judge_rating` column 1-5 with the LLM judge's ratings, then:)
+python scripts/sfs_judge_correlation.py --mode analyze \
+  --rated_csv  $(dirname $RES)/judge_ratings.csv \
+  --output_md  $(dirname $RES)/sfs_judge_correlation.md
 ```
 
 ### Range / resume / parallelism
@@ -805,7 +807,7 @@ Checkpoint selection is on `val_loss` only — saving-best on a similarity metri
 pip install pytest sacrebleu rouge-score bert-score librosa scipy
 ```
 
-`sacrebleu`, `rouge-score`, `bert-score` are only needed for the corresponding metric — missing deps cause that one metric to silently skip. `librosa` is required by `scripts/plot_attention.py` for the spectrogram. `scipy` is required by `scripts/sfs_human_correlation.py` for Spearman/Pearson.
+`sacrebleu`, `rouge-score`, `bert-score` are only needed for the corresponding metric — missing deps cause that one metric to silently skip. `librosa` is required by `scripts/plot_attention.py` for the spectrogram. `scipy` is required by `scripts/sfs_judge_correlation.py` for Spearman/Pearson.
 
 ### Full pytest suite
 
@@ -914,7 +916,7 @@ scripts/
 
   # Causal study + metric validity:
   faithfulness_study.py              — Mask top-K attended frames → measure SFS drop
-  sfs_human_correlation.py           — Prepare/analyze SFS-vs-human ratings (Spearman + Pearson)
+  sfs_judge_correlation.py           — Prepare/analyze SFS-vs-LLM-judge ratings (Spearman + Pearson; rho=0.69 is an AI-judge/Claude result, NOT human)
 
   test_*.py                          — Standalone test scripts
 
