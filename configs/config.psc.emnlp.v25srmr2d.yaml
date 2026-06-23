@@ -1,0 +1,116 @@
+# v25 — COMBINED grounding model: supervised dense local-SNR map + TRUE-2D SRMR
+# modulation-energy map + observability/abstention, on the canonical AQUA-NL data.
+#
+# This is v24 (the corrected supervised dense local-SNR-map model on processed_aug +
+# descriptions_observability_all + reliability_head + general oracle SNR map) PLUS the
+# new SRMR-2D grounding head:
+#
+#   SRMR (Falk, Zheng & Chan, IEEE TASLP 2010) is the ONE AQUA-NL feature with a
+#   genuinely time-frequency-2D dense target. Its oracle field is the per-(acoustic-band
+#   x modulation-band) modulation-energy tensor (23 gammatone bands x 8 modulation bands)
+#   computed on the clean s1 stem; the scalar SRMR is its low/high modulation-energy
+#   aggregate. The local-SNR map's frequency axis is a borrowed STFT-band pool, but the
+#   SRMR map's frequency (acoustic x modulation) axis is NON-VACUOUS: reverberation moves
+#   energy from low (1-4) to high (5-8) modulation bands, so the 2D tensor carries WHERE
+#   the reverberant smearing lives. Built by scripts/compute_srmr_maps.py into
+#   srmr_map_targets/{train,dev}.
+#
+# So v25 trains BOTH the SNR map AND the SRMR 2D map + abstention = the combined,
+# directly-supervised dense-grounding model. lambda_srmr_map=0 would make this byte-
+# identical to v24.
+#
+# CANONICAL TUPLE (DATA_INVENTORY.md §4):
+#   data_dir          = processed_aug                          (41700 train / 3000 val / 3000 test)
+#   descriptions_path = descriptions_observability_all.json    (47700, abstention; 100% join on 41700)
+#   features_csv.train= features_aug_train_cleangt.csv         (41700; aux/nums supervise ALL clips)
+#   features_csv.val  = dev_cleanf0.csv                        (clean-F0 val regime)
+#   snr_map_dir       = snr_map_targets_aug/{train,dev}        (general per-suffix oracle, ALL 41700)
+#   srmr_map_dir      = srmr_map_targets/{train,dev}           (oracle clean-s1 23x8 SRMR tensor)
+#   lambda_snr_map 0.5, lambda_srmr_map 0.3
+
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-08
+adapter_variant: film-mamba
+batch_size: 6
+beats_cached: false
+bf16: true
+data_dir: /ocean/projects/cis260125p/shared/data/processed_aug
+descriptions_path: /ocean/projects/cis260125p/shared/data/descriptions_observability_all.json
+epochs: 12
+eval_every_epoch: 1
+features_csv:
+  train: /ocean/projects/cis260125p/shared/data/features_aug_train_cleangt.csv
+  val: /ocean/projects/cis260125p/shared/data/features_pyannote/dev_cleanf0.csv
+features_path: /ocean/projects/cis260125p/shared/data/features.json
+grad_clip: 1.0
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+lambda_mse: 0.0
+lambda_nll: 0.3
+lambda_nums: 0.3
+lambda_prose: 1.0
+lambda_snr_irm: 0.0
+lambda_snr_map: 0.5
+lambda_snr_scalar: 0.0
+lambda_srmr_map: 0.3
+lm_name: Qwen/Qwen3-8B
+log_every: 10
+lora_alpha: 32
+lora_dropout: 0.05
+lora_rank: 16
+lora_targets:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+lr_adapter: 0.0001
+lr_encoder: 1.0e-05
+lr_lm: 1.0e-05
+lr_scheduler: cosine
+max_nums_length: 64
+max_target_length: 512
+min_lr_ratio: 0.0
+num_workers: 4
+optimizer: adamw
+pin_memory: true
+prompt: Describe the quality of this recording.
+prompt_nums: 'List the numerical features of this recording:'
+prompt_prose: Describe the quality of this recording.
+reliability_head: true
+resume_from: null
+save_dir: /ocean/projects/cis260125p/shared/checkpoints/v25_srmr2d
+score_overlap_spans: false
+seed: 73
+snr_map_dir:
+  train: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/train
+  val: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/dev
+snr_map_huber_delta: 1.0
+snr_map_hidden: 256
+snr_map_kernel_size: 5
+snr_map_predict_irm: false
+snr_map_snr_bias: 5.0
+srmr_map_dir:
+  train: /ocean/projects/cis260125p/shared/data/srmr_map_targets/train
+  val: /ocean/projects/cis260125p/shared/data/srmr_map_targets/dev
+srmr_map_huber_delta: 1.0
+srmr_map_hidden: 256
+srmr_map_n_acoustic: 23
+srmr_map_n_modulation: 8
+tagged_mode: false
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+unfreeze_beats_top_n: 0
+unfreeze_wavlm_top_n: 0
+use_sections: false
+val_sfs_n: 32
+val_subset_size: 256
+wandb_entity: speech_quality_adapter
+wandb_project: aqua-nl-emnlp
+wandb_run_name: v25-srmr2d
+warmup_ratio: 0.03
+weight_decay: 0.01

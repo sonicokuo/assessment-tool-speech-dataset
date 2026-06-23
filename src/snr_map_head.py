@@ -453,3 +453,204 @@ def snr_map_loss_term(
             metrics.update(irm_m)
 
     return weighted, metrics
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SRMR 2D modulation-energy map head — the TRUE-2D grounding branch.
+#
+# Unlike the local-SNR field (whose oracle target is a 1-D per-frame TIME signal, the
+# IRM branch's frequency axis a borrowed STFT-band pool), SRMR (Falk, Zheng & Chan,
+# IEEE TASLP 2010) is defined on a GENUINELY 2-D auditory plane: a gammatone ACOUSTIC
+# filterbank (23 cochlear bands) x an 8-band MODULATION filterbank. The dense oracle
+# target is the per-(acoustic, modulation) average modulation-energy tensor computed
+# on the clean s1 stem (src/srmr_maps.py / scripts/compute_srmr_maps.py). Reverberation
+# moves energy from low (1-4) to high (5-8) modulation bands, so this tensor carries
+# WHERE the reverberant smearing lives — the frequency axis here is non-vacuous.
+#
+# The head regresses the 23x8 LOG-energy map from the SAME WavLM audio_features the
+# adapter consumes (mean-pool over time -> MLP -> A*M grid), supervised by a masked
+# Huber against the oracle log-map. Like the SNR map it is training-only, has its OWN
+# params (never the LM CE graph), and is DEFAULT-OFF: built only when lambda_srmr_map>0
+# and a no-op (returns None) whenever the head is absent, the weight is 0, or the batch
+# carries no srmr_map_target — so lambda_srmr_map=0 is byte-identical.
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Canonical SRMR geometry (src/srmr_maps.py defaults; Falk et al. 2010 / SRMRpy).
+SRMR_N_ACOUSTIC: int = 23
+SRMR_N_MODULATION: int = 8
+
+
+class SupervisedSRMRMapHead(nn.Module):
+    """Regress the 2D (acoustic x modulation) SRMR log-energy map from audio features.
+
+    A clip-level head: it MEAN-POOLS the WavLM frames into one clip embedding (the SRMR
+    target is a time-AVERAGED 23x8 tensor, so a clip-level readout is the natural carrier
+    — no per-frame alignment needed, unlike the SNR timeline), then an MLP projects to
+    the flat A*M map which is reshaped to (B, A, M). Small-init readout so the head
+    starts near a flat prior. The scalar SRMR can be read THROUGH the predicted map
+    (pooled_srmr) as the low/high modulation-energy ratio, the CBM tie mirroring the SNR
+    pooled-scalar tie.
+
+    Args:
+        audio_dim:   WavLM feature dim feeding the head (1024).
+        n_acoustic:  gammatone acoustic-band count of the map (23).
+        n_modulation:modulation-band count of the map (8).
+        hidden:      MLP hidden width.
+        huber_delta: Huber transition on the log-energy error.
+    """
+
+    def __init__(
+        self,
+        audio_dim: int = AUDIO_DIM,
+        n_acoustic: int = SRMR_N_ACOUSTIC,
+        n_modulation: int = SRMR_N_MODULATION,
+        hidden: int = 256,
+        huber_delta: float = 1.0,
+    ):
+        super().__init__()
+        self.audio_dim = int(audio_dim)
+        self.n_acoustic = int(n_acoustic)
+        self.n_modulation = int(n_modulation)
+        self.hidden = int(hidden)
+        self.huber_delta = float(huber_delta)
+        out_dim = self.n_acoustic * self.n_modulation
+
+        self.in_proj = nn.Linear(self.audio_dim, self.hidden)
+        self.mid = nn.Linear(self.hidden, self.hidden)
+        self.out_proj = nn.Linear(self.hidden, out_dim)
+        # small-init readout so the head starts ~flat (mirrors the SNR map readout).
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.01)
+        with torch.no_grad():
+            self.out_proj.bias.zero_()
+
+    @staticmethod
+    def _masked_mean_pool(audio_features: torch.Tensor, audio_lens: torch.Tensor | None) -> torch.Tensor:
+        """(B, T, D) WavLM frames -> (B, D) masked mean over real (non-padded) frames."""
+        B, T, _ = audio_features.shape
+        if audio_lens is None:
+            return audio_features.mean(dim=1)
+        idx = torch.arange(T, device=audio_features.device).unsqueeze(0)        # (1, T)
+        m = (idx < audio_lens.to(audio_features.device).unsqueeze(1)).to(audio_features.dtype)  # (B, T)
+        denom = m.sum(dim=1, keepdim=True).clamp(min=1.0)                        # (B, 1)
+        return (audio_features * m.unsqueeze(-1)).sum(dim=1) / denom            # (B, D)
+
+    def forward(
+        self,
+        audio_features: torch.Tensor,
+        audio_lens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """(B, T, audio_dim) WavLM frames -> (B, n_acoustic, n_modulation) log-energy map."""
+        if audio_features.dim() != 3:
+            raise ValueError(
+                f"audio_features must be (B, T, audio_dim), got {tuple(audio_features.shape)}"
+            )
+        pooled = self._masked_mean_pool(audio_features, audio_lens)             # (B, D)
+        h = F.gelu(self.in_proj(pooled))
+        h = F.gelu(self.mid(h))
+        flat = self.out_proj(h)                                                 # (B, A*M)
+        return flat.reshape(-1, self.n_acoustic, self.n_modulation)            # (B, A, M)
+
+    @staticmethod
+    def pooled_srmr(
+        logmap: torch.Tensor,            # (B, A, M) predicted LOG10 energy
+        kstar: int = SRMR_N_MODULATION,
+    ) -> torch.Tensor:
+        """Read the scalar SRMR THROUGH the predicted log-map (CBM tie).
+
+        SRMR = sum(low-modulation energy, bands 1-4) / sum(high-modulation, 5..K*),
+        the same aggregation srmr_maps.srmr_scalar_from_avg uses. The map is in LOG10
+        space, so it is exponentiated back to energy before the ratio. Returns (B,).
+        """
+        kstar = int(max(5, min(kstar, logmap.shape[-1])))
+        energy = torch.pow(10.0, logmap)                                        # (B, A, M)
+        num = energy[:, :, :4].sum(dim=(1, 2))                                  # (B,)
+        den = energy[:, :, 4:kstar].sum(dim=(1, 2)) + 1e-12                     # (B,)
+        return num / den
+
+    def map_loss(
+        self,
+        pred: torch.Tensor,              # (B, A, M)
+        target: torch.Tensor,           # (B, A, M) oracle log-energy map
+        mask: torch.Tensor | None = None,  # (B, A, M) valid-band mask (1=supervise)
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Masked Huber on the 2D log-energy map.
+
+        Returns:
+            (loss, metrics). loss is the mean Huber over supervised bands (0.0 when the
+            mask is empty). metrics has 'srmr_map_mae' (mean |error| over supervised
+            bands) and 'srmr_map_n_bands'.
+        """
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"pred {tuple(pred.shape)} vs target {tuple(target.shape)}"
+            )
+        tgt = target.to(pred.dtype)
+        mf = (torch.ones_like(pred) if mask is None else mask.to(pred.dtype))
+        err = pred - tgt
+        per = F.huber_loss(
+            err, torch.zeros_like(err), reduction="none", delta=self.huber_delta,
+        ) * mf
+        denom = mf.sum().clamp(min=1.0)
+        loss = per.sum() / denom
+        with torch.no_grad():
+            mae = float(((err.abs() * mf).sum() / denom).item())
+            n = float(mf.sum().item())
+        return loss, {"srmr_map_mae": mae, "srmr_map_n_bands": n}
+
+
+def srmr_map_loss_term(
+    head: "SupervisedSRMRMapHead | None",
+    batch: dict,
+    lambda_srmr_map: float,
+    device: torch.device | str = "cpu",
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+    """train.py integration: dense 2D SRMR-modulation-map supervision off WavLM frames.
+
+    Mirrors snr_map_loss_term: runs the SRMR head on the batch's `audio_features` (the
+    SAME field the adapter consumes), regresses the predicted 23x8 log-energy map against
+    the oracle clean-s1 SRMR map (masked Huber), and returns lambda_srmr_map · loss as a
+    fresh term. The head has its OWN params, so its gradient lands on the head — never the
+    LM CE graph. Fully decoupled, added to the total loss in compute_loss.
+
+    Pulls from the batch:
+        audio_features:  (B, T, audio_dim) WavLM frames (always present).
+        srmr_map_target: (B, A, M) oracle log-energy map. REQUIRED — no-op if absent.
+        srmr_map_mask:   (B, A, M) valid-band mask. Defaults to all-ones when absent.
+        audio_lens:      (B,) WavLM frame counts (for the masked mean-pool).
+
+    Returns:
+        (weighted_loss_or_None, metrics). No-op (None, {}) when the head is absent,
+        lambda <= 0, or the batch carries no srmr_map_target — safe to call
+        unconditionally, zero-overhead when off. metrics has 'loss_srmr_map' (UNWEIGHTED
+        Huber) and 'srmr_map_mae'.
+    """
+    if head is None or lambda_srmr_map <= 0.0:
+        return None, {}
+    target = batch.get("srmr_map_target")
+    audio_features = batch.get("audio_features")
+    if target is None or audio_features is None:
+        return None, {}
+
+    head_dtype = head.in_proj.weight.dtype
+    audio_features = audio_features.to(device).to(head_dtype)
+    target = target.to(device).to(head_dtype)
+    audio_lens = batch.get("audio_lens")
+    if audio_lens is not None:
+        audio_lens = audio_lens.to(device)
+
+    pred = head.forward(audio_features, audio_lens=audio_lens)                  # (B, A, M)
+    # Align the predicted grid to the target grid if a clip carried a different A/M
+    # (defensive; targets are fixed 23x8). Slice to the common (A, M).
+    A = min(pred.shape[1], target.shape[1])
+    M = min(pred.shape[2], target.shape[2])
+    pred = pred[:, :A, :M]
+    target = target[:, :A, :M]
+
+    mask = batch.get("srmr_map_mask")
+    if mask is not None:
+        mask = mask.to(device)[:, :A, :M]
+
+    loss, metrics = head.map_loss(pred, target, mask)
+    weighted = lambda_srmr_map * loss
+    metrics = {"loss_srmr_map": float(loss.detach().item()), **metrics}
+    return weighted, metrics
