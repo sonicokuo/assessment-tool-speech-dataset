@@ -1,0 +1,102 @@
+# v24 — CORRECTED supervised dense local-SNR-map model on the CANONICAL AQUA-NL data.
+#
+# This is the headline-grounding model. It takes the PROVEN observability/abstention
+# headline recipe (v21: processed_aug 41700, descriptions_observability_all abstention
+# spine, reliability_head, val_subset_size 256, 12 epochs) and adds the directly-
+# supervised dense per-frame local-SNR-map head against the GENERAL oracle target
+# (s1 vs (INPUT_AUDIO - s1), per clip suffix: mixture=speaker-vs-speaker,
+# augNp=speech-vs-noise~N dB, s1clean=clean +40 dB). Built by the --general path of
+# scripts/compute_snr_map_targets.py into snr_map_targets_aug/{train,dev}.
+#
+# Corrects v23, which was misconfigured: it ran on processed_pyannote (13900 overlap
+# mixtures only), the OLD non-abstention descriptions_untagged_noseg_nodur, and a
+# snr-map that covered ONLY overlap mixtures (no non-overlap/noise grounding). v24
+# uses the canonical universe so it is a drop-in comparison with v21/v22 and the
+# SNR-map covers overlap + non-overlap + noise (all 41700 train clips).
+#
+# CANONICAL TUPLE (DATA_INVENTORY.md §4):
+#   data_dir          = processed_aug                          (41700 train / 3000 val / 3000 test)
+#   descriptions_path = descriptions_observability_all.json    (47700, abstention; 100% join on 41700)
+#   features_csv.train= features_aug_train_cleangt.csv         (41700; aux/nums supervise ALL clips)
+#   features_csv.val  = dev_cleanf0.csv                        (clean-F0 val regime)
+#   snr_map_dir       = snr_map_targets_aug/{train,dev}        (general per-suffix oracle, ALL 41700)
+#   lambda_snr_map 0.5, lambda_snr_scalar 0.0, snr_map_snr_bias 5.0
+
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-08
+adapter_variant: film-mamba
+batch_size: 6
+beats_cached: false
+bf16: true
+data_dir: /ocean/projects/cis260125p/shared/data/processed_aug
+descriptions_path: /ocean/projects/cis260125p/shared/data/descriptions_observability_all.json
+epochs: 12
+eval_every_epoch: 1
+features_csv:
+  train: /ocean/projects/cis260125p/shared/data/features_aug_train_cleangt.csv
+  val: /ocean/projects/cis260125p/shared/data/features_pyannote/dev_cleanf0.csv
+features_path: /ocean/projects/cis260125p/shared/data/features.json
+grad_clip: 1.0
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+lambda_mse: 0.0
+lambda_nll: 0.3
+lambda_nums: 0.3
+lambda_prose: 1.0
+lambda_snr_irm: 0.0
+lambda_snr_map: 0.5
+lambda_snr_scalar: 0.0
+lm_name: Qwen/Qwen3-8B
+log_every: 10
+lora_alpha: 32
+lora_dropout: 0.05
+lora_rank: 16
+lora_targets:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+lr_adapter: 0.0001
+lr_encoder: 1.0e-05
+lr_lm: 1.0e-05
+lr_scheduler: cosine
+max_nums_length: 64
+max_target_length: 512
+min_lr_ratio: 0.0
+num_workers: 4
+optimizer: adamw
+pin_memory: true
+prompt: Describe the quality of this recording.
+prompt_nums: 'List the numerical features of this recording:'
+prompt_prose: Describe the quality of this recording.
+reliability_head: true
+resume_from: null
+save_dir: /ocean/projects/cis260125p/shared/checkpoints/v24_snrmap
+score_overlap_spans: false
+seed: 73
+snr_map_dir:
+  train: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/train
+  val: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/dev
+snr_map_huber_delta: 1.0
+snr_map_hidden: 256
+snr_map_kernel_size: 5
+snr_map_predict_irm: false
+snr_map_snr_bias: 5.0
+tagged_mode: false
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+unfreeze_beats_top_n: 0
+unfreeze_wavlm_top_n: 0
+use_sections: false
+val_sfs_n: 32
+val_subset_size: 256
+wandb_entity: speech_quality_adapter
+wandb_project: aqua-nl-emnlp
+wandb_run_name: v24-snrmap
+warmup_ratio: 0.03
+weight_decay: 0.01
