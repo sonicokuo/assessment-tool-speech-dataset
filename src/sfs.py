@@ -220,6 +220,13 @@ class ClaimParser:
             r"overlap[\s,]+with\s+(?:a|an)\s+ratio\s+of\s+(?:approximately\s+)?(\d+\.?\d*)",
             [("overlap_ratio", 1, "")],
         ),
+        # Value-FIRST form: "(0.7825 overlap ratio)" (the canonical builder's hedge
+        # phrasing under heavy overlap) and "0.74 overlap ratio" (v21 observability
+        # descriptions). The base "overlap ratio is X" patterns miss value-first.
+        (
+            r"(\d+\.?\d*)\s+overlap\s+ratio",
+            [("overlap_ratio", 1, "")],
+        ),
         # F0 standard deviation — "F0 standard deviation SD is X Hz",
         # "F0 SD is X Hz", "F0 standard deviation (SD) is X Hz", and the model's
         # shorthand "F0 deviation is X Hz" ("standard" omitted). "standard" is made
