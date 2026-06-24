@@ -256,6 +256,26 @@ def main() -> int:
         pooled_pearson = _masked_pearson(pp, tt, ones)
         pooled_srcc = _masked_spearman(pp, tt, ones)
 
+    # CLIP-SPECIFICITY control (the metric that actually matters for a per-clip claim):
+    # does the predicted map match THIS clip's oracle better than a DIFFERENT clip's oracle?
+    # matched = corr(pred[i], tgt[i]); mismatched = corr(pred[i], tgt[i+1]). The 23x8 grid has
+    # a strong shared across-clip shape, so a high matched Pearson is NOT evidence of per-clip
+    # grounding. gap = matched - mismatched isolates the per-clip signal: gap ~ 0 means the map
+    # only reproduces the canonical grid (not discriminative); gap > 0 (and growing) means real
+    # per-clip structure. Cells are the fixed full 23x8, so pred[i]/tgt[j] align elementwise.
+    matched_corrs, mismatched_corrs = [], []
+    N = len(pooled_pred)
+    for i in range(N):
+        j = (i + 1) % N
+        if pooled_pred[i].numel() >= 2 and pooled_pred[i].numel() == pooled_tgt[i].numel():
+            matched_corrs.append(
+                _masked_pearson(pooled_pred[i], pooled_tgt[i], torch.ones_like(pooled_pred[i])))
+        if N >= 2 and pooled_pred[i].numel() >= 2 and pooled_pred[i].numel() == pooled_tgt[j].numel():
+            mismatched_corrs.append(
+                _masked_pearson(pooled_pred[i], pooled_tgt[j], torch.ones_like(pooled_pred[i])))
+    matched_mean = _mean(matched_corrs)
+    mismatched_mean = _mean(mismatched_corrs)
+
     result = {
         "n_clips": n_scored,
         "n_bands": n_bands_seen,
@@ -267,6 +287,10 @@ def main() -> int:
         # pooled-across-clips correlation (one flat vector of all supervised cells):
         "srmr_map_pearson_pooled": float(pooled_pearson),
         "srmr_map_srcc_pooled": float(pooled_srcc),
+        # clip-specificity: the REAL per-clip-grounding test (matched - mismatched).
+        "srmr_map_matched_mean": matched_mean,
+        "srmr_map_mismatched_mean": mismatched_mean,
+        "srmr_map_clip_specificity_gap": matched_mean - mismatched_mean,
     }
     json.dump(result, open(args.out, "w"), indent=2)
     print(json.dumps(result, indent=2))
