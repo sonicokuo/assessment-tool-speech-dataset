@@ -241,11 +241,36 @@ def composite_score(
         if bleu is None or bleu < bleu_floor:
             return float("-inf")
 
+    h = headline_band_free_means(
+        per_feature, reliable_features,
+        min_pairs=min_pairs, degenerate_features=degenerate_features,
+    )
+    return h["mean_srcc"] - lam_nmae * h["mean_nmae"]
+
+
+def headline_band_free_means(
+    per_feature: dict[str, dict],
+    reliable_features: Iterable[str],
+    *,
+    min_pairs: int = DEFAULT_MIN_PAIRS,
+    degenerate_features: Iterable[str] = DEGENERATE_SELECTION_FEATURES,
+) -> dict:
+    """Headline band-free aggregates over the SAME feature set `composite_score` uses.
+
+    Returns ``{"mean_srcc", "mean_nmae", "features_used", "n_features"}`` where the
+    means are over features that are reliable, NOT degenerate (snr-scalar excluded),
+    and have >= ``min_pairs`` paired clips with a defined statistic. ``mean_srcc`` is
+    THE headline reporting number ("mean SRCC over reliable features, snr excluded").
+    Surfaced as its own function so train.py can log it directly instead of leaving it
+    buried inside `composite_score` — the logged `val/srcc_mean` is a different, raw
+    all-feature mean and must not be mistaken for this.
+    """
     reliable = frozenset(reliable_features)
     degenerate = frozenset(degenerate_features)
 
     srccs: list[float] = []
     nmaes: list[float] = []
+    used: list[str] = []
     for f, stats in per_feature.items():
         if f not in reliable or f in degenerate:
             continue
@@ -254,13 +279,17 @@ def composite_score(
         s = stats.get("srcc")
         if s is not None:
             srccs.append(s)
+            used.append(f)
         nm = stats.get("nmae")
         if nm is not None:
             nmaes.append(nm)
 
-    mean_srcc = (sum(srccs) / len(srccs)) if srccs else 0.0
-    mean_nmae = (sum(nmaes) / len(nmaes)) if nmaes else 0.0
-    return mean_srcc - lam_nmae * mean_nmae
+    return {
+        "mean_srcc": (sum(srccs) / len(srccs)) if srccs else 0.0,
+        "mean_nmae": (sum(nmaes) / len(nmaes)) if nmaes else 0.0,
+        "features_used": used,
+        "n_features": len(srccs),
+    }
 
 
 def ema(prev: float | None, new: float, beta: float = 0.7) -> float:

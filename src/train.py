@@ -75,6 +75,7 @@ from ckpt_selection import (
 from selection_metric import (
     band_free_val_scores,
     composite_score,
+    headline_band_free_means,
     ema,
     SELECTION_FEATURES,
 )
@@ -2042,14 +2043,20 @@ def train(config: dict) -> None:
             composite_ema = ema(composite_ema, ema_update, beta=val_select_ema_beta)
             avg_composite = raw_composite
 
-            # Aggregate band-free scalars for wandb. Means over features with a
-            # defined value (None features are skipped).
+            # Aggregate band-free scalars for wandb. TWO different means, kept
+            # distinct so the headline number is never confused with the raw one:
+            #   * bf_srcc_mean_all = raw mean over EVERY feature with a defined SRCC
+            #     (snr INCLUDED, no min_pairs gate) — a diagnostic, NOT the headline.
+            #   * headline = mean SRCC over RELIABLE features, snr EXCLUDED, min_pairs
+            #     gated — THE reported number, computed by the same helper the
+            #     composite uses, so logged == selected components exactly.
             _srccs = [v["srcc"] for v in bf_pf.values() if v["srcc"] is not None]
             _nmaes = [v["nmae"] for v in bf_pf.values() if v["nmae"] is not None]
             _covs = [v["coverage"] for v in bf_pf.values()]
-            bf_srcc_mean = (sum(_srccs) / len(_srccs)) if _srccs else 0.0
-            bf_nmae_mean = (sum(_nmaes) / len(_nmaes)) if _nmaes else 0.0
+            bf_srcc_mean_all = (sum(_srccs) / len(_srccs)) if _srccs else 0.0
+            bf_nmae_mean_all = (sum(_nmaes) / len(_nmaes)) if _nmaes else 0.0
             bf_coverage_mean = (sum(_covs) / len(_covs)) if _covs else 0.0
+            headline = headline_band_free_means(bf_pf, RECOVERABLE_FEATURES)
 
             # Per-epoch averages of B-full's three loss terms — diagnostic curves so you
             # can see whether the prose CE, the nums CE, and the aux-head MSE are each
@@ -2097,8 +2104,14 @@ def train(config: dict) -> None:
             # per-feature SRCC / nMAE. These stream online (they are plain scalars,
             # not a heavy table artifact), so the selection curve is visible even
             # with log_val_samples_table off.
-            log_dict["val/srcc_mean"] = bf_srcc_mean
-            log_dict["val/nmae_mean"] = bf_nmae_mean
+            # HEADLINE reporting number (mean SRCC over reliable feats, snr excluded)
+            # — the one to read/quote. val/srcc_mean_all is the raw all-feature mean
+            # (snr-included) and must NOT be mistaken for the headline.
+            log_dict["val/srcc_mean_reliable"] = headline["mean_srcc"]
+            log_dict["val/nmae_mean_reliable"] = headline["mean_nmae"]
+            log_dict["val/n_headline_features"] = headline["n_features"]
+            log_dict["val/srcc_mean_all"] = bf_srcc_mean_all
+            log_dict["val/nmae_mean_all"] = bf_nmae_mean_all
             log_dict["val/coverage_mean"] = bf_coverage_mean
             log_dict["val/composite"] = avg_composite
             log_dict["val/composite_ema"] = composite_ema
@@ -2108,6 +2121,9 @@ def train(config: dict) -> None:
                 if _stats["nmae"] is not None:
                     log_dict[f"val/nmae_{_feat}"] = _stats["nmae"]
                 log_dict[f"val/coverage_{_feat}"] = _stats["coverage"]
+                # per-feature paired-clip count — lets you see which features cleared
+                # min_pairs and actually entered the headline mean (audit blind spot).
+                log_dict[f"val/n_{_feat}"] = _stats.get("n", 0)
             wandb.log(log_dict)
 
         # ── Print epoch summary ──
