@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -62,7 +63,22 @@ from snr_map_head import SupervisedSNRMapHead, snr_map_loss_term
 # head not built, loss term no-ops). The frequency axis here is non-vacuous (unlike SNR).
 from snr_map_head import SupervisedSRMRMapHead, srmr_map_loss_term
 # Degeneration-aware, lower-variance best-checkpoint selection.
-from ckpt_selection import seeded_val_indices, should_save_best
+from ckpt_selection import (
+    seeded_val_indices,
+    should_save_best,
+    passes_degeneration_guard,
+    degeneration_stats,
+)
+# Band-free, lower-variance checkpoint selection (research Q1 protocol):
+# continuous SRCC/nMAE composite with a hard BLEU fluency floor + EMA smoothing,
+# replacing the saturated small-val SFS-F1 argmax. See src/selection_metric.py.
+from selection_metric import (
+    band_free_val_scores,
+    composite_score,
+    ema,
+    SELECTION_FEATURES,
+)
+from feature_set import RECOVERABLE_FEATURES
 from ckpt_io import (
     CKPT_FORMAT_SLIM,
     slim_llm_state_dict,
@@ -1416,6 +1432,17 @@ def train(config: dict) -> None:
     best_val_bleu = None
     wandb_run_id = None
 
+    # ── Band-free composite selection state (research Q1 protocol) ────────────
+    # select_metric chooses the best.pt axis. 'composite' (default) selects on an
+    # EMA-smoothed continuous SRCC/nMAE composite with a hard BLEU floor; 'sfs_f1'
+    # reproduces the legacy degeneration-gated SFS-F1 argmax BYTE-IDENTICALLY.
+    select_metric = config.get("select_metric", "composite")
+    lam_nmae = float(config.get("lam_nmae", 0.5))
+    bleu_floor = config.get("bleu_floor", 5.0)
+    val_select_ema_beta = float(config.get("val_select_ema_beta", 0.7))
+    best_val_composite = float("-inf")   # best EMA-smoothed composite seen so far
+    composite_ema = None                  # running EMA of the raw composite
+
     if config.get("resume_from"):
         checkpoint = torch.load(config["resume_from"], weights_only=False)
         adapter.load_state_dict(checkpoint["adapter_state_dict"])
@@ -1453,8 +1480,14 @@ def train(config: dict) -> None:
         # Backwards-compat: old checkpoints stored "best_val_loss"; new ones store "best_val_sfs_f1".
         if "best_val_sfs_f1" in checkpoint:
             best_val_sfs_f1 = checkpoint["best_val_sfs_f1"]
+        # Composite-selection state (absent in pre-band-free ckpts → cold start).
+        if "best_val_composite" in checkpoint:
+            best_val_composite = checkpoint["best_val_composite"]
+        if checkpoint.get("composite_ema") is not None:
+            composite_ema = checkpoint["composite_ema"]
         wandb_run_id = checkpoint.get("wandb_run_id")
-        print(f"Resumed from epoch {start_epoch}, best_val_sfs_f1={best_val_sfs_f1:.4f}")
+        print(f"Resumed from epoch {start_epoch}, best_val_sfs_f1={best_val_sfs_f1:.4f}, "
+              f"best_val_composite={best_val_composite:.4f}")
 
     # Wandb. `wandb_entity` in the YAML pins the team account so contributors
     # don't have to remember to export WANDB_ENTITY every session. Passing
@@ -1497,8 +1530,11 @@ def train(config: dict) -> None:
     # bins so it stays representative; otherwise it's a seeded uniform draw.
     # COST: ~val_subset_size greedy generations per epoch (≈256 × ~0.3-1 s on an
     # 8B LoRA on PSC ⇒ a few minutes/epoch). Backward-compat: if val_subset_size
-    # is absent, fall back to the legacy val_sfs_n (default 32).
-    val_subset_size = int(config.get("val_subset_size", config.get("val_sfs_n", 32)))
+    # is absent, fall back to the legacy val_sfs_n; if that is ALSO absent, default
+    # to 200 — the research Q1 lower bound (150-250 clips) for a stable SRCC
+    # (Schonbrodt & Perugini 2013; Bonett & Wright 2000). A config that explicitly
+    # set val_sfs_n keeps its value, so this only changes brand-new runs.
+    val_subset_size = int(config.get("val_subset_size", config.get("val_sfs_n", 200)))
     val_strata = overlap_strata_from_csv_map(val_set.files, val_set.feature_csv_map)
     if val_strata is not None:
         from collections import Counter as _Counter
@@ -1716,6 +1752,7 @@ def train(config: dict) -> None:
         avg_sfs_f1 = None  # in scope for best-checkpoint check below; None on non-eval epochs
         val_gen_texts: list = []   # this epoch's val generations, for the degeneration guard
         val_bleu = None            # BLEU on those generations (None if not computed)
+        avg_composite = None       # this epoch's raw band-free composite (None on non-eval epochs)
         if (epoch + 1) % config["eval_every_epoch"] == 0:
             adapter.eval()
             llm.eval()
@@ -1811,6 +1848,14 @@ def train(config: dict) -> None:
 
             sample_rows = []
             sfs_f1s, sfs_precs, sfs_recs = [], [], []
+            # ── Band-free selection accumulators (research Q1 protocol) ─────────
+            # Full (untruncated) generations + filenames + per-clip clean GT, fed
+            # to selection_metric.band_free_val_scores after the loop. clean_gt is
+            # parsed from the verbalized target text (the same band-free GT source
+            # metrics_calibrated uses), restricted to the canonical 12 features.
+            bf_gen_texts: list[str] = []
+            bf_filenames: list[str] = []
+            bf_clean_gt: dict[str, dict[str, float]] = {}
             # val_subset_size (FIX 2) controls the val-time generation sample count.
             # Default 256 (was 32) — 32's bootstrap CI (±0.06) was too noisy to rank
             # epochs / select best.pt; 256 roughly halves the noise floor. Computed
@@ -1902,11 +1947,36 @@ def train(config: dict) -> None:
                          round(p, 3), round(r, 3), round(f1, 3))
                     )
 
+                    # Band-free selection: stash the FULL generation, the filename,
+                    # and the per-clip clean GT (target-parsed scalars restricted to
+                    # the canonical 12 features). composite_score is computed after
+                    # the loop. Skip clips with no parseable GT (nothing to rank).
+                    fname_key = sample.get("filename", f"_idx_{i}")
+                    clip_gt = {
+                        c.feature: c.value for c in target_claims
+                        if c.feature in SELECTION_FEATURES
+                    }
+                    if clip_gt:
+                        bf_gen_texts.append(gen_text)
+                        bf_filenames.append(fname_key)
+                        bf_clean_gt[fname_key] = clip_gt
+
             # wandb.Table renders as a browseable table in the UI per epoch.
-            table = wandb.Table(columns=["epoch", "filename", "target", "generated",
-                                         "sfs_precision", "sfs_recall", "sfs_f1"])
-            for row in sample_rows:
-                table.add_data(*row)
+            # GATED behind log_val_samples_table (DEFAULT FALSE): the per-epoch
+            # val-samples Artifact/Table is the heavy object whose upload STALLS
+            # online wandb sync (each epoch re-uploads a fresh table artifact;
+            # the sync thread blocks behind it and the run hangs). With the gate
+            # off, the scalar metrics below still stream online — only the table
+            # artifact is skipped — so future runs can train ONLINE without the
+            # hang. The same rows are still dumped to disk as JSON (below), so no
+            # information is lost; inspect them offline or `wandb sync` later.
+            log_val_samples_table = config.get("log_val_samples_table", False)
+            table = None
+            if log_val_samples_table:
+                table = wandb.Table(columns=["epoch", "filename", "target", "generated",
+                                             "sfs_precision", "sfs_recall", "sfs_f1"])
+                for row in sample_rows:
+                    table.add_data(*row)
 
             # Dump JSON to disk for offline inspection (same shape as IDL HW4's text_val_epoch_*.json).
             samples_dir = os.path.join(config["save_dir"], "val_samples")
@@ -1946,6 +2016,41 @@ def train(config: dict) -> None:
             val_gen_texts = list(hyps)
             val_bleu = gen_metrics.get("bleu")
 
+            # ── Band-free composite (research Q1 protocol) ─────────────────────
+            # Continuous per-feature SRCC / nMAE / coverage over the canonical 12
+            # features, joined to the target-parsed clean GT. The composite =
+            # mean_SRCC(reliable, non-degenerate, snr-excluded) - lam_nmae*mean_nMAE
+            # with a HARD BLEU floor; EMA-smoothed across epochs to denoise the
+            # selection signal. These are logged regardless of select_metric so the
+            # curve is always visible; they only DRIVE selection when
+            # select_metric=='composite'.
+            bf_scores = band_free_val_scores(bf_gen_texts, bf_filenames, bf_clean_gt)
+            bf_pf = bf_scores["per_feature"]
+            # Raw composite (with BLEU floor) and its EMA. The floor uses val_bleu;
+            # if BLEU is unavailable (dep missing) the floor is skipped (None) so a
+            # missing fluency signal never silently rejects every epoch.
+            raw_composite = composite_score(
+                bf_pf, RECOVERABLE_FEATURES,
+                lam_nmae=lam_nmae,
+                bleu=val_bleu,
+                bleu_floor=(bleu_floor if val_bleu is not None else None),
+            )
+            # -inf (floor failure) must not poison the EMA — treat it as a NaN
+            # update (EMA passes prev through), but still log the raw -inf so a
+            # collapse is visible. Otherwise smooth normally.
+            ema_update = raw_composite if math.isfinite(raw_composite) else float("nan")
+            composite_ema = ema(composite_ema, ema_update, beta=val_select_ema_beta)
+            avg_composite = raw_composite
+
+            # Aggregate band-free scalars for wandb. Means over features with a
+            # defined value (None features are skipped).
+            _srccs = [v["srcc"] for v in bf_pf.values() if v["srcc"] is not None]
+            _nmaes = [v["nmae"] for v in bf_pf.values() if v["nmae"] is not None]
+            _covs = [v["coverage"] for v in bf_pf.values()]
+            bf_srcc_mean = (sum(_srccs) / len(_srccs)) if _srccs else 0.0
+            bf_nmae_mean = (sum(_nmaes) / len(_nmaes)) if _nmaes else 0.0
+            bf_coverage_mean = (sum(_covs) / len(_covs)) if _covs else 0.0
+
             # Per-epoch averages of B-full's three loss terms — diagnostic curves so you
             # can see whether the prose CE, the nums CE, and the aux-head MSE are each
             # converging as expected.
@@ -1960,11 +2065,15 @@ def train(config: dict) -> None:
                 "val_loss_mse": avg_val_mse,
                 "train_loss_epoch": avg_train_loss,
                 "epoch": epoch + 1,
-                "val_samples": table,
                 "val_sfs_precision": avg_sfs_p,
                 "val_sfs_recall": avg_sfs_r,
                 "val_sfs_f1": avg_sfs_f1,
             }
+            # val_sfs_f1 is now a DEPRECATED selection axis (saturates; computed on
+            # a small subset) — kept logged for back-compat/curves only. The
+            # composite below is the selection signal when select_metric=='composite'.
+            if table is not None:  # gated by log_val_samples_table (default False)
+                log_dict["val_samples"] = table
             # [section_readout] held-out grounding loss + per-feature MAE. Watch
             # val_readout_mae/f0_mean, .../overlap_ratio — falling means the
             # section's z (hence its attention) is learning to find that evidence.
@@ -1983,6 +2092,22 @@ def train(config: dict) -> None:
                 log_dict["val_rouge_l"] = gen_metrics["rouge_l"]
             if gen_metrics["bertscore_f1"] is not None:
                 log_dict["val_bertscore_f1"] = gen_metrics["bertscore_f1"]
+            # ── Band-free selection metrics (research Q1 protocol) ─────────────
+            # Aggregate continuous scalars + the composite (raw + EMA) + every
+            # per-feature SRCC / nMAE. These stream online (they are plain scalars,
+            # not a heavy table artifact), so the selection curve is visible even
+            # with log_val_samples_table off.
+            log_dict["val/srcc_mean"] = bf_srcc_mean
+            log_dict["val/nmae_mean"] = bf_nmae_mean
+            log_dict["val/coverage_mean"] = bf_coverage_mean
+            log_dict["val/composite"] = avg_composite
+            log_dict["val/composite_ema"] = composite_ema
+            for _feat, _stats in bf_pf.items():
+                if _stats["srcc"] is not None:
+                    log_dict[f"val/srcc_{_feat}"] = _stats["srcc"]
+                if _stats["nmae"] is not None:
+                    log_dict[f"val/nmae_{_feat}"] = _stats["nmae"]
+                log_dict[f"val/coverage_{_feat}"] = _stats["coverage"]
             wandb.log(log_dict)
 
         # ── Print epoch summary ──
@@ -2031,6 +2156,11 @@ def train(config: dict) -> None:
                 "llm_state_dict": llm_sd,
                 "lora_state_dict": llm_sd,  # legacy alias
                 "best_val_sfs_f1": best_val_sfs_f1,
+                # Band-free composite selection state (research Q1 protocol). Carried
+                # so --resume_from restores the running EMA + best-so-far without a
+                # cold start. Absent in pre-band-free ckpts → cold start on resume.
+                "best_val_composite": best_val_composite,
+                "composite_ema": composite_ema,
                 "wandb_run_id": wandb_run_id,
                 "config": config,
                 "added_special_tokens": list(TAG_SPECIAL_TOKENS) if config.get("tagged_mode") else [],
@@ -2095,30 +2225,90 @@ def train(config: dict) -> None:
                 print(f"  [wandb-artifact] WARNING upload of {path} failed: "
                       f"{type(e).__name__}: {e}")
 
-        # Degeneration-aware selection: SFS only parses numbers, so it is blind to
-        # fluency/structural collapse (tag-spam, repetition, foreign-token runs) —
-        # an SFS argmax can select a degenerate checkpoint. Gate it on a BLEU /
-        # rep-n / non-ASCII guard over this epoch's generations (ckpt_selection.py).
-        _save_best, _save_reason = should_save_best(
-            avg_sfs_f1, best_val_sfs_f1, val_bleu, best_val_bleu, val_gen_texts,
-        )
-        if val_bleu is not None:
-            best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
-        if (not _save_best) and avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
-            print(f"  [select] withheld best.pt despite val_sfs_f1={avg_sfs_f1:.4f}: {_save_reason}")
-        if _save_best:
-            best_val_sfs_f1 = avg_sfs_f1
-            best_path = os.path.join(config["save_dir"], "best.pt")
-            # best.pt is inference-only → omit optimizer/scheduler.
-            _atomic_save(_ckpt_payload(epoch, save_optimizer=False), best_path)
-            print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
-            if config.get("upload_ckpt_to_wandb", True):
-                run_name = (wandb.run.name if wandb.run is not None else None) or "run"
-                _upload_to_wandb_artifact(
-                    best_path,
-                    name=f"best-{run_name}",
-                    metadata={"epoch": epoch, "val_sfs_f1": best_val_sfs_f1},
+        # ── Best-checkpoint selection ─────────────────────────────────────────
+        # select_metric switches the axis:
+        #   'composite' (DEFAULT) — EMA-smoothed band-free composite (continuous
+        #     SRCC/nMAE, snr excluded) with a HARD BLEU fluency floor baked into
+        #     composite_score, plus the same degeneration guard as a backstop.
+        #     Lower-variance + non-saturating per the research Q1 protocol.
+        #   'sfs_f1' — the legacy degeneration-gated val_sfs_f1 argmax, BYTE-FOR-BYTE
+        #     unchanged (the block below is identical to the pre-band-free code).
+        # best_val_bleu is updated identically on BOTH paths so the relative BLEU
+        # floor tracks the same running max regardless of which axis selects.
+        if select_metric == "sfs_f1":
+            # ── Legacy path (unchanged) ───────────────────────────────────────
+            # Degeneration-aware selection: SFS only parses numbers, so it is blind to
+            # fluency/structural collapse (tag-spam, repetition, foreign-token runs) —
+            # an SFS argmax can select a degenerate checkpoint. Gate it on a BLEU /
+            # rep-n / non-ASCII guard over this epoch's generations (ckpt_selection.py).
+            _save_best, _save_reason = should_save_best(
+                avg_sfs_f1, best_val_sfs_f1, val_bleu, best_val_bleu, val_gen_texts,
+            )
+            if val_bleu is not None:
+                best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
+            if (not _save_best) and avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
+                print(f"  [select] withheld best.pt despite val_sfs_f1={avg_sfs_f1:.4f}: {_save_reason}")
+            if _save_best:
+                best_val_sfs_f1 = avg_sfs_f1
+                best_path = os.path.join(config["save_dir"], "best.pt")
+                # best.pt is inference-only → omit optimizer/scheduler.
+                _atomic_save(_ckpt_payload(epoch, save_optimizer=False), best_path)
+                print(f"Saved best val model (val_sfs_f1={best_val_sfs_f1:.4f})")
+                if config.get("upload_ckpt_to_wandb", True):
+                    run_name = (wandb.run.name if wandb.run is not None else None) or "run"
+                    _upload_to_wandb_artifact(
+                        best_path,
+                        name=f"best-{run_name}",
+                        metadata={"epoch": epoch, "val_sfs_f1": best_val_sfs_f1},
+                    )
+        else:
+            # ── Band-free composite path (DEFAULT) ────────────────────────────
+            # Select on the EMA-smoothed composite. The hard BLEU floor lives
+            # INSIDE composite_score (raw_composite == -inf below the floor → its
+            # EMA can't beat best), and the rep-n/non-ASCII degeneration guard is
+            # still applied as a backstop for high-BLEU-but-structurally-broken
+            # epochs (e.g. tag-spam that keeps BLEU up). Skip on non-eval epochs
+            # (avg_composite is None then).
+            if val_bleu is not None:
+                best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
+            _save_best = False
+            _save_reason = "no eval this epoch"
+            if avg_composite is not None:
+                improved = composite_ema is not None and composite_ema > best_val_composite
+                _deg = degeneration_stats(val_gen_texts)
+                guard_ok, guard_reason = passes_degeneration_guard(
+                    val_bleu, best_val_bleu,
+                    _deg["rep_n_max"], _deg["nonascii_frac"],
+                    _deg["frac_clips_nonascii"], _deg["frac_clips_high_rep"],
                 )
+                if not improved:
+                    _save_reason = (f"no composite_ema improvement "
+                                    f"(ema={composite_ema:.4f} <= best={best_val_composite:.4f})")
+                elif not guard_ok:
+                    _save_reason = f"composite improved but degenerate ({guard_reason})"
+                else:
+                    _save_best = True
+                    _save_reason = "composite_ema improved, clean"
+            if (not _save_best) and avg_composite is not None and \
+                    composite_ema is not None and composite_ema > best_val_composite:
+                print(f"  [select] withheld best.pt despite composite_ema={composite_ema:.4f}: {_save_reason}")
+            if _save_best:
+                best_val_composite = composite_ema
+                # keep best_val_sfs_f1 tracking the chosen epoch's SFS for telemetry
+                if avg_sfs_f1 is not None:
+                    best_val_sfs_f1 = max(best_val_sfs_f1, avg_sfs_f1)
+                best_path = os.path.join(config["save_dir"], "best.pt")
+                _atomic_save(_ckpt_payload(epoch, save_optimizer=False), best_path)
+                print(f"Saved best val model (composite_ema={best_val_composite:.4f}, "
+                      f"raw_composite={avg_composite:.4f}, val_sfs_f1={avg_sfs_f1})")
+                if config.get("upload_ckpt_to_wandb", True):
+                    run_name = (wandb.run.name if wandb.run is not None else None) or "run"
+                    _upload_to_wandb_artifact(
+                        best_path,
+                        name=f"best-{run_name}",
+                        metadata={"epoch": epoch, "val_composite": best_val_composite,
+                                  "val_sfs_f1": avg_sfs_f1},
+                    )
 
         # Save last (for resuming) — keeps optimizer + scheduler so --resume_from works.
         _atomic_save(
@@ -2128,7 +2318,11 @@ def train(config: dict) -> None:
         print("Saved epoch model")
 
     wandb.finish()
-    print("\nTraining complete. Best val_sfs_f1: {:.04f}".format(best_val_sfs_f1))
+    if select_metric == "sfs_f1":
+        print("\nTraining complete. Best val_sfs_f1: {:.04f}".format(best_val_sfs_f1))
+    else:
+        print("\nTraining complete. Best val_composite (EMA): {:.04f} "
+              "(best val_sfs_f1 seen: {:.04f})".format(best_val_composite, best_val_sfs_f1))
 
 
 # ── CLI ──────────────────────────────────────────────
