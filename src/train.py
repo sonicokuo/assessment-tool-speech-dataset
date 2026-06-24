@@ -56,6 +56,10 @@ from decoupled_grounding import (
 # target (the directly-supervised grounding the project lacked). Off by default
 # (lambda_snr_map: 0 → head not built, loss term no-ops).
 from snr_map_head import SupervisedSNRMapHead, snr_map_loss_term
+# [srmr_map] supervised TRUE-2D SRMR (acoustic x modulation) modulation-energy map head.
+# Regresses the 23x8 oracle log-energy tensor from WavLM frames (lambda_srmr_map: 0 →
+# head not built, loss term no-ops). The frequency axis here is non-vacuous (unlike SNR).
+from snr_map_head import SupervisedSRMRMapHead, srmr_map_loss_term
 # Degeneration-aware, lower-variance best-checkpoint selection.
 from ckpt_selection import seeded_val_indices, should_save_best
 from ckpt_io import (
@@ -502,6 +506,7 @@ def compute_loss(
     section_ctx: dict | None = None,
     decoupled_head: "DecoupledGroundingHead | None" = None,
     snr_map_head: "SupervisedSNRMapHead | None" = None,
+    srmr_map_head: "SupervisedSRMRMapHead | None" = None,
     batch: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """B-full multi-task forward + auxiliary regression head.
@@ -728,6 +733,26 @@ def compute_loss(
     else:
         metrics["loss_snr_map"] = 0.0
 
+    # [srmr_map] SUPERVISED 2D SRMR modulation-energy-map term. Runs the SRMR head on the
+    # batch's WavLM `audio_features` and regresses the 23x8 (acoustic x modulation)
+    # log-energy map against the oracle clean-s1 SRMR map (masked Huber). Its gradient
+    # lands on the head's own params — never the LM CE graph. No-op when the head is
+    # absent, lambda <= 0, or the batch carries no srmr_map_target (already weighted by
+    # lambda_srmr_map inside srmr_map_loss_term).
+    srmr_map_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    lambda_srmr_map = float(config.get("lambda_srmr_map", 0.0))
+    if srmr_map_head is not None and lambda_srmr_map > 0.0 and batch is not None:
+        sr_loss, sr_metrics = srmr_map_loss_term(
+            srmr_map_head, batch, lambda_srmr_map, device,
+        )
+        if sr_loss is not None:
+            srmr_map_loss = sr_loss.to(lm_loss_prose.dtype)
+            metrics.update(sr_metrics)
+        else:
+            metrics["loss_srmr_map"] = 0.0
+    else:
+        metrics["loss_srmr_map"] = 0.0
+
     lambda_prose = float(config.get("lambda_prose", 1.0))
     lambda_nums = float(config.get("lambda_nums", 0.0))
     lambda_mse = float(config.get("lambda_mse", 0.0))
@@ -747,6 +772,9 @@ def compute_loss(
     # [snr_map] add the dense local-SNR-map term (already scaled by lambda_snr_map inside
     # snr_map_loss_term; 0 when disabled).
     total = total + snr_map_loss
+    # [srmr_map] add the 2D SRMR-modulation-map term (already scaled by lambda_srmr_map
+    # inside srmr_map_loss_term; 0 when disabled).
+    total = total + srmr_map_loss
     metrics["loss_total"] = float(total.detach().item())
     return total, metrics
 
@@ -1065,6 +1093,28 @@ def train(config: dict) -> None:
                   "dataloader will carry no dense targets and the term will no-op. Set "
                   "snr_map_dir to the compute_snr_map_targets.py output.")
 
+    # [srmr_map] Optional SUPERVISED 2D SRMR modulation-energy-map head (the TRUE-2D
+    # grounding branch; Falk et al. TASLP 2010). Regresses the 23x8 (acoustic x
+    # modulation) log-energy map off the WavLM frames against the oracle clean-s1 SRMR
+    # tensor. Built ONLY when lambda_srmr_map > 0, so off-by-default is byte-identical
+    # (no head, no params, loss term no-ops). float32 for regression precision.
+    srmr_map_head: "SupervisedSRMRMapHead | None" = None
+    if float(config.get("lambda_srmr_map", 0.0)) > 0.0:
+        srmr_map_head = SupervisedSRMRMapHead(
+            audio_dim=int(config.get("srmr_map_audio_dim", 1024)),
+            n_acoustic=int(config.get("srmr_map_n_acoustic", 23)),
+            n_modulation=int(config.get("srmr_map_n_modulation", 8)),
+            hidden=int(config.get("srmr_map_hidden", 256)),
+            huber_delta=float(config.get("srmr_map_huber_delta", 1.0)),
+        ).to(device)
+        print(f"[srmr_map] enabled: lambda_srmr_map={config.get('lambda_srmr_map')}, "
+              f"map={config.get('srmr_map_n_acoustic', 23)}x{config.get('srmr_map_n_modulation', 8)}, "
+              f"hidden={config.get('srmr_map_hidden', 256)}")
+        if not config.get("srmr_map_dir"):
+            print("[srmr_map] WARNING: lambda_srmr_map>0 but srmr_map_dir is unset — the "
+                  "dataloader will carry no 2D targets and the term will no-op. Set "
+                  "srmr_map_dir to the compute_srmr_maps.py output.")
+
     # Trainable-parameter summary — printed once at startup and stashed for wandb.run.summary
     # after wandb.init() below. Helps compare adapter vs LoRA/full-FT footprint across runs.
     lm_total = sum(p.numel() for p in llm.parameters())
@@ -1147,13 +1197,22 @@ def train(config: dict) -> None:
     else:
         train_snr_dir = val_snr_dir = snr_map_dir
 
+    # [srmr_map] optional oracle 2D SRMR-modulation-map target dirs (build-A), per split.
+    # Same {split: path} dict or single path convention; None → no targets → no-op.
+    srmr_map_dir = config.get("srmr_map_dir")
+    if isinstance(srmr_map_dir, dict):
+        train_srmr_dir = srmr_map_dir.get("train") or srmr_map_dir.get("train-100")
+        val_srmr_dir = srmr_map_dir.get("val") or srmr_map_dir.get("dev")
+    else:
+        train_srmr_dir = val_srmr_dir = srmr_map_dir
+
     train_set = PreprocessedDataset(
         train_dir, config["descriptions_path"], features_csv=train_csv,
-        snr_map_dir=train_snr_dir,
+        snr_map_dir=train_snr_dir, srmr_map_dir=train_srmr_dir,
     )
     val_set = PreprocessedDataset(
         val_dir, config["descriptions_path"], features_csv=val_csv,
-        snr_map_dir=val_snr_dir,
+        snr_map_dir=val_snr_dir, srmr_map_dir=val_srmr_dir,
     )
     assert train_set.descriptions is not None, f"Descriptions not found: {config['descriptions_path']}"
     print(f"Loaded: train={len(train_set)}, val={len(val_set)}")
@@ -1212,6 +1271,10 @@ def train(config: dict) -> None:
         # [snr_map] dense local-SNR-map head, also at adapter LR. Its conv/proj train
         # on the parallel dense Huber against the stem-derived oracle target.
         param_groups.append({"params": snr_map_head.parameters(), "lr": config["lr_adapter"]})
+    if srmr_map_head is not None:
+        # [srmr_map] 2D SRMR-modulation-map head, also at adapter LR. Its MLP trains on
+        # the parallel masked Huber against the clean-s1 oracle 23x8 log-energy tensor.
+        param_groups.append({"params": srmr_map_head.parameters(), "lr": config["lr_adapter"]})
     if encoder_unfreeze_params:
         # [encoder-unfreeze] the unfrozen top-N SSL-encoder blocks get their OWN group
         # at lr_encoder — a small LR (e.g. 1e-5) distinct from the adapter LR so
@@ -1286,6 +1349,8 @@ def train(config: dict) -> None:
             decoupled_head.load_state_dict(checkpoint["decoupled_head_state_dict"])
         if snr_map_head is not None and "snr_map_head_state_dict" in checkpoint:  # [snr_map]
             snr_map_head.load_state_dict(checkpoint["snr_map_head_state_dict"])
+        if srmr_map_head is not None and "srmr_map_head_state_dict" in checkpoint:  # [srmr_map]
+            srmr_map_head.load_state_dict(checkpoint["srmr_map_head_state_dict"])
         # best.pt no longer carries optimizer/scheduler (inference-only). Resuming is
         # meant to use last.pt, which does. Guard so resuming from a best.pt (or any
         # optimizer-less ckpt) doesn't KeyError — it just starts fresh optimizer state.
@@ -1437,6 +1502,7 @@ def train(config: dict) -> None:
                 section_ctx=section_ctx,
                 decoupled_head=decoupled_head,   # [decoupled_grounding]
                 snr_map_head=snr_map_head,       # [snr_map] dense local-SNR-map head
+                srmr_map_head=srmr_map_head,     # [srmr_map] 2D SRMR-modulation-map head
                 batch=batch,                     # heads read audio_features/beats/gt off it
             )
             loss = loss / accum_steps
@@ -1473,6 +1539,8 @@ def train(config: dict) -> None:
                     torch.nn.utils.clip_grad_norm_(decoupled_head.parameters(), config["grad_clip"])
                 if snr_map_head is not None:  # [snr_map] clip the dense-map head too
                     torch.nn.utils.clip_grad_norm_(snr_map_head.parameters(), config["grad_clip"])
+                if srmr_map_head is not None:  # [srmr_map] clip the 2D SRMR-map head too
+                    torch.nn.utils.clip_grad_norm_(srmr_map_head.parameters(), config["grad_clip"])
                 if encoder_unfreeze_params:  # [encoder-unfreeze] clip the unfrozen encoder blocks
                     torch.nn.utils.clip_grad_norm_(encoder_unfreeze_params, config["grad_clip"])
                 optimizer.step()
@@ -1530,6 +1598,13 @@ def train(config: dict) -> None:
                     log_payload["lambda_snr_map"] = float(config.get("lambda_snr_map", 0.0))
                     for k in ("snr_map_mae", "loss_snr_scalar", "snr_pooled_mae",
                               "loss_snr_irm", "snr_irm_mae"):
+                        if k in loss_metrics:
+                            log_payload[f"train_{k}"] = loss_metrics[k]
+                # [srmr_map] surface the 2D SRMR-map loss + MAE.
+                if loss_metrics.get("loss_srmr_map", 0.0):
+                    log_payload["train_loss_srmr_map"] = loss_metrics["loss_srmr_map"]
+                    log_payload["lambda_srmr_map"] = float(config.get("lambda_srmr_map", 0.0))
+                    for k in ("srmr_map_mae", "srmr_map_n_bands"):
                         if k in loss_metrics:
                             log_payload[f"train_{k}"] = loss_metrics[k]
                 wandb.log(log_payload)
@@ -1877,6 +1952,8 @@ def train(config: dict) -> None:
                 payload["decoupled_head_state_dict"] = decoupled_head.state_dict()
             if snr_map_head is not None:  # [snr_map]
                 payload["snr_map_head_state_dict"] = snr_map_head.state_dict()
+            if srmr_map_head is not None:  # [srmr_map]
+                payload["srmr_map_head_state_dict"] = srmr_map_head.state_dict()
             # [encoder-unfreeze] persist ONLY the unfrozen (requires_grad) encoder
             # params so the fine-tuned top-N blocks survive a reload without bloating
             # the ckpt with the frozen backbone (restored from from_pretrained / the

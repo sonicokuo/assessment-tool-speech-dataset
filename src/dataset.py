@@ -26,6 +26,7 @@ class PreprocessedDataset(Dataset):
         descriptions_path: str | None = None,
         features_csv: str | None = None,
         snr_map_dir: str | None = None,
+        srmr_map_dir: str | None = None,
     ):
         self.data_dir = data_dir
         self.files = sorted([f for f in os.listdir(data_dir) if f.endswith(".pt")])
@@ -47,6 +48,19 @@ class PreprocessedDataset(Dataset):
             if os.path.exists(man):
                 with open(man) as f:
                     self.snr_map_manifest = json.load(f)
+
+        # srmr_map_dir → oracle 2D (acoustic x modulation) SRMR-modulation-energy map
+        # targets (build-A, the TRUE-2D grounding field), one small per-clip .pt keyed
+        # by filename via manifest.json (written by scripts/compute_srmr_maps.py). Loaded
+        # LAZILY in __getitem__. Absent dir / manifest → no targets → srmr_map_loss_term
+        # is a silent no-op (default-off byte-identical).
+        self.srmr_map_dir = srmr_map_dir
+        self.srmr_map_manifest: dict[str, str] = {}
+        if srmr_map_dir:
+            man = os.path.join(srmr_map_dir, "manifest.json")
+            if os.path.exists(man):
+                with open(man) as f:
+                    self.srmr_map_manifest = json.load(f)
 
         # features_csv → per-clip GT scalars and bare-numbers target string for B-full.
         # Map filename → CSV row dict. Keys missing from the map fall back to
@@ -97,6 +111,18 @@ class PreprocessedDataset(Dataset):
                         result["snr_map_mask"] = tgt["snr_map_mask"]          # (T,)
                     if "snr_irm_target" in tgt:
                         result["snr_irm_target"] = tgt["snr_irm_target"]      # (T_p, F)
+
+        # Oracle 2D SRMR modulation-energy map target (lazy load by filename). The head
+        # regresses the per-(acoustic, modulation) log-energy map; absent → loss no-ops.
+        if self.srmr_map_manifest:
+            rel = self.srmr_map_manifest.get(filename)
+            if rel is not None:
+                tgt_path = os.path.join(self.srmr_map_dir, rel)
+                if os.path.exists(tgt_path):
+                    tgt = torch.load(tgt_path, weights_only=False)
+                    result["srmr_map_target"] = tgt["srmr_logmap"]           # (A, M)
+                    if "srmr_mask" in tgt:
+                        result["srmr_map_mask"] = tgt["srmr_mask"]           # (A, M)
 
         if self.descriptions and stem in self.descriptions:
             result["target_text"] = self.descriptions[stem]
@@ -171,6 +197,24 @@ def collate_fn(batch):
                     snr_msk[i, :L] = 1.0   # no explicit mask → supervise all real frames
         out["snr_map_target"] = snr_tgt
         out["snr_map_mask"] = snr_msk
+
+    # Oracle 2D SRMR modulation-energy map target. Fixed (A, M) per clip (default 23x8),
+    # so a plain stack with a per-clip all-ones/all-zero mask. Clips without the key get
+    # an all-zero target + all-zero mask, so srmr_map_loss_term contributes nothing for
+    # them; the key is absent entirely (full no-op) when NO clip carries it.
+    if any("srmr_map_target" in item for item in batch):
+        ref = next(item["srmr_map_target"] for item in batch if "srmr_map_target" in item)
+        A, M = ref.shape[0], ref.shape[1]
+        srmr_tgt = torch.zeros(B, A, M)
+        srmr_msk = torch.zeros(B, A, M)
+        for i, item in enumerate(batch):
+            t = item.get("srmr_map_target")
+            if t is not None and t.shape[0] == A and t.shape[1] == M:
+                srmr_tgt[i] = t.float()
+                m = item.get("srmr_map_mask")
+                srmr_msk[i] = m.float() if (m is not None) else torch.ones(A, M)
+        out["srmr_map_target"] = srmr_tgt
+        out["srmr_map_mask"] = srmr_msk
 
     # Oracle IRM grid target (optional). Variable T_p per clip → pad to the batch max
     # T_p with a (B, T_p_max) validity mask (True on real time-patches).
