@@ -26,6 +26,7 @@ from sfs import HybridClaimParser, SFSScorer
 from dataset import PreprocessedDataset, collate_fn
 from text_metrics import compute_generation_metrics
 from feature_set import FEATURE_SCALES, N_FEATURES
+from ntl import digit_token_ids, number_token_loss
 from section_tags import (
     SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
     SECTION_TAGS,
@@ -430,6 +431,21 @@ def _inject_section_summaries(
     return target_embeds + additive
 
 
+# NTL needs the 10 single-digit token ids for the active tokenizer. They never
+# change for a given tokenizer, so resolve them once and cache by tokenizer
+# identity (keyed by id(tokenizer)) to avoid re-encoding every step.
+_DIGIT_IDS_CACHE: dict[int, torch.Tensor] = {}
+
+
+def _get_digit_ids(tokenizer: PreTrainedTokenizerBase) -> torch.Tensor:
+    key = id(tokenizer)
+    cached = _DIGIT_IDS_CACHE.get(key)
+    if cached is None:
+        cached = digit_token_ids(tokenizer)
+        _DIGIT_IDS_CACHE[key] = cached
+    return cached
+
+
 def _ce_against_target(
     llm: nn.Module,
     embed_layer: nn.Module,
@@ -440,11 +456,21 @@ def _ce_against_target(
     max_length: int,
     device: torch.device,
     section_ctx: dict | None = None,
-) -> torch.Tensor:
+    return_ntl_tensors: bool = False,
+) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """Run one LM forward (prefix + prompt + target) and return CE loss on the target tokens.
 
     Tokens of the prefix and prompt are masked out via -100 labels so the loss reflects
     only the autoregressive prediction of the target tokens.
+
+    When return_ntl_tensors=True, ALSO returns the tensors needed by the Number Token
+    Loss WITHOUT a second LM forward — they are sliced from the same outputs:
+        (loss, ntl_logits, ntl_target_ids, ntl_target_mask)
+    Here ntl_logits[b, j] is the next-token-shifted distribution that predicts the
+    target token ntl_target_ids[b, j] (HF computes CE with an internal shift; we
+    reproduce that shift so NTL reads the SAME predicted distribution CE scores).
+    ntl_target_mask is the per-position content mask (1 at real target tokens incl.
+    EOS, 0 at padding). All three cover only the L target positions.
 
     Section-query injection (when section_ctx is provided):
       - mode="static":  precomputed per-section e_all is gathered by section_idx
@@ -485,7 +511,22 @@ def _ce_against_target(
     labels = torch.cat([ignore_labels, target_labels], dim=1)
 
     outputs = llm(inputs_embeds=inputs_embeds, labels=labels)
-    return outputs.loss
+    if not return_ntl_tensors:
+        return outputs.loss
+
+    # ── NTL tensor extraction (no extra LM forward) ──────────────────────────
+    # outputs.logits is (B, S, V), S = N + P + L. HF's CE shifts internally:
+    # logits[:, i] predicts token at position i+1. The L target tokens sit at
+    # sequence positions [N+P, N+P+L). So the distribution that predicts the
+    # target token at target-index j is logits[:, (N+P) + j - 1]. Sliced over
+    # j in [0, L): logits[:, N+P-1 : N+P+L-1]. Aligns ntl_logits[b, j] with
+    # target_ids[b, j] exactly as CE does, so NTL reads the same predictions.
+    L = target_ids.shape[1]
+    start = N + P - 1
+    ntl_logits = outputs.logits[:, start:start + L, :]   # (B, L, V)
+    ntl_target_ids = target_ids                          # (B, L)
+    ntl_target_mask = target_attn                        # (B, L) 1 at content incl. EOS
+    return outputs.loss, ntl_logits, ntl_target_ids, ntl_target_mask
 
 
 def compute_loss(
@@ -552,14 +593,46 @@ def compute_loss(
     # Prose CE loss (always computed). When use_sections=true, section_ctx is
     # threaded through so the per-section audio summaries get residually
     # injected into the target embeddings at <sec_X> open positions.
-    lm_loss_prose = _ce_against_target(
-        llm, embed_layer, tokenizer,
-        prefix_embeds, prompt_ids, target_text,
-        max_length=config["max_target_length"],
-        device=device,
-        section_ctx=section_ctx,
-    )
+    #
+    # [ntl] Number Token Loss (arXiv 2411.02083, WAS/abs variant). When
+    # lambda_ntl > 0 we ask the SAME prose forward to also hand back the
+    # next-token-shifted logits + target ids so we can add an ordinal penalty on
+    # the prose's digit positions — fixing CE's nominal-digit dilution without a
+    # second forward. lambda_ntl <= 0 → byte-identical to before (plain CE,
+    # single return value, no NTL tensors built).
+    lambda_ntl = float(config.get("lambda_ntl", 0.0))
+    want_ntl = lambda_ntl > 0.0
+    if want_ntl:
+        lm_loss_prose, ntl_logits, ntl_target_ids, ntl_target_mask = _ce_against_target(
+            llm, embed_layer, tokenizer,
+            prefix_embeds, prompt_ids, target_text,
+            max_length=config["max_target_length"],
+            device=device,
+            section_ctx=section_ctx,
+            return_ntl_tensors=True,
+        )
+    else:
+        lm_loss_prose = _ce_against_target(
+            llm, embed_layer, tokenizer,
+            prefix_embeds, prompt_ids, target_text,
+            max_length=config["max_target_length"],
+            device=device,
+            section_ctx=section_ctx,
+        )
     metrics["loss_lm_prose"] = float(lm_loss_prose.detach().item())
+
+    # [ntl] Ordinal digit penalty on the prose target's digit positions. Masked to
+    # content tokens (no padding), 0 when there are no digit targets in the batch.
+    ntl_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    if want_ntl:
+        digit_ids = _get_digit_ids(tokenizer)
+        ntl_loss = number_token_loss(
+            ntl_logits.float(), ntl_target_ids, digit_ids,
+            target_mask=ntl_target_mask,
+        ).to(lm_loss_prose.dtype)
+        metrics["loss_ntl"] = float(ntl_loss.detach().item())
+    else:
+        metrics["loss_ntl"] = 0.0
 
     # [section_readout] Grounding loss. Regresses each section's acoustic scalar
     # out of z = alpha · V.detach() (the attention output), pushing alpha onto
@@ -759,6 +832,11 @@ def compute_loss(
     lambda_nll = float(config.get("lambda_nll", 0.0))
 
     total = lambda_prose * lm_loss_prose + lambda_nums * lm_loss_nums + lambda_mse * mse_loss
+    # [ntl] add the Number Token Loss on prose digit positions (ntl_loss is 0 when
+    # lambda_ntl <= 0 or the batch has no digit targets). lambda_ntl default 0.3
+    # (paper default); it is the ordinal complement to the prose CE, so it scales
+    # the same prose forward's digit gradient — keep it modest to preserve fluency.
+    total = total + lambda_ntl * ntl_loss
     # [reliability_head] add the heteroscedastic NLL term (nll_loss is 0 when the head
     # is absent or lambda_nll == 0). Note: NLL and plain MSE can be used together (NLL
     # trains the variance, MSE keeps a clean mean gradient) or NLL alone — set
@@ -1210,8 +1288,18 @@ def train(config: dict) -> None:
         train_dir, config["descriptions_path"], features_csv=train_csv,
         snr_map_dir=train_snr_dir, srmr_map_dir=train_srmr_dir,
     )
+    # The dataset keys descriptions by clip stem and looks up the CURRENT split's
+    # stems in whatever JSON it is handed. The legacy single combined JSON (e.g.
+    # descriptions_observability_all.json) contains every split's stems, so one
+    # `descriptions_path` resolves both train and val. The NEW canonical builder
+    # writes SPLIT-LOCAL files (descriptions_canonical_{train,dev,test}.json), so the
+    # train file does NOT contain val stems — val target_text would silently never
+    # resolve. `descriptions_path_val` (optional) lets a split-local setup point the
+    # val dataset at the dev JSON. Absent → falls back to descriptions_path, so every
+    # existing combined-JSON config is byte-identical.
+    val_descriptions_path = config.get("descriptions_path_val") or config["descriptions_path"]
     val_set = PreprocessedDataset(
-        val_dir, config["descriptions_path"], features_csv=val_csv,
+        val_dir, val_descriptions_path, features_csv=val_csv,
         snr_map_dir=val_snr_dir, srmr_map_dir=val_srmr_dir,
     )
     assert train_set.descriptions is not None, f"Descriptions not found: {config['descriptions_path']}"
@@ -1563,6 +1651,12 @@ def train(config: dict) -> None:
                     "lr": scheduler.get_last_lr()[0],
                     "step": n_steps + epoch * len(train_loader),
                 }
+                # [ntl] surface the Number Token Loss when active (0 / absent when
+                # lambda_ntl <= 0). THE signal for whether digit accuracy is being
+                # supervised ordinally rather than nominally.
+                if loss_metrics.get("loss_ntl", 0.0):
+                    log_payload["train_loss_ntl"] = loss_metrics["loss_ntl"]
+                    log_payload["lambda_ntl"] = float(config.get("lambda_ntl", 0.0))
                 # [section_readout] surface the grounding loss + per-feature MAE
                 # (computed in compute_loss but otherwise discarded). These are
                 # THE signal for whether attention is becoming grounded.

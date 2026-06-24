@@ -1,13 +1,13 @@
-"""Canonical 8-feature list for AQUA-NL B-full multi-task training and the aux regression head.
+"""Canonical 12-feature list for the new-project multi-task training and the aux regression head.
 
 Single source of truth for:
-  - The numerical target string used in B-full's forward A ("snr=15.66 srmr=4.5 ...").
-  - The (B, 8) scalar tensor + mask used by the aux regression head's MSE.
+  - The numerical target string used in forward A ("snr=15.66 srmr=4.5 ...").
+  - The (B, 12) scalar tensor + mask used by the aux regression head's MSE.
 
-These 8 features are the scalar entries inside src/section_tags.py's catalog —
-one per <f_*> open tag, excluding the overlap_segments span set (which isn't a
-scalar). Order MUST stay synced with the scalar entries of FEATURE_TAGS in
-section_tags.py.
+The order matches the canonical descriptions builder
+(scripts/build_canonical_descriptions.py), which emits the 12 features in this
+fixed sequence: snr, srmr, hnr, f0_mean, f0_sd, jitter, shimmer, speaking_rate,
+articulation_rate, pause_count, pause_rate, overlap_ratio.
 
 Update history:
   - 2026-05-11: trimmed from 13 → 7 (drop f0_sd, jitter, shimmer, srmr,
@@ -18,6 +18,13 @@ Update history:
     are dropped — duration is an intro sentence outside any section; hnr was
     grouped under voice_quality which we cut to avoid a redundant attention
     figure with pitch.
+  - 2026-06-24: EXPANDED 8 → 12 for the new full-feature run. Re-added hnr,
+    jitter, shimmer, articulation_rate to match the canonical 12-feature
+    descriptions (data/descriptions_canonical_{train,dev,test}.json). The order
+    is realigned to the canonical builder: voice-quality scalars (hnr, jitter,
+    shimmer) sit next to pitch (f0_mean, f0_sd); articulation_rate next to
+    speaking_rate. The aux head dim (adapter.N_AUX_FEATURES) reads N_FEATURES so
+    it auto-tracks this list.
 """
 
 from __future__ import annotations
@@ -28,19 +35,25 @@ import torch
 
 
 # (short_name, csv_column, format_string)
-# Order matches the scalar tags in src/section_tags.py::FEATURE_TAGS.
+# Order matches the canonical descriptions builder (scripts/build_canonical_descriptions.py):
+#   snr, srmr, hnr, f0_mean, f0_sd, jitter, shimmer, speaking_rate,
+#   articulation_rate, pause_count, pause_rate, overlap_ratio.
 SUPERVISED_FEATURES: list[tuple[str, str, str]] = [
     ("snr",               "snr_db",                          "{:.2f}"),
     ("srmr",              "srmr",                            "{:.4f}"),
+    ("hnr",               "hnr_db",                          "{:.2f}"),
     ("f0_mean",           "f0_mean_hz",                      "{:.2f}"),
     ("f0_sd",             "f0_sd_hz",                        "{:.2f}"),
+    ("jitter",            "jitter_local_pct",                "{:.2f}"),
+    ("shimmer",           "shimmer_pct",                     "{:.2f}"),
     ("speaking_rate",     "praat_speaking_rate_syl_sec",     "{:.3f}"),
+    ("articulation_rate", "praat_articulation_rate_syl_sec", "{:.3f}"),
     ("pause_count",       "praat_pause_count",               "{:d}"),
     ("pause_rate",        "praat_pause_rate_per_min",        "{:.3f}"),
     ("overlap_ratio",     "overlap_ratio",                   "{:.4f}"),
 ]
 
-N_FEATURES: int = len(SUPERVISED_FEATURES)  # 8
+N_FEATURES: int = len(SUPERVISED_FEATURES)  # 12
 
 
 # Per-feature scales used to NORMALIZE the auxiliary-head MSE.
@@ -52,9 +65,13 @@ N_FEATURES: int = len(SUPERVISED_FEATURES)  # 8
 FEATURE_SCALES: tuple[float, ...] = (
     5.0,    # snr  (dB, typical ~15)
     2.0,    # srmr  (typical ~5)
+    20.0,   # hnr  (dB, typical ~15-20)
     50.0,   # f0_mean  (Hz, typical ~150)
     20.0,   # f0_sd  (Hz, typical ~40)
+    2.0,    # jitter  (pct, typical ~1-2)
+    8.0,    # shimmer  (pct, typical ~6-8)
     2.0,    # speaking_rate  (syl/sec, typical ~6)
+    6.0,    # articulation_rate  (syl/sec, typical ~6)
     3.0,    # pause_count  (count, typical ~3)
     5.0,    # pause_rate  (per min, typical ~10)
     0.3,    # overlap_ratio  (typical ~0.5)
@@ -74,11 +91,18 @@ assert len(FEATURE_SCALES) == N_FEATURES, "FEATURE_SCALES length must match SUPE
 # ILL_POSED is recoverable by default. These are LABELS only — they do not change any
 # training math unless an experiment explicitly consumes them (e.g. risk-coverage
 # stratification), so adding them is a no-op for existing runs.
+# 2026-06-24: extended to the 12-feature set. The voice-quality scalars (hnr,
+# jitter, shimmer) join pitch (f0_mean, f0_sd) as ILL_POSED: they are derived from
+# a single speaker's periodicity/cycle-to-cycle perturbation, which a 2-speaker mix
+# corrupts the same way it corrupts pitch — the model should abstain on them under
+# overlap. articulation_rate joins speaking_rate as RECOVERABLE (rate/timing
+# features survive mixing well enough to keep emitting a number).
 RECOVERABLE_FEATURES: frozenset[str] = frozenset({
-    "snr", "srmr", "speaking_rate", "pause_count", "pause_rate", "overlap_ratio",
+    "snr", "srmr", "speaking_rate", "articulation_rate",
+    "pause_count", "pause_rate", "overlap_ratio",
 })
 ILL_POSED_UNDER_OVERLAP_FEATURES: frozenset[str] = frozenset({
-    "f0_mean", "f0_sd",
+    "f0_mean", "f0_sd", "jitter", "shimmer", "hnr",
 })
 
 # Per-feature index lookups, in SUPERVISED_FEATURES order, for the reliability head /
@@ -171,11 +195,11 @@ def build_nums_target(row: dict) -> str:
 
 
 def extract_scalars(row: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract the (13,) scalar tensor + (13,) bool mask for the aux regression head.
+    """Extract the (N_FEATURES,) scalar tensor + (N_FEATURES,) bool mask for the aux head.
 
     Returns:
-        scalars: float32 tensor of shape (13,) — values, with 0.0 substituted for missing.
-        mask:    bool tensor of shape (13,) — True where the original CSV value was present.
+        scalars: float32 tensor of shape (N_FEATURES,) — values, 0.0 substituted for missing.
+        mask:    bool tensor of shape (N_FEATURES,) — True where the CSV value was present.
 
     The mask is used by compute_loss to zero out MSE contribution from missing slots,
     so the aux head isn't penalized for "this clip has no F0".

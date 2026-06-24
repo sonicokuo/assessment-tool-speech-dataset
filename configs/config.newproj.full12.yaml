@@ -1,0 +1,138 @@
+# config.newproj.full12.yaml
+#
+# NEW-PROJECT FULL-FEATURE training recipe (codename undecided — wandb project is a
+# placeholder, NOT aqua-nl-emnlp). This is config.psc.emnlp.v24snrmap.yaml (the best
+# LoRA-8B grounding recipe) re-pointed at the CANONICAL 12-FEATURE data and extended
+# with the Number Token Loss (NTL-WAS, arXiv 2411.02083) so the prose forward's digit
+# spans get an ordinal regression signal instead of nominal CE.
+#
+# CHANGES vs config.psc.emnlp.v24snrmap.yaml (every change documented inline below):
+#   1. descriptions_path -> descriptions_canonical_train.json  (12-feature, abstention-
+#      aware prose; dev/test counterparts added under descriptions_path_{val,test}).
+#   2. lambda_ntl: 0.3                  ENABLE Number Token Loss on prose digit positions.
+#   3. wandb_project: speech-quality-desc   NEW placeholder project (NOT aqua-nl-emnlp).
+#   4. wandb_run_name / save_dir        renamed to newproj_full12 to avoid clobbering v24.
+#   5. max_target_length: 512           already 512 in v24; kept — the 12-feature canonical
+#                                       prose (with the abstention paragraph) is longer than
+#                                       the 8-feature target, so the full 512 budget is needed.
+#
+# UNCHANGED but load-bearing for this run (so it is a clean drop-in comparison with v24):
+#   - The aux regression head + bare-numbers nums_target auto-EXPAND to 12 features: both
+#     read src/feature_set.py::SUPERVISED_FEATURES (now 12) and adapter.N_AUX_FEATURES =
+#     feature_set.N_FEATURES. No per-feature config knob changes here; lambda_nums (0.3) and
+#     lambda_mse (0.0) stay as v24 set them. The 12-wide masked-MSE GT + presence mask flow
+#     from dataset.py automatically.
+#   - snr_map head KEPT ON (lambda_snr_map 0.5, snr_map_targets_aug, snr_map_snr_bias 5.0) —
+#     the deletion-faithful dense local-SNR grounding that is the headline novelty.
+#   - reliability_head: true (heteroscedastic abstention head) + lambda_nll 0.3 KEPT ON —
+#     the per-feature uncertainty / abstention signal, which now also covers the 5 ill-posed
+#     features (f0_mean, f0_sd, jitter, shimmer, hnr) per feature_set's observability split.
+#
+# CANONICAL TUPLE:
+#   data_dir          = processed_aug                              (41700 train / 3000 val / 3000 test)
+#   descriptions_path = descriptions_canonical_train.json          (12-feature, abstention-aware)
+#   features_csv.train= features_aug_train_cleangt.csv             (has all 12 feature columns)
+#   features_csv.val  = dev_cleanf0.csv                            (clean-F0 val regime)
+#   snr_map_dir       = snr_map_targets_aug/{train,dev}            (general per-suffix oracle, ALL 41700)
+
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-08
+adapter_variant: film-mamba
+batch_size: 6
+beats_cached: false
+bf16: true
+data_dir: /ocean/projects/cis260125p/shared/data/processed_aug
+# [CHANGE 1] canonical 12-feature, abstention-aware training targets.
+# NOTE: the canonical builder writes SPLIT-LOCAL files, so descriptions_path holds
+# TRAIN stems only. train.py reads descriptions_path_val (added) for the val dataset so
+# val target_text resolves; without it val descriptions would silently be empty.
+descriptions_path: /ocean/projects/cis260125p/shared/data/descriptions_canonical_train.json
+descriptions_path_val: /ocean/projects/cis260125p/shared/data/descriptions_canonical_dev.json
+# Reference value for the TEST split. inference.py reads descriptions_path; at eval time
+# override it with this test JSON (python src/inference.py --config ... and point
+# descriptions_path at descriptions_canonical_test.json, or set it here before eval).
+descriptions_path_test: /ocean/projects/cis260125p/shared/data/descriptions_canonical_test.json
+epochs: 12
+eval_every_epoch: 1
+features_csv:
+  train: /ocean/projects/cis260125p/shared/data/features_aug_train_cleangt.csv
+  val: /ocean/projects/cis260125p/shared/data/features_pyannote/dev_cleanf0.csv
+features_path: /ocean/projects/cis260125p/shared/data/features.json
+grad_clip: 1.0
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+# [12-feature aux head] lambda_mse 0.0 (as v24): the MSE head is OFF; the heteroscedastic
+# NLL (lambda_nll) is the active aux-scalar term. Both auto-expand to 12 features.
+lambda_mse: 0.0
+lambda_nll: 0.3
+# [12-feature nums target] bare-numbers forward A, now emits all 12 features.
+lambda_nums: 0.3
+lambda_prose: 1.0
+# [CHANGE 2] Number Token Loss (NTL-WAS, arXiv 2411.02083). 0.3 = paper default. Adds an
+# ordinal |E_pred_digit - target_digit| penalty on the prose target's digit positions,
+# fixing CE's nominal-digit dilution without a second LM forward. <= 0 would disable it
+# (byte-identical to the no-NTL path).
+lambda_ntl: 0.3
+lambda_snr_irm: 0.0
+# [snr_map KEPT ON] deletion-faithful dense local-SNR grounding (the headline novelty).
+lambda_snr_map: 0.5
+lambda_snr_scalar: 0.0
+lm_name: Qwen/Qwen3-8B
+log_every: 10
+lora_alpha: 32
+lora_dropout: 0.05
+lora_rank: 16
+lora_targets:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+lr_adapter: 0.0001
+lr_encoder: 1.0e-05
+lr_lm: 1.0e-05
+lr_scheduler: cosine
+max_nums_length: 96   # 12 features → the bare-numbers string is longer than the 8-feature run
+# [CHANGE 5] 512: the 12-feature canonical prose + abstention paragraph runs ~300-450 tokens.
+max_target_length: 512
+min_lr_ratio: 0.0
+num_workers: 4
+optimizer: adamw
+pin_memory: true
+prompt: Describe the quality of this recording.
+prompt_nums: 'List the numerical features of this recording:'
+prompt_prose: Describe the quality of this recording.
+# [reliability_head KEPT ON] heteroscedastic abstention head (now covers the 5 ill-posed
+# features per feature_set's RECOVERABLE/ILL_POSED split).
+reliability_head: true
+resume_from: null
+save_dir: /ocean/projects/cis260125p/shared/checkpoints/newproj_full12
+score_overlap_spans: false
+seed: 73
+snr_map_dir:
+  train: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/train
+  val: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/dev
+snr_map_huber_delta: 1.0
+snr_map_hidden: 256
+snr_map_kernel_size: 5
+snr_map_predict_irm: false
+snr_map_snr_bias: 5.0
+tagged_mode: false
+temperature: 1.0
+top_k: 0
+top_p: 1.0
+unfreeze_beats_top_n: 0
+unfreeze_wavlm_top_n: 0
+use_sections: false
+val_sfs_n: 32
+val_subset_size: 256
+wandb_entity: speech_quality_adapter
+# [CHANGE 3] NEW placeholder wandb project — NOT aqua-nl-emnlp.
+wandb_project: speech-quality-desc
+# [CHANGE 4] renamed run so it does not clobber the v24 run/checkpoint.
+wandb_run_name: newproj-full12
+warmup_ratio: 0.03
+weight_decay: 0.01

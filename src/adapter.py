@@ -5,6 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import Mamba
 
+# The aux regression head's output dim MUST equal the number of supervised
+# features. Read it from feature_set (the single source of truth) so expanding
+# SUPERVISED_FEATURES (e.g. 8 → 12) auto-tracks the head, the masked-MSE GT
+# tensor, and the presence mask without a second edit here.
+from feature_set import N_FEATURES as _FS_N_FEATURES
+
 # ── Constants ──────────────────────────────────────────────
 MODEL_DIM = 1024
 LM_DIM = 4096  # LM hidden dims
@@ -20,7 +26,7 @@ AUDIO_DIM = 1024  # WavLM output dims
 # Old checkpoints (5-channel) are incompatible with this 4-channel layout; retrain after upgrading.
 OVERLAP_FEATURES = 4
 OVERLAP_DIM = 32  # output of OverlapEmbedding to learn representation
-N_AUX_FEATURES = 8  # matches src/feature_set.py::N_FEATURES; aux regression head output size
+N_AUX_FEATURES = _FS_N_FEATURES  # = feature_set.N_FEATURES (12); aux regression head output size
 
 
 # ── Components ──────────────────────────────────────────────
@@ -443,8 +449,8 @@ def build_adapter(
         with_aux_head: if True (default), wraps the variant with AdapterWithAuxHead so
                        forward returns (prefix, scalar_pred). Set False to retain the
                        legacy single-tensor return signature (e.g. for old checkpoints).
-        n_aux_features: number of scalar features the aux head regresses to (default 13,
-                       matching src/feature_set.py::N_FEATURES).
+        n_aux_features: number of scalar features the aux head regresses to (default
+                       N_AUX_FEATURES = feature_set.N_FEATURES = 12).
         reliability_head: if True, the aux head is the HETEROSCEDASTIC ReliabilityHead
                        (predicts per-feature mean AND log-variance), and forward returns
                        (prefix, (mean, log_var)). Default False → plain Linear mean head,
