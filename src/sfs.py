@@ -141,7 +141,7 @@ class ClaimParser:
         ),  # special handling: feature name includes F1/F2/etc
         # SNR (also matches "Signal-to-Noise Ratio (SNR) is 18.54 dB")
         (
-            r"(?:Signal-to-Noise\s+Ratio\s*(?:\(SNR\))?\s*|SNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+|estimated at\s+)?(\d+\.?\d*)\s*dB",
+            r"(?:Signal-to-Noise\s+Ratio\s*(?:\(SNR\))?\s*|SNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+|estimated at\s+)?(-?\d+\.?\d*)\s*dB",
             [("snr", 1, "dB")],
         ),
         # SNR — leading-number form used by the observability builder:
@@ -152,14 +152,14 @@ class ClaimParser:
         # value bound to snr. The gap "(?:[^.]|\.\d)*?" allows decimals but
         # blocks a sentence boundary so the match can't cross sentences.
         (
-            r"(\d+\.?\d*)\s*dB[,]?(?:[^.]|\.\d)*?(?:signal-to-noise\s+ratio|\bSNR\b)",
+            r"(-?\d+\.?\d*)\s*dB[,]?(?:[^.]|\.\d)*?(?:signal-to-noise\s+ratio|\bSNR\b)",
             [("snr", 1, "dB")],
         ),
         # RT60
         (r"RT60\s*(?:=|≈|~|<|>|is)\s*(?:approximately\s+)?(\d+\.?\d*)\s*s", [("rt60", 1, "s")]),
         # HNR (also matches "Harmonics-to-Noise Ratio (HNR) of 12.59 dB")
         (
-            r"(?:Harmonics?-to-Noise\s+Ratio\s*(?:\(HNR\))?\s*|HNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+)?(\d+\.?\d*)\s*dB",
+            r"(?:Harmonics?-to-Noise\s+Ratio\s*(?:\(HNR\))?\s*|HNR\s*)(?:=|≈|~|is|of)\s*(?:approximately\s+)?(-?\d+\.?\d*)\s*dB",
             [("hnr", 1, "dB")],
         ),
         # Speaking rate — tightened to ONLY match "speaking rate", not bare "rate",
