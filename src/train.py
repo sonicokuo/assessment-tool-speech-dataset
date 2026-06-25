@@ -1916,6 +1916,10 @@ def train(config: dict) -> None:
                             max_new_tokens=config.get("max_target_length", 256),
                             do_sample=False,
                             pad_token_id=tokenizer.pad_token_id,
+                            # Stop on the SAME EOS the target was trained to emit
+                            # (_tokenize_with_eos appends tokenizer.eos_token_id). Explicit
+                            # so decode termination can't drift from the model-config default.
+                            eos_token_id=tokenizer.eos_token_id,
                         )
                         gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
 
@@ -1942,10 +1946,31 @@ def train(config: dict) -> None:
                         p = r = f1 = 0.0
                     sfs_precs.append(p); sfs_recs.append(r); sfs_f1s.append(f1)
 
+                    # Per-clip band-free diagnostics for the val_samples table:
+                    # parsed preds, clean GT (from target text), abs error per canonical
+                    # feature. SRCC/nMAE are POPULATION-level (computed after the loop), so
+                    # the per-clip table shows abs-error, not SRCC. Store FULL text — the
+                    # old [:400] slice truncated away pause_count/pause_rate/overlap_ratio
+                    # (mentioned past char ~400), hiding them from the post-hoc band-free eval.
+                    import json as _json_row
+                    _pred_vals = {c.feature: c.value for c in pred_claims
+                                  if c.feature in SELECTION_FEATURES}
+                    _clip_gt_t = {c.feature: c.value for c in target_claims
+                                  if c.feature in SELECTION_FEATURES}
+                    _pf_abs_err = {}
+                    for _feat, _gtv in _clip_gt_t.items():
+                        _pv = _pred_vals.get(_feat)
+                        _pf_abs_err[_feat] = {
+                            "pred": (round(_pv, 4) if _pv is not None else None),
+                            "gt": round(_gtv, 4),
+                            "abs_err": (round(abs(_pv - _gtv), 4) if _pv is not None else None),
+                        }
+                    _n_matched = sum(1 for v in _pf_abs_err.values() if v["pred"] is not None)
                     sample_rows.append(
                         (epoch + 1, sample.get("filename", "?"),
-                         target_text[:400], gen_text[:400],
-                         round(p, 3), round(r, 3), round(f1, 3))
+                         target_text, gen_text,
+                         _n_matched, len(_clip_gt_t),
+                         _json_row.dumps(_pf_abs_err, ensure_ascii=False))
                     )
 
                     # Band-free selection: stash the FULL generation, the filename,
@@ -1975,7 +2000,7 @@ def train(config: dict) -> None:
             table = None
             if log_val_samples_table:
                 table = wandb.Table(columns=["epoch", "filename", "target", "generated",
-                                             "sfs_precision", "sfs_recall", "sfs_f1"])
+                                             "n_matched", "n_gt_features", "per_feature_abs_error"])
                 for row in sample_rows:
                     table.add_data(*row)
 
@@ -1991,9 +2016,9 @@ def train(config: dict) -> None:
                             "filename": r[1],
                             "target": r[2],
                             "generated": r[3],
-                            "sfs_precision": r[4],
-                            "sfs_recall": r[5],
-                            "sfs_f1": r[6],
+                            "n_matched": r[4],
+                            "n_gt_features": r[5],
+                            "per_feature_abs_error": _json.loads(r[6]),
                         }
                         for r in sample_rows
                     ],
