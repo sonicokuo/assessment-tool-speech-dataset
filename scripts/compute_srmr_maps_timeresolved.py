@@ -70,7 +70,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import soundfile as sf  # noqa: E402
 
-from srmr_maps import srmr_energy_tensor, srmr_scalar_from_avg  # noqa: E402
+from data.srmr_maps import srmr_energy_tensor, srmr_scalar_from_avg  # noqa: E402
 
 T_GRID_DEFAULT = 32       # coarse time bins (downsample target; ~25-50 is fine per spec)
 LOG_FLOOR = 1e-8

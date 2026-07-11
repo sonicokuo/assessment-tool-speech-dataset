@@ -26,8 +26,8 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import srmr_maps as sm  # noqa: E402
-from snr_map_head import (  # noqa: E402
+import data.srmr_maps as sm  # noqa: E402
+from model.snr_map_head import (  # noqa: E402
     SupervisedSRMRMapHead, srmr_map_loss_term,
     SRMR_N_ACOUSTIC, SRMR_N_MODULATION,
 )
@@ -181,8 +181,8 @@ def test_map_loss_masked():
 # ── source files parse (ast) ─────────────────────────────────────────────────────
 def test_source_files_parse():
     here = os.path.dirname(__file__)
-    for rel in ("../src/srmr_maps.py", "../scripts/compute_srmr_maps.py",
-                "../src/snr_map_head.py"):
+    for rel in ("../src/data/srmr_maps.py", "../scripts/compute_srmr_maps.py",
+                "../src/model/snr_map_head.py"):
         path = os.path.join(here, rel)
         with open(path) as f:
             ast.parse(f.read())

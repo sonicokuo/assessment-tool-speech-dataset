@@ -24,12 +24,12 @@ import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 from peft import LoraConfig, get_peft_model
 
-from adapter import build_adapter
-from ckpt_io import load_llm_state_dict
-from dataset import PreprocessedDataset
-from sfs import HybridClaimParser, SFSScorer
-from text_metrics import compute_generation_metrics
-from section_tags import (
+from model.adapter import build_adapter
+from data.ckpt_io import load_llm_state_dict
+from data.dataset import PreprocessedDataset
+from eval.sfs import HybridClaimParser, SFSScorer
+from eval.text_metrics import compute_generation_metrics
+from data.section_tags import (
     SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
     SECTION_TAGS,
     N_SECTIONS,
@@ -38,8 +38,8 @@ from section_tags import (
     section_open_token_ids,
     strip_all_tags,
 )
-from section_query import SectionQueryHead
-from spec_encoder import SpecEncoder
+from model.section_query import SectionQueryHead
+from model.spec_encoder import SpecEncoder
 
 
 # ── Generation ──────────────────────────────────────────────
@@ -272,7 +272,7 @@ def _range_attention_key(body: str) -> str:
         "0.5 to 1.0 s"      → "overlap@0.5-1.0s"
         (unparseable body)  → "overlap@malformed:<raw text>"
     """
-    from section_tags import extract_overlap_segments
+    from data.section_tags import extract_overlap_segments
     ranges = extract_overlap_segments(body)
     if ranges:
         s, e = ranges[0]
@@ -423,7 +423,7 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     # the LM weights directly under llm_state_dict / lora_state_dict.
     full_ft = not bool(config.get("lora_rank"))
     if not full_ft:
-        from peft_config import lora_config_kwargs, uses_pissa
+        from model.peft_config import lora_config_kwargs, uses_pissa
         llm = get_peft_model(llm, LoraConfig(**lora_config_kwargs(config)))
         if uses_pissa(config):
             print("[LoRA] WARNING: PiSSA init requested but inference rebuilds from the "

@@ -12,7 +12,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from dataset import collate_fn  # noqa: E402
+from data.dataset import collate_fn  # noqa: E402
 
 
 def _item(beats=False):

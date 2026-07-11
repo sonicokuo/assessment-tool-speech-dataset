@@ -75,7 +75,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import soundfile as sf  # noqa: E402
 
-from clean_features import snr_timeline_db, irm_grid  # noqa: E402
+from data.clean_features import snr_timeline_db, irm_grid  # noqa: E402
 
 WAVLM_HOP = 320          # samples @ 16 kHz → 50 Hz frame grid (preprocess.py)
 F_P_DEFAULT = 8          # BEATs frequency-patch count

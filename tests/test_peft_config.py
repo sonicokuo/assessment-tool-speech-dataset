@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from peft_config import lora_config_kwargs, uses_pissa  # noqa: E402
+from model.peft_config import lora_config_kwargs, uses_pissa  # noqa: E402
 
 
 def _base(**over):

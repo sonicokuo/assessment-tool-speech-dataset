@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from snr_maps import (  # noqa: E402
+from data.snr_maps import (  # noqa: E402
     snr_timeline_from_stems,
     irm_map_from_stems,
     snr_maps_from_stems,

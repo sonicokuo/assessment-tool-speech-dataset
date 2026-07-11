@@ -136,7 +136,7 @@ def load_model(config: dict, ck: dict, device):
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from adapter import build_adapter
+    from model.adapter import build_adapter
     tokenizer = AutoTokenizer.from_pretrained(config["lm_name"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

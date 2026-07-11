@@ -5,7 +5,7 @@ load-bearing."""
 
 import pytest
 
-from feature_tags import (
+from data.feature_tags import (
     CLOSE_TAG,
     FEATURE_TAGS,
     SPECIAL_TOKENS,
@@ -27,7 +27,7 @@ class TestModuleConstants:
         #   - feature opens (9) + </f> close
         #   - range marker open + close (<r>, </r>) used inside multi-value spans
         # Catalog total: 6 + 1 + 9 + 1 + 2 = 19.
-        from section_tags import SECTION_TAGS
+        from data.section_tags import SECTION_TAGS
         n_sections = len(SECTION_TAGS)
         n_features = len(FEATURE_TAGS)
         n_range_markers = 2

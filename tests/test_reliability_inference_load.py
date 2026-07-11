@@ -36,8 +36,8 @@ if "mamba_ssm" not in sys.modules:
     _stub.Mamba = object
     sys.modules["mamba_ssm"] = _stub
 
-from adapter import build_adapter  # noqa: E402
-from feature_set import N_FEATURES  # noqa: E402
+from model.adapter import build_adapter  # noqa: E402
+from data.feature_set import N_FEATURES  # noqa: E402
 
 
 def _build_like_inference(reliability_head: bool):

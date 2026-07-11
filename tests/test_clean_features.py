@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from clean_features import clean_snr_db, _ratio_to_db  # noqa: E402
+from data.clean_features import clean_snr_db, _ratio_to_db  # noqa: E402
 
 
 def _tone(freq, sr, n, amp):

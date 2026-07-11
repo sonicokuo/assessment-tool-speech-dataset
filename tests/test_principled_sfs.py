@@ -22,7 +22,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sfs import (  # noqa: E402
+from eval.sfs import (  # noqa: E402
     Claim,
     SFSScorer,
     ToleranceConfig,
@@ -30,7 +30,7 @@ from sfs import (  # noqa: E402
     tolerance_sweep,
     _baseline_predictor,
 )
-from metrics_calibrated import relative_tolerance  # noqa: E402
+from eval.metrics_calibrated import relative_tolerance  # noqa: E402
 
 
 # ── 1. relative tolerance / no-op ────────────────────────────────────────────

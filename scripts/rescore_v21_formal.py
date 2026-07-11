@@ -37,8 +37,8 @@ import sys
 SHARED = "/ocean/projects/cis260125p/shared"
 sys.path.insert(0, f"{SHARED}/assessment-tool-redirect/src")
 
-from sfs import HybridClaimParser, SFSScorer, PERCEPTUAL_JND  # noqa: E402
-from metrics_calibrated import (  # noqa: E402
+from eval.sfs import HybridClaimParser, SFSScorer, PERCEPTUAL_JND  # noqa: E402
+from eval.metrics_calibrated import (  # noqa: E402
     estimate_noise_model,
     select_family,
     coverage_tolerance,

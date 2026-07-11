@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from selection_metric import (  # noqa: E402
+from eval.selection_metric import (  # noqa: E402
     band_free_val_scores,
     composite_score,
     ema,
@@ -21,7 +21,7 @@ from selection_metric import (  # noqa: E402
     SELECTION_FEATURES,
     DEGENERATE_SELECTION_FEATURES,
 )
-from feature_set import RECOVERABLE_FEATURES  # noqa: E402
+from data.feature_set import RECOVERABLE_FEATURES  # noqa: E402
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -128,35 +128,36 @@ class TestBandFreeRoundTrip:
 # ═══════════════════════════════════════════════════════════════════════════
 class TestCompositeScore:
     def _pf(self):
-        # snr is degenerate (excluded); srmr + speaking_rate are reliable +
-        # non-degenerate; f0_mean is ill-posed (NOT reliable) so excluded even
-        # though it has a high srcc.
+        # 2026-07-11 policy: overlap_ratio is degenerate-excluded (the FiLM
+        # conditioning input / partial leak); snr is now KEPT. srmr + speaking_rate
+        # are reliable + non-degenerate; f0_mean is ill-posed (NOT reliable) so
+        # excluded even though it has a high srcc.
         return {
-            "snr": {"srcc": -0.9, "nmae": 2.0, "n": 50},          # degenerate-excluded
+            "overlap_ratio": {"srcc": -0.9, "nmae": 2.0, "n": 50}, # degenerate-excluded
             "srmr": {"srcc": 0.8, "nmae": 0.2, "n": 50},          # reliable
             "speaking_rate": {"srcc": 0.6, "nmae": 0.4, "n": 50}, # reliable
             "f0_mean": {"srcc": 0.95, "nmae": 0.1, "n": 50},      # ill-posed (excluded)
             "pause_count": {"srcc": 0.7, "nmae": 0.3, "n": 2},    # reliable but n<min_pairs
         }
 
-    def test_excludes_snr_and_illposed_and_low_n(self):
+    def test_excludes_overlap_and_illposed_and_low_n(self):
         pf = self._pf()
         s = composite_score(pf, RECOVERABLE_FEATURES, lam_nmae=0.5, min_pairs=5)
-        # usable = srmr, speaking_rate (snr degenerate, f0_mean ill-posed,
+        # usable = srmr, speaking_rate (overlap_ratio degenerate, f0_mean ill-posed,
         # pause_count below min_pairs).
         mean_srcc = (0.8 + 0.6) / 2
         mean_nmae = (0.2 + 0.4) / 2
         assert s == pytest.approx(mean_srcc - 0.5 * mean_nmae)
 
-    def test_snr_truly_excluded_by_name(self):
-        # Even if snr were reliable and high-n, it must be dropped.
-        pf = {"snr": {"srcc": 1.0, "nmae": 0.0, "n": 100},
+    def test_overlap_truly_excluded_snr_kept_by_name(self):
+        # overlap_ratio must be dropped even when reliable+high-n; snr must be KEPT.
+        pf = {"overlap_ratio": {"srcc": 1.0, "nmae": 0.0, "n": 100},
               "srmr": {"srcc": 0.5, "nmae": 0.0, "n": 100}}
-        reliable = RECOVERABLE_FEATURES | {"snr"}
-        s = composite_score(pf, reliable, lam_nmae=0.5, min_pairs=5)
-        # snr dropped -> mean over {srmr} only = 0.5
+        s = composite_score(pf, RECOVERABLE_FEATURES, lam_nmae=0.5, min_pairs=5)
+        # overlap_ratio dropped -> mean over {srmr} only = 0.5
         assert s == pytest.approx(0.5)
-        assert "snr" in DEGENERATE_SELECTION_FEATURES
+        assert "overlap_ratio" in DEGENERATE_SELECTION_FEATURES
+        assert "snr" not in DEGENERATE_SELECTION_FEATURES
 
     def test_bleu_floor_returns_neg_inf(self):
         pf = self._pf()
@@ -183,7 +184,7 @@ class TestCompositeScore:
         assert s == pytest.approx(0.4 - 0.5 * 0.2)
 
     def test_empty_usable_set_is_zero(self):
-        pf = {"snr": {"srcc": 0.9, "nmae": 0.1, "n": 50}}  # only the excluded feature
+        pf = {"overlap_ratio": {"srcc": 0.9, "nmae": 0.1, "n": 50}}  # only the excluded feature
         s = composite_score(pf, RECOVERABLE_FEATURES, lam_nmae=0.5)
         assert s == pytest.approx(0.0)
 

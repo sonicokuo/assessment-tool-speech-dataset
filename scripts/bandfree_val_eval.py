@@ -7,7 +7,7 @@ clean GT is unavailable on this split are reported with coverage only.
 """
 import json, sys, glob, os
 sys.path.insert(0, '/ocean/projects/cis260125p/shared/assessment-tool-redirect/src')
-from sfs import HybridClaimParser, SFSScorer
+from eval.sfs import HybridClaimParser, SFSScorer
 import numpy as np
 from scipy.stats import spearmanr
 

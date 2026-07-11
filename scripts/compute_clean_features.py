@@ -47,7 +47,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import soundfile as sf  # noqa: E402
-from clean_features import clean_snr_db, clean_srmr, clean_rate_and_pauses  # noqa: E402
+from data.clean_features import clean_snr_db, clean_srmr, clean_rate_and_pauses  # noqa: E402
 
 
 def _read_mono(path: str):

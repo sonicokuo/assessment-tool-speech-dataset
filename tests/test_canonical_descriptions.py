@@ -22,7 +22,7 @@ sys.path.insert(
 
 import pytest  # noqa: E402
 
-from sfs import AbstentionDetector, HybridClaimParser  # noqa: E402
+from eval.sfs import AbstentionDetector, HybridClaimParser  # noqa: E402
 
 from build_canonical_descriptions import (  # noqa: E402
     ABSTAIN_UNDER_OVERLAP,

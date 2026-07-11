@@ -64,7 +64,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import soundfile as sf  # noqa: E402
-from snr_maps import (  # noqa: E402
+from data.snr_maps import (  # noqa: E402
     snr_timeline_from_stems,
     irm_map_from_stems,
     F_BINS_DEFAULT,

@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from grounding_metrics import (  # noqa: E402
+from eval.grounding_metrics import (  # noqa: E402
     time_mass,
     freq_mass,
     time_concentration_ratio,
@@ -151,7 +151,7 @@ def test_iou_time_zero_mass_scores_low_not_none():
 
 
 def test_soft_iou_time_collapsed_map_is_low_not_none():
-    from grounding_metrics import soft_iou_time
+    from eval.grounding_metrics import soft_iou_time
     # uniform/collapsed map → soft IoU near the gt-fraction floor, always a number.
     r = soft_iou_time([0.0] * (10 * NF), [(0.0, 0.5)], 1.0, NF)
     assert r is not None

@@ -22,22 +22,22 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 from tqdm.auto import tqdm
 
-from adapter import build_adapter
-from sfs import HybridClaimParser, SFSScorer
-from dataset import PreprocessedDataset, collate_fn
-from text_metrics import compute_generation_metrics
-from feature_set import FEATURE_SCALES, N_FEATURES
-from ntl import digit_token_ids, number_token_loss
-from section_tags import (
+from model.adapter import build_adapter
+from eval.sfs import HybridClaimParser, SFSScorer
+from data.dataset import PreprocessedDataset, collate_fn
+from eval.text_metrics import compute_generation_metrics
+from data.feature_set import FEATURE_SCALES, N_FEATURES
+from model.ntl import digit_token_ids, number_token_loss
+from data.section_tags import (
     SPECIAL_TOKENS as TAG_SPECIAL_TOKENS,
     SECTION_TAGS,
     N_SECTIONS,
     RANGE_OPEN_TAG,
     section_open_token_ids,
 )
-from section_query import SectionQueryHead
+from model.section_query import SectionQueryHead
 # [section_readout] training-only regression head that grounds section attention.
-from section_readout import (
+from model.section_readout import (
     SectionReadoutHead,
     section_readout_loss,
     query_section_indices,
@@ -47,7 +47,7 @@ from section_readout import (
 # patches — produces per-feature attention maps WITHOUT the LM emitting any special
 # token, so the LM generates clean untagged prose (0% degeneration). See
 # src/decoupled_grounding.py. Off by default (decoupled_grounding: false).
-from decoupled_grounding import (
+from training.decoupled_grounding import (
     DecoupledGroundingHead,
     decoupled_grounding_loss_term,
     feature_names,
@@ -57,13 +57,14 @@ from decoupled_grounding import (
 # the per-frame SNR timeline off the WavLM frames against the stem-derived oracle
 # target (the directly-supervised grounding the project lacked). Off by default
 # (lambda_snr_map: 0 → head not built, loss term no-ops).
-from snr_map_head import SupervisedSNRMapHead, snr_map_loss_term
+from model.snr_map_head import SupervisedSNRMapHead, snr_map_loss_term
 # [srmr_map] supervised TRUE-2D SRMR (acoustic x modulation) modulation-energy map head.
 # Regresses the 23x8 oracle log-energy tensor from WavLM frames (lambda_srmr_map: 0 →
 # head not built, loss term no-ops). The frequency axis here is non-vacuous (unlike SNR).
-from snr_map_head import SupervisedSRMRMapHead, srmr_map_loss_term
+from model.snr_map_head import SupervisedSRMRMapHead, srmr_map_loss_term
+from model.token_grounding_head import TokenGroundingHead
 # Degeneration-aware, lower-variance best-checkpoint selection.
-from ckpt_selection import (
+from eval.ckpt_selection import (
     seeded_val_indices,
     should_save_best,
     passes_degeneration_guard,
@@ -72,21 +73,21 @@ from ckpt_selection import (
 # Band-free, lower-variance checkpoint selection (research Q1 protocol):
 # continuous SRCC/nMAE composite with a hard BLEU fluency floor + EMA smoothing,
 # replacing the saturated small-val SFS-F1 argmax. See src/selection_metric.py.
-from selection_metric import (
+from eval.selection_metric import (
     band_free_val_scores,
     composite_score,
     headline_band_free_means,
     ema,
     SELECTION_FEATURES,
 )
-from feature_set import RECOVERABLE_FEATURES
-from ckpt_io import (
+from data.feature_set import RECOVERABLE_FEATURES
+from data.ckpt_io import (
     CKPT_FORMAT_SLIM,
     slim_llm_state_dict,
     load_llm_state_dict,
     overlap_strata_from_csv_map,
 )
-from spec_encoder import SpecEncoder
+from model.spec_encoder import SpecEncoder
 
 
 # ── Tokenizer + LM setup helpers ──────────────────────────────────────────────
@@ -141,7 +142,7 @@ def _register_feature_tags(tokenizer: PreTrainedTokenizerBase, llm: nn.Module) -
                 print("[tagged-mode] semantic warm-start DISABLED "
                       "(semantic_tag_init=false); keeping identical mean-init (v13 recipe)")
             else:
-                from token_init import build_semantic_tag_init, semantic_init_new_rows
+                from model.token_init import build_semantic_tag_init, semantic_init_new_rows
                 # boundary = tokenizer length BEFORE the add (the id of the first
                 # new token). Qwen3-8B pads the embedding matrix past len(tokenizer),
                 # so old_vocab_size would reject every new tag (the R10 bug).
@@ -232,6 +233,27 @@ def _tokenize_with_eos(
         attn_mask[i, : lengths[i]] = 1
 
     return target_ids, attn_mask
+
+
+def unlikelihood_token_loss(logits, target_ids, target_mask, eps: float = 1e-6):
+    """Token-level unlikelihood (Welleck et al., ICLR 2020, arXiv:1908.04319).
+
+    Penalizes probability on tokens that already appeared earlier in the SAME target
+    sequence and are NOT the current target -- the repetition signature the MLE
+    objective under-penalizes. Auxiliary term to counter training-time degeneration.
+    logits (B,L,V) aligned to target_ids (B,L); target_mask (B,L) 1 at content incl EOS.
+    """
+    B, L, V = logits.shape
+    p = torch.nn.functional.softmax(logits.float(), dim=-1)
+    ctx = target_ids.unsqueeze(1).expand(B, L, L)
+    tri = torch.tril(torch.ones(L, L, device=logits.device), diagonal=-1).bool()
+    valid = tri.unsqueeze(0).expand(B, L, L).clone()
+    valid &= (ctx != target_ids.unsqueeze(2))
+    m = target_mask.bool()
+    valid &= m.unsqueeze(2) & m.unsqueeze(1)
+    p_cand = torch.gather(p, 2, ctx.clamp(min=0))
+    ul = -(torch.log(torch.clamp(1.0 - p_cand, min=eps)) * valid.float()).sum()
+    return ul / valid.float().sum().clamp(min=1.0)
 
 
 def _build_section_ctx(
@@ -474,6 +496,7 @@ def _ce_against_target(
     device: torch.device,
     section_ctx: dict | None = None,
     return_ntl_tensors: bool = False,
+    return_hidden: bool = False,
 ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
     """Run one LM forward (prefix + prompt + target) and return CE loss on the target tokens.
 
@@ -527,9 +550,21 @@ def _ce_against_target(
     target_labels[target_attn == 0] = -100
     labels = torch.cat([ignore_labels, target_labels], dim=1)
 
-    outputs = llm(inputs_embeds=inputs_embeds, labels=labels)
-    if not return_ntl_tensors:
+    outputs = llm(inputs_embeds=inputs_embeds, labels=labels,
+                  output_hidden_states=return_hidden)
+    if not return_ntl_tensors and not return_hidden:
         return outputs.loss
+
+    # ── Token-grounding hidden states (M1) ───────────────────────────────────
+    # last-layer hidden states at the L target positions [N+P, N+P+L), plus the
+    # per-position content mask. The number the LM emits lives in these hidden
+    # states; the TokenGroundingHead uses them (mean-pooled here for the global
+    # query) to attend over the audio prefix. output_hidden_states=False is the
+    # HF default, so the return_hidden=False path is byte-identical to before.
+    if return_hidden:
+        L = target_ids.shape[1]
+        prose_hidden = outputs.hidden_states[-1][:, N + P:N + P + L, :]  # (B, L, D)
+        return outputs.loss, prose_hidden, target_attn
 
     # ── NTL tensor extraction (no extra LM forward) ──────────────────────────
     # outputs.logits is (B, S, V), S = N + P + L. HF's CE shifts internally:
@@ -565,6 +600,7 @@ def compute_loss(
     decoupled_head: "DecoupledGroundingHead | None" = None,
     snr_map_head: "SupervisedSNRMapHead | None" = None,
     srmr_map_head: "SupervisedSRMRMapHead | None" = None,
+    token_grounding_head: "TokenGroundingHead | None" = None,
     batch: dict | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """B-full multi-task forward + auxiliary regression head.
@@ -618,7 +654,21 @@ def compute_loss(
     # second forward. lambda_ntl <= 0 → byte-identical to before (plain CE,
     # single return value, no NTL tensors built).
     lambda_ntl = float(config.get("lambda_ntl", 0.0))
-    want_ntl = lambda_ntl > 0.0
+    lambda_unlikelihood = float(config.get("lambda_unlikelihood", 0.0))
+    want_ntl = lambda_ntl > 0.0 or lambda_unlikelihood > 0.0
+    # [token_grounding] M1: when enabled, ask the prose forward to also hand back the
+    # last-layer hidden states at the target positions (the query source). Gated behind
+    # lambda_token_grounding>0 AND a head being present; otherwise the default forward
+    # (output_hidden_states=False) is byte-identical to the baseline. NTL and token-
+    # grounding are not used together (the M3 recipe sets lambda_ntl=0).
+    lambda_token_grounding = float(config.get("lambda_token_grounding", 0.0))
+    want_tg = (
+        lambda_token_grounding > 0.0
+        and token_grounding_head is not None
+        and batch is not None
+    )
+    prose_hidden = None
+    prose_hidden_mask = None
     if want_ntl:
         lm_loss_prose, ntl_logits, ntl_target_ids, ntl_target_mask = _ce_against_target(
             llm, embed_layer, tokenizer,
@@ -627,6 +677,15 @@ def compute_loss(
             device=device,
             section_ctx=section_ctx,
             return_ntl_tensors=True,
+        )
+    elif want_tg:
+        lm_loss_prose, prose_hidden, prose_hidden_mask = _ce_against_target(
+            llm, embed_layer, tokenizer,
+            prefix_embeds, prompt_ids, target_text,
+            max_length=config["max_target_length"],
+            device=device,
+            section_ctx=section_ctx,
+            return_hidden=True,
         )
     else:
         lm_loss_prose = _ce_against_target(
@@ -650,6 +709,13 @@ def compute_loss(
         metrics["loss_ntl"] = float(ntl_loss.detach().item())
     else:
         metrics["loss_ntl"] = 0.0
+
+    # [unlikelihood] Welleck-2020 token-level UL on the same prose ntl_logits (no extra
+    # forward). Counters training-time repetition. 0 when lambda_unlikelihood <= 0.
+    ul_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    if lambda_unlikelihood > 0.0 and want_ntl:
+        ul_loss = unlikelihood_token_loss(ntl_logits, ntl_target_ids, ntl_target_mask).to(lm_loss_prose.dtype)
+    metrics["loss_ul"] = float(ul_loss.detach().item())
 
     # [section_readout] Grounding loss. Regresses each section's acoustic scalar
     # out of z = alpha · V.detach() (the attention output), pushing alpha onto
@@ -738,13 +804,14 @@ def compute_loss(
         and float(config.get("lambda_nll", 0.0)) > 0.0
     )
     if has_nll:
-        from reliability_head import heteroscedastic_nll
+        from model.reliability_head import heteroscedastic_nll
         gt_scalars_n = gt_scalars.to(device).to(scalar_pred.dtype)
         gt_mask_n = gt_mask.to(device)
         scales_n = torch.tensor(FEATURE_SCALES, device=device, dtype=scalar_pred.dtype)
         nll_loss = heteroscedastic_nll(
             scalar_pred, reliability_log_var.to(scalar_pred.dtype),
             gt_scalars_n, mask=gt_mask_n, scales=scales_n,
+            beta=float(config.get("beta_nll", 0.0)),   # Seitzer 2022 β-NLL; 0.0 = plain Kendall & Gal
         ).to(lm_loss_prose.dtype)
         metrics["loss_nll"] = float(nll_loss.detach().item())
         # Mean predicted σ over present slots — a quick "is the head using its
@@ -843,6 +910,55 @@ def compute_loss(
     else:
         metrics["loss_srmr_map"] = 0.0
 
+    # [token_grounding] M1: couple the EMITTED number to a grounded pooled read of the
+    # audio. The mean prose hidden state (global query, Q=1) attends over the audio
+    # prefix; the pooled scalar is regressed to the GT feature value (Huber) and the
+    # attention alpha is pushed onto the oracle SNR region beta (Liu-2017). beta/prefix
+    # mask are derived by adaptive-pooling the dense snr_map_target down to prefix
+    # resolution. Gradient lands on the TokenGroundingHead's params (and, via the prose
+    # hidden states, lightly on the LM/adapter). Pre-scaled by its lambdas here. No-op
+    # unless want_tg and the batch carries snr_map_target.
+    tgF = torch.nn.functional
+    token_grounding_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    lambda_liu = float(config.get("lambda_liu", 0.0))
+    if want_tg and prose_hidden is not None and batch.get("snr_map_target") is not None:
+        Bsz = prefix_embeds.shape[0]
+        Npre = prefix_embeds.shape[1]
+        snr_idx = int(config.get("token_grounding_feature_index", 0))  # 'snr' is feat 0
+        # global query = mean prose hidden over content tokens
+        hm = prose_hidden_mask.unsqueeze(-1).to(prose_hidden.dtype)
+        q = (prose_hidden * hm).sum(1) / hm.sum(1).clamp(min=1.0)        # (B, D)
+        q = q.unsqueeze(1).float()                                      # (B, 1, D)
+        prefix = prefix_embeds.float()                                  # (B, N, D)
+        # beta + prefix mask from dense SNR target pooled to prefix resolution
+        st = batch["snr_map_target"].to(device).float().unsqueeze(1)    # (B,1,T)
+        pooled_snr = tgF.adaptive_avg_pool1d(st, Npre).squeeze(1)        # (B, N)
+        sm = batch.get("snr_map_mask")
+        if sm is not None:
+            pm = tgF.adaptive_avg_pool1d(sm.to(device).float().unsqueeze(1), Npre).squeeze(1)
+            prefix_mask = (pm > 0.0).float()                            # (B, N)
+        else:
+            prefix_mask = torch.ones(Bsz, Npre, device=device)
+        beta_logits = pooled_snr.masked_fill(prefix_mask < 0.5, float("-inf"))
+        beta = torch.nan_to_num(beta_logits.softmax(dim=-1), nan=0.0).unsqueeze(1)  # (B,1,N)
+        region_valid = (prefix_mask.sum(-1) > 0).float().unsqueeze(1)   # (B,1)
+        pooled, alpha, _ = token_grounding_head(q, prefix, prefix_mask)
+        if gt_scalars is not None:
+            gt_s = gt_scalars[:, snr_idx:snr_idx + 1].to(device).float()
+            gt_m = (gt_mask[:, snr_idx:snr_idx + 1].to(device).float()
+                    if gt_mask is not None else torch.ones(Bsz, 1, device=device))
+            pl = token_grounding_head.pooled_loss(pooled, gt_s, gt_m)
+            token_grounding_loss = token_grounding_loss + lambda_token_grounding * pl
+            metrics["loss_tg_pooled"] = float(pl.detach())
+        if lambda_liu > 0.0:
+            ll = token_grounding_head.liu_loss(alpha, beta, region_valid)
+            token_grounding_loss = token_grounding_loss + lambda_liu * ll
+            metrics["loss_tg_liu"] = float(ll.detach())
+        token_grounding_loss = token_grounding_loss.to(lm_loss_prose.dtype)
+        metrics["loss_token_grounding"] = float(token_grounding_loss.detach())
+    else:
+        metrics["loss_token_grounding"] = 0.0
+
     lambda_prose = float(config.get("lambda_prose", 1.0))
     lambda_nums = float(config.get("lambda_nums", 0.0))
     lambda_mse = float(config.get("lambda_mse", 0.0))
@@ -854,6 +970,7 @@ def compute_loss(
     # (paper default); it is the ordinal complement to the prose CE, so it scales
     # the same prose forward's digit gradient — keep it modest to preserve fluency.
     total = total + lambda_ntl * ntl_loss
+    total = total + lambda_unlikelihood * ul_loss
     # [reliability_head] add the heteroscedastic NLL term (nll_loss is 0 when the head
     # is absent or lambda_nll == 0). Note: NLL and plain MSE can be used together (NLL
     # trains the variance, MSE keeps a clean mean gradient) or NLL alone — set
@@ -870,6 +987,9 @@ def compute_loss(
     # [srmr_map] add the 2D SRMR-modulation-map term (already scaled by lambda_srmr_map
     # inside srmr_map_loss_term; 0 when disabled).
     total = total + srmr_map_loss
+    # [token_grounding] add the token-coupled grounding term (already scaled by
+    # lambda_token_grounding/lambda_liu inside the block; 0 when disabled).
+    total = total + token_grounding_loss
     metrics["loss_total"] = float(total.detach().item())
     return total, metrics
 
@@ -905,7 +1025,7 @@ def train(config: dict) -> None:
     if full_ft:
         print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → training all LM weights")
     else:
-        from peft_config import lora_config_kwargs, uses_pissa
+        from model.peft_config import lora_config_kwargs, uses_pissa
         llm = get_peft_model(llm, LoraConfig(**lora_config_kwargs(config)))
         _extra = []
         if config.get("use_dora"):
@@ -980,7 +1100,7 @@ def train(config: dict) -> None:
     # unfreezes its top-N transformer blocks, and routes those params into their own
     # optimizer group at lr_encoder (a small LR). See src/encoder_unfreeze.py for the
     # GPU-memory implications.
-    from encoder_unfreeze import (
+    from model.encoder_unfreeze import (
         unfreeze_top_n_blocks, encoder_trainable_params, count_blocks,
     )
     wavlm_encoder = None  # only built when unfreeze_wavlm_top_n > 0
@@ -1188,6 +1308,25 @@ def train(config: dict) -> None:
                   "dataloader will carry no dense targets and the term will no-op. Set "
                   "snr_map_dir to the compute_snr_map_targets.py output.")
 
+    # [token_grounding] M1 token-coupled grounding head. The emitted number's prose
+    # hidden state (global mean query) attends over the audio prefix to produce a
+    # grounded attention + pooled scalar. Built ONLY when lambda_token_grounding > 0, so
+    # off-by-default is byte-identical (no head, no params, the block no-ops). Reuses the
+    # dense snr_map_target as the oracle region, so lambda_token_grounding>0 also needs
+    # snr_map_dir set for the Liu term.
+    token_grounding_head: "TokenGroundingHead | None" = None
+    if float(config.get("lambda_token_grounding", 0.0)) > 0.0:
+        _tg_lm_dim = int(getattr(llm.config, "hidden_size", 4096))
+        token_grounding_head = TokenGroundingHead(
+            lm_dim=_tg_lm_dim,
+            prefix_dim=_tg_lm_dim,
+            hidden=int(config.get("token_grounding_hidden", 256)),
+            huber_delta=float(config.get("token_grounding_huber_delta", 1.0)),
+        ).to(device)
+        print(f"[token_grounding] enabled: lambda_token_grounding={config.get('lambda_token_grounding')}, "
+              f"lambda_liu={config.get('lambda_liu', 0.0)}, hidden={config.get('token_grounding_hidden', 256)}, "
+              f"feature_index={config.get('token_grounding_feature_index', 0)}")
+
     # [srmr_map] Optional SUPERVISED 2D SRMR modulation-energy-map head (the TRUE-2D
     # grounding branch; Falk et al. TASLP 2010). Regresses the 23x8 (acoustic x
     # modulation) log-energy map off the WavLM frames against the oracle clean-s1 SRMR
@@ -1380,6 +1519,9 @@ def train(config: dict) -> None:
         # [srmr_map] 2D SRMR-modulation-map head, also at adapter LR. Its MLP trains on
         # the parallel masked Huber against the clean-s1 oracle 23x8 log-energy tensor.
         param_groups.append({"params": srmr_map_head.parameters(), "lr": config["lr_adapter"]})
+    if token_grounding_head is not None:
+        # [token_grounding] q/k/v attention head, at adapter LR.
+        param_groups.append({"params": token_grounding_head.parameters(), "lr": config["lr_adapter"]})
     if encoder_unfreeze_params:
         # [encoder-unfreeze] the unfrozen top-N SSL-encoder blocks get their OWN group
         # at lr_encoder — a small LR (e.g. 1e-5) distinct from the adapter LR so
@@ -1442,6 +1584,7 @@ def train(config: dict) -> None:
     bleu_floor = config.get("bleu_floor", 5.0)
     val_select_ema_beta = float(config.get("val_select_ema_beta", 0.7))
     best_val_composite = float("-inf")   # best EMA-smoothed composite seen so far
+    best_srcc_robust = float("-inf")     # [§6] best plain mean-SRCC-over-5-robust seen so far
     composite_ema = None                  # running EMA of the raw composite
 
     if config.get("resume_from"):
@@ -1467,6 +1610,8 @@ def train(config: dict) -> None:
             snr_map_head.load_state_dict(checkpoint["snr_map_head_state_dict"])
         if srmr_map_head is not None and "srmr_map_head_state_dict" in checkpoint:  # [srmr_map]
             srmr_map_head.load_state_dict(checkpoint["srmr_map_head_state_dict"])
+        if token_grounding_head is not None and "token_grounding_head_state_dict" in checkpoint:
+            token_grounding_head.load_state_dict(checkpoint["token_grounding_head_state_dict"])
         # best.pt no longer carries optimizer/scheduler (inference-only). Resuming is
         # meant to use last.pt, which does. Guard so resuming from a best.pt (or any
         # optimizer-less ckpt) doesn't KeyError — it just starts fresh optimizer state.
@@ -1484,6 +1629,8 @@ def train(config: dict) -> None:
         # Composite-selection state (absent in pre-band-free ckpts → cold start).
         if "best_val_composite" in checkpoint:
             best_val_composite = checkpoint["best_val_composite"]
+        if "best_srcc_robust" in checkpoint:
+            best_srcc_robust = checkpoint["best_srcc_robust"]
         if checkpoint.get("composite_ema") is not None:
             composite_ema = checkpoint["composite_ema"]
         wandb_run_id = checkpoint.get("wandb_run_id")
@@ -1628,6 +1775,7 @@ def train(config: dict) -> None:
                 decoupled_head=decoupled_head,   # [decoupled_grounding]
                 snr_map_head=snr_map_head,       # [snr_map] dense local-SNR-map head
                 srmr_map_head=srmr_map_head,     # [srmr_map] 2D SRMR-modulation-map head
+                token_grounding_head=token_grounding_head,  # [token_grounding] M1
                 batch=batch,                     # heads read audio_features/beats/gt off it
             )
             loss = loss / accum_steps
@@ -1666,6 +1814,8 @@ def train(config: dict) -> None:
                     torch.nn.utils.clip_grad_norm_(snr_map_head.parameters(), config["grad_clip"])
                 if srmr_map_head is not None:  # [srmr_map] clip the 2D SRMR-map head too
                     torch.nn.utils.clip_grad_norm_(srmr_map_head.parameters(), config["grad_clip"])
+                if token_grounding_head is not None:  # [token_grounding] clip the M1 head too
+                    torch.nn.utils.clip_grad_norm_(token_grounding_head.parameters(), config["grad_clip"])
                 if encoder_unfreeze_params:  # [encoder-unfreeze] clip the unfrozen encoder blocks
                     torch.nn.utils.clip_grad_norm_(encoder_unfreeze_params, config["grad_clip"])
                 optimizer.step()
@@ -1754,6 +1904,7 @@ def train(config: dict) -> None:
         val_gen_texts: list = []   # this epoch's val generations, for the degeneration guard
         val_bleu = None            # BLEU on those generations (None if not computed)
         avg_composite = None       # this epoch's raw band-free composite (None on non-eval epochs)
+        srcc_robust = None         # [§6] this epoch's mean SRCC over 5 robust feats (None on non-eval)
         if (epoch + 1) % config["eval_every_epoch"] == 0:
             adapter.eval()
             llm.eval()
@@ -2082,6 +2233,13 @@ def train(config: dict) -> None:
             bf_nmae_mean_all = (sum(_nmaes) / len(_nmaes)) if _nmaes else 0.0
             bf_coverage_mean = (sum(_covs) / len(_covs)) if _covs else 0.0
             headline = headline_band_free_means(bf_pf, RECOVERABLE_FEATURES)
+            # [§6 selection] plain mean SRCC over the 5 robust features (snr INCLUDED,
+            # f0 + overlap_ratio EXCLUDED) — the fixed, un-smoothed selection signal the
+            # plan specifies (no nMAE, no EMA, no gated composite).
+            _ROBUST5 = ("srmr", "snr", "speaking_rate", "pause_count", "pause_rate")
+            _rv = [bf_pf[f]["srcc"] for f in _ROBUST5
+                   if f in bf_pf and bf_pf[f].get("srcc") is not None]
+            srcc_robust = (sum(_rv) / len(_rv)) if _rv else None
 
             # Per-epoch averages of B-full's three loss terms — diagnostic curves so you
             # can see whether the prose CE, the nums CE, and the aux-head MSE are each
@@ -2133,6 +2291,8 @@ def train(config: dict) -> None:
             # — the one to read/quote. val/srcc_mean_all is the raw all-feature mean
             # (snr-included) and must NOT be mistaken for the headline.
             log_dict["val/srcc_mean_reliable"] = headline["mean_srcc"]
+            if srcc_robust is not None:
+                log_dict["val/srcc_robust"] = srcc_robust   # [§6] the selection signal
             log_dict["val/nmae_mean_reliable"] = headline["mean_nmae"]
             log_dict["val/n_headline_features"] = headline["n_features"]
             log_dict["val/srcc_mean_all"] = bf_srcc_mean_all
@@ -2201,6 +2361,7 @@ def train(config: dict) -> None:
                 # so --resume_from restores the running EMA + best-so-far without a
                 # cold start. Absent in pre-band-free ckpts → cold start on resume.
                 "best_val_composite": best_val_composite,
+                "best_srcc_robust": best_srcc_robust,
                 "composite_ema": composite_ema,
                 "wandb_run_id": wandb_run_id,
                 "config": config,
@@ -2219,6 +2380,8 @@ def train(config: dict) -> None:
                 payload["snr_map_head_state_dict"] = snr_map_head.state_dict()
             if srmr_map_head is not None:  # [srmr_map]
                 payload["srmr_map_head_state_dict"] = srmr_map_head.state_dict()
+            if token_grounding_head is not None:  # [token_grounding]
+                payload["token_grounding_head_state_dict"] = token_grounding_head.state_dict()
             # [encoder-unfreeze] persist ONLY the unfrozen (requires_grad) encoder
             # params so the fine-tuned top-N blocks survive a reload without bloating
             # the ckpt with the frozen backbone (restored from from_pretrained / the
@@ -2301,6 +2464,49 @@ def train(config: dict) -> None:
                         best_path,
                         name=f"best-{run_name}",
                         metadata={"epoch": epoch, "val_sfs_f1": best_val_sfs_f1},
+                    )
+        elif select_metric == "srcc_robust":
+            # ── [§6] plain mean-SRCC-over-5-robust path ───────────────────────
+            # Select best.pt on the unsmoothed mean SRCC over {srmr, snr,
+            # speaking_rate, pause_count, pause_rate} vs clean GT (f0 + overlap_ratio
+            # excluded). No nMAE, no EMA, no composite — exactly the §6 selection —
+            # with the same rep-n / non-ASCII / BLEU degeneration guard as a fluency
+            # backstop. best_val_bleu still tracks the running max identically.
+            if val_bleu is not None:
+                best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
+            _save_best = False
+            _save_reason = "no eval this epoch"
+            if srcc_robust is not None:
+                improved = srcc_robust > best_srcc_robust
+                _deg = degeneration_stats(val_gen_texts)
+                guard_ok, guard_reason = passes_degeneration_guard(
+                    val_bleu, best_val_bleu,
+                    _deg["rep_n_max"], _deg["nonascii_frac"],
+                    _deg["frac_clips_nonascii"], _deg["frac_clips_high_rep"],
+                )
+                if not improved:
+                    _save_reason = (f"no srcc_robust improvement "
+                                    f"({srcc_robust:.4f} <= best={best_srcc_robust:.4f})")
+                elif not guard_ok:
+                    _save_reason = f"srcc_robust improved but degenerate ({guard_reason})"
+                else:
+                    _save_best = True
+                    _save_reason = "srcc_robust improved, clean"
+            if (not _save_best) and srcc_robust is not None and srcc_robust > best_srcc_robust:
+                print(f"  [select] withheld best.pt despite srcc_robust={srcc_robust:.4f}: {_save_reason}")
+            if _save_best:
+                best_srcc_robust = srcc_robust
+                if avg_sfs_f1 is not None:
+                    best_val_sfs_f1 = max(best_val_sfs_f1, avg_sfs_f1)
+                best_path = os.path.join(config["save_dir"], "best.pt")
+                _atomic_save(_ckpt_payload(epoch, save_optimizer=False), best_path)
+                print(f"Saved best val model (srcc_robust={best_srcc_robust:.4f}, val_sfs_f1={avg_sfs_f1})")
+                if config.get("upload_ckpt_to_wandb", True):
+                    run_name = (wandb.run.name if wandb.run is not None else None) or "run"
+                    _upload_to_wandb_artifact(
+                        best_path, name=f"best-{run_name}",
+                        metadata={"epoch": epoch, "val_srcc_robust": best_srcc_robust,
+                                  "val_sfs_f1": avg_sfs_f1},
                     )
         else:
             # ── Band-free composite path (DEFAULT) ────────────────────────────

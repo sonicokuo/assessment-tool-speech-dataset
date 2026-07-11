@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from section_readout import (  # noqa: E402
+from model.section_readout import (  # noqa: E402
     SectionReadoutHead,
     build_section_feature_mask,
     section_readout_loss,
@@ -37,8 +37,8 @@ def test_warmup_lambda_ramps_then_holds():
 def test_warmup_lambda_disabled_returns_target():
     assert warmup_lambda(0.5, 0, 0) == 0.5        # no warmup -> target immediately
     assert warmup_lambda(0.5, 0, -1) == 0.5
-from feature_set import N_FEATURES, SUPERVISED_FEATURES  # noqa: E402
-from section_tags import N_SECTIONS, SECTION_TAGS  # noqa: E402
+from data.feature_set import N_FEATURES, SUPERVISED_FEATURES  # noqa: E402
+from data.section_tags import N_SECTIONS, SECTION_TAGS  # noqa: E402
 
 
 # ── routing matrix ───────────────────────────────────────────────────────────

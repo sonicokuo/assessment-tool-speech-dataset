@@ -37,8 +37,8 @@ def main() -> int:
     import torch
     import yaml
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from sfs import HybridClaimParser, SFSScorer
-    from text_metrics import compute_generation_metrics
+    from eval.sfs import HybridClaimParser, SFSScorer
+    from eval.text_metrics import compute_generation_metrics
 
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from text_metrics import compute_generation_metrics
+from eval.text_metrics import compute_generation_metrics
 
 
 def _show(title: str, m: dict) -> None:

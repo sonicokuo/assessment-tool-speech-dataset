@@ -20,7 +20,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from hedging_calibration import (  # noqa: E402
+from eval.hedging_calibration import (  # noqa: E402
     extract_clip_signals,
     reliability_by_bin,
     risk_coverage_curve,

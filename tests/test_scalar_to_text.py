@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 
 from scalar_to_text_experiment import splice_text, SPLICE_SPECS, HEAD_KEYS
-from sfs import ClaimParser
+from eval.sfs import ClaimParser
 
 
 # The exact untagged-prose phrasing v17 emits (from inference_results.json).

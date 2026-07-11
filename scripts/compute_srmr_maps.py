@@ -59,7 +59,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import soundfile as sf  # noqa: E402
 
-from srmr_maps import srmr_map_target, srmr_scalar_from_avg  # noqa: E402
+from data.srmr_maps import srmr_map_target, srmr_scalar_from_avg  # noqa: E402
 
 _S1CLEAN_RE = re.compile(r"^(.*)_s1clean$")
 _AUGNP_RE = re.compile(r"^(.*)_augNp\d+_\d+$")

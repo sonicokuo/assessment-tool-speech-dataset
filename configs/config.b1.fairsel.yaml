@@ -1,0 +1,88 @@
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-08
+adapter_variant: film-mamba
+batch_size: 6
+beats_cached: false
+bf16: true
+bleu_floor: 5.0
+data_dir: /ocean/projects/cis260125p/shared/data/processed_aug
+descriptions_path: /ocean/projects/cis260125p/shared/data/descriptions_observability_aug_train.json
+descriptions_path_test: /ocean/projects/cis260125p/shared/data/descriptions_observability_test.json
+descriptions_path_val: /ocean/projects/cis260125p/shared/data/descriptions_observability_dev.json
+epochs: 12
+eval_every_epoch: 1
+features_csv:
+  train: /ocean/projects/cis260125p/shared/data/features_aug_train_cleangt.csv
+  val: /ocean/projects/cis260125p/shared/data/features_pyannote/dev_cleanf0.csv
+features_path: /ocean/projects/cis260125p/shared/data/features.json
+grad_clip: 1.0
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+lam_nmae: 0.5
+lambda_liu: 0.0
+lambda_mse: 0.3
+lambda_nll: 0.0
+lambda_ntl: 0.0
+lambda_nums: 0.3
+lambda_prose: 1.0
+lambda_snr_irm: 0.0
+lambda_snr_map: 0.0
+lambda_snr_scalar: 0.0
+lambda_token_grounding: 0.0
+lm_name: Qwen/Qwen3-8B
+log_every: 10
+log_val_samples_table: false
+lora_alpha: 32
+lora_dropout: 0.05
+lora_rank: 16
+lora_targets:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+lr_adapter: 0.0001
+lr_encoder: 1.0e-05
+lr_lm: 1.0e-05
+lr_scheduler: cosine
+max_nums_length: 96
+max_target_length: 512
+min_lr_ratio: 0.0
+num_workers: 4
+optimizer: adamw
+pin_memory: true
+prompt: Describe the quality of this recording.
+prompt_nums: 'List the numerical features of this recording:'
+prompt_prose: Describe the quality of this recording.
+reliability_head: false
+resume_from: null
+save_dir: /ocean/projects/cis260125p/shared/checkpoints/full/b1_fairsel_s73
+score_overlap_spans: false
+seed: 73
+select_metric: srcc_robust
+snr_map_dir:
+  train: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/train
+  val: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/dev
+snr_map_hidden: 256
+snr_map_huber_delta: 1.0
+snr_map_kernel_size: 5
+snr_map_predict_irm: false
+snr_map_snr_bias: 5.0
+tagged_mode: false
+temperature: 1.0
+top_k: 1
+top_p: 1.0
+unfreeze_beats_top_n: 0
+unfreeze_wavlm_top_n: 0
+use_sections: false
+val_select_ema_beta: 0.7
+val_sfs_n: 32
+val_subset_size: 200
+wandb_entity: speech_quality_adapter
+wandb_project: speech-quality-desc
+wandb_run_name: b1_fairsel_s73
+warmup_ratio: 0.03
+weight_decay: 0.01

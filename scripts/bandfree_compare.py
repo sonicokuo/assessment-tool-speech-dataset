@@ -11,7 +11,7 @@ Usage: python bandfree_compare.py [v1 v2 ...]   (default: curated main + ablatio
 """
 import json, sys, os
 sys.path.insert(0, '/ocean/projects/cis260125p/shared/assessment-tool-redirect/src')
-from sfs import HybridClaimParser, SFSScorer
+from eval.sfs import HybridClaimParser, SFSScorer
 import numpy as np
 from scipy.stats import spearmanr, pearsonr
 

@@ -24,9 +24,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from snr_map_head import SupervisedSNRMapHead, snr_map_loss_term  # noqa: E402
-from clean_features import snr_timeline_db, irm_grid  # noqa: E402
-import snr_map_validate as smv  # noqa: E402
+from model.snr_map_head import SupervisedSNRMapHead, snr_map_loss_term  # noqa: E402
+from data.clean_features import snr_timeline_db, irm_grid  # noqa: E402
+import experiments.snr_map_validate as smv  # noqa: E402
 
 
 # ── head forward: finite + shape + range ────────────────────────────────────────
@@ -168,7 +168,7 @@ def test_pooled_snr_tracks_timeline():
 
 
 def test_scalar_tie_term_runs():
-    from feature_set import N_FEATURES, FEATURE_NAMES
+    from data.feature_set import N_FEATURES, FEATURE_NAMES
     head = SupervisedSNRMapHead(audio_dim=8)
     gt = torch.zeros(2, N_FEATURES)
     gtm = torch.zeros(2, N_FEATURES, dtype=torch.bool)

@@ -30,7 +30,7 @@ if "mamba_ssm" not in sys.modules:
 
 class TestSectionQueryHead:
     def setup_method(self):
-        from section_query import SectionQueryHead
+        from model.section_query import SectionQueryHead
         self.head = SectionQueryHead(
             n_sections=6, d_patch=768, d_lm=2048, d_k=256, d_v=256,
         )
@@ -107,7 +107,7 @@ class TestSectionQueryHeadDynamic:
     """Tests for the dynamic-query forward used by section_query_mode='dynamic'."""
 
     def setup_method(self):
-        from section_query import SectionQueryHead
+        from model.section_query import SectionQueryHead
         self.head = SectionQueryHead(n_sections=6, d_patch=768, d_lm=2048, d_k=256, d_v=256)
 
     def test_forward_dynamic_shape_a_with_batch_idx(self):
@@ -271,7 +271,7 @@ class TestVariableLengthBatching:
     """
 
     def test_collate_pads_and_emits_mask(self):
-        from dataset import collate_fn
+        from data.dataset import collate_fn
         # Two synthetic batch items with different "patch counts"
         a_patches = torch.randn(100, 768)
         b_patches = torch.randn(248, 768)
@@ -303,7 +303,7 @@ class TestVariableLengthBatching:
         assert (out["beats_patches"][0, 100:] == 0).all()
 
     def test_attention_ignores_padded_positions(self):
-        from section_query import SectionQueryHead
+        from model.section_query import SectionQueryHead
         head = SectionQueryHead(n_sections=6, d_patch=768, d_lm=2048, d_k=256, d_v=256)
         B, P_max = 2, 100
         patches = torch.randn(B, P_max, 768)
@@ -322,7 +322,7 @@ class TestVariableLengthBatching:
         assert torch.allclose(alpha[1].sum(-1), torch.ones(6), atol=1e-5)
 
     def test_dynamic_attention_ignores_padded_positions(self):
-        from section_query import SectionQueryHead
+        from model.section_query import SectionQueryHead
         head = SectionQueryHead(n_sections=6, d_patch=768, d_lm=2048, d_k=256, d_v=256)
         B, P_max = 3, 80
         patches = torch.randn(B, P_max, 768)
@@ -352,12 +352,12 @@ class TestRangeMarkers:
     """
 
     def test_special_tokens_includes_range_markers(self):
-        from section_tags import RANGE_OPEN_TAG, RANGE_CLOSE_TAG, SPECIAL_TOKENS
+        from data.section_tags import RANGE_OPEN_TAG, RANGE_CLOSE_TAG, SPECIAL_TOKENS
         assert RANGE_OPEN_TAG in SPECIAL_TOKENS
         assert RANGE_CLOSE_TAG in SPECIAL_TOKENS
 
     def test_strip_removes_range_markers(self):
-        from section_tags import strip_all_tags
+        from data.section_tags import strip_all_tags
         text = (
             "<sec_overlap><f_overlap_segments>overlap at "
             "<r>0.5-1.0s</r>, <r>3.0-4.5s</r></f></sec>"
@@ -367,7 +367,7 @@ class TestRangeMarkers:
     def test_sfs_parser_handles_range_markers_transparently(self):
         # The TaggedClaimParser regex doesn't care about <r>...</r> wrappers
         # because extract_overlap_segments scans the whole feature-span body.
-        from sfs import TaggedClaimParser
+        from eval.sfs import TaggedClaimParser
         text = (
             "<f_overlap_segments>overlap at <r>0.5-1.0s</r>, "
             "<r>3.0-4.5s</r>, <r>7.0-9.0s</r></f>"
@@ -416,7 +416,7 @@ class TestDynamicInjectionHelper:
     def test_dynamic_injection_runs_and_writes_at_section_positions(self):
         import torch.nn as nn
         from train import _inject_section_summaries_dynamic
-        from section_query import SectionQueryHead
+        from model.section_query import SectionQueryHead
 
         # Tiny mock LM that returns hidden_states[-1] of the same shape as inputs.
         class MockLM(nn.Module):
@@ -472,7 +472,7 @@ class TestDynamicInjectionHelper:
         # If no section tokens are in the batch, no LM forward should happen.
         import torch.nn as nn
         from train import _inject_section_summaries_dynamic
-        from section_query import SectionQueryHead
+        from model.section_query import SectionQueryHead
 
         # If the LM is called we want a noticeable side-effect to detect it.
         class WatchdogLM(nn.Module):
@@ -508,7 +508,7 @@ class TestDynamicInjectionHelper:
 
 class TestPatchGridReshape:
     def test_reshape_attention_to_2d(self):
-        from spec_encoder import PatchGrid
+        from model.spec_encoder import PatchGrid
         grid = PatchGrid(n_patches=248, d_patch=768, time_dim=31, freq_dim=8, backend="beats")
         alpha = torch.rand(2, 248).softmax(dim=-1)
         alpha_2d = grid.reshape_attention(alpha)
@@ -517,7 +517,7 @@ class TestPatchGridReshape:
         assert torch.allclose(alpha_2d.sum(dim=(1, 2)), torch.ones(2), atol=1e-5)
 
     def test_reshape_attention_preserves_row_major_order(self):
-        from spec_encoder import PatchGrid
+        from model.spec_encoder import PatchGrid
         # Construct an attention vector where patch i has value i (so we can
         # verify the reshape lays out time-bins as rows, freq-bins as cols).
         grid = PatchGrid(n_patches=12, d_patch=4, time_dim=3, freq_dim=4, backend="beats")
@@ -583,7 +583,7 @@ class TestInjectionHelper:
 )
 class TestBEATsIntegration:
     def test_beats_loads_and_runs(self):
-        from spec_encoder import SpecEncoder
+        from model.spec_encoder import SpecEncoder
         enc = SpecEncoder(model_name="beats", freeze=True)
         assert enc.backend == "beats"
         assert enc.d_out == 768
@@ -595,8 +595,8 @@ class TestBEATsIntegration:
         assert grid.freq_dim == 8  # 128 mel bins / 16 patch size
 
     def test_beats_into_section_head(self):
-        from section_query import SectionQueryHead
-        from spec_encoder import SpecEncoder
+        from model.section_query import SectionQueryHead
+        from model.spec_encoder import SpecEncoder
         enc = SpecEncoder(model_name="beats", freeze=True)
         head = SectionQueryHead(n_sections=6, d_patch=enc.d_out, d_lm=2048, d_k=256, d_v=256)
         waveform = torch.randn(2, 80000) * 0.1

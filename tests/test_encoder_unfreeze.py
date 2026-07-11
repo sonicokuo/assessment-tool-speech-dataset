@@ -22,7 +22,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from encoder_unfreeze import (  # noqa: E402
+from model.encoder_unfreeze import (  # noqa: E402
     unfreeze_top_n_blocks,
     encoder_trainable_params,
     count_blocks,

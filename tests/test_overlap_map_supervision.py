@@ -26,7 +26,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from decoupled_grounding import (  # noqa: E402
+from training.decoupled_grounding import (  # noqa: E402
     DecoupledGroundingHead,
     decoupled_grounding_loss_term,
     overlap_time_target,
@@ -37,7 +37,7 @@ from decoupled_grounding import (  # noqa: E402
     F_P_DEFAULT,
     WAVLM_FRAME_RATE_HZ,
 )
-from feature_set import N_FEATURES  # noqa: E402
+from data.feature_set import N_FEATURES  # noqa: E402
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -333,7 +333,7 @@ def test_only_overlap_feature_map_is_supervised():
     idx = overlap_ratio_index()
     assert 0 <= idx < N_FEATURES
     # overlap_ratio is the catalog's localizable, oracle-GT feature.
-    from decoupled_grounding import feature_names
+    from training.decoupled_grounding import feature_names
     assert feature_names()[idx] == "overlap_ratio"
 
 

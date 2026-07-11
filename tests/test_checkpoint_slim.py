@@ -22,7 +22,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from ckpt_io import (  # noqa: E402
+from data.ckpt_io import (  # noqa: E402
     CKPT_FORMAT_SLIM,
     SlimLoadError,
     slim_llm_state_dict,
@@ -31,7 +31,7 @@ from ckpt_io import (  # noqa: E402
     overlap_bin,
     overlap_strata_from_csv_map,
 )
-from ckpt_selection import seeded_val_indices  # noqa: E402
+from eval.ckpt_selection import seeded_val_indices  # noqa: E402
 
 torch = pytest.importorskip("torch")
 peft = pytest.importorskip("peft")

@@ -26,7 +26,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from decoupled_grounding import (  # noqa: E402
+from training.decoupled_grounding import (  # noqa: E402
     DecoupledGroundingHead,
     hard_concrete_sample,
     hard_concrete_keepprob,
@@ -34,7 +34,7 @@ from decoupled_grounding import (  # noqa: E402
     DEFAULT_BITS_BETA,
     feature_names,
 )
-from feature_set import N_FEATURES, SUPERVISED_FEATURES  # noqa: E402
+from data.feature_set import N_FEATURES, SUPERVISED_FEATURES  # noqa: E402
 
 _NAMES = [n for n, _c, _f in SUPERVISED_FEATURES]
 _OVR = _NAMES.index("overlap_ratio")

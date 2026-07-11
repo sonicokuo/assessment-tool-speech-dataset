@@ -35,7 +35,7 @@ import math
 
 # Import the tag SoT. The script lives in scripts/, src/ is a sibling.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from feature_tags import FEATURE_TAGS, render_tagged_span, TAG_BY_NAME  # noqa: E402
+from data.feature_tags import FEATURE_TAGS, render_tagged_span, TAG_BY_NAME  # noqa: E402
 
 # ─── Ollama config ────────────────────────────────────────────────────────────
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -244,13 +244,13 @@ def _build_section_bodies(row: dict, sample_rate: int = 16000) -> dict[str, str]
     Uses src/section_tags.py::build_section_body which is the SoT for section
     membership and inner-claim phrasing templates.
     """
-    from section_tags import SECTION_TAGS, build_section_body
+    from data.section_tags import SECTION_TAGS, build_section_body
 
     bodies: dict[str, str] = {}
     for sec in SECTION_TAGS:
         feature_values: dict[str, str] = {}
         for fname in sec.feature_names:
-            ft = next(f for f in __import__("section_tags").FEATURE_TAGS if f.name == fname)
+            ft = next(f for f in __import__("data.section_tags", fromlist=["FEATURE_TAGS"]).FEATURE_TAGS if f.name == fname)
             raw = None if ft.csv_col is None else row.get(ft.csv_col)
             value = _format_value_for_tag(ft, raw, sample_rate=sample_rate)
             if value is not None:
@@ -274,7 +274,7 @@ def generate_quality_description_sectioned(row: dict) -> str:
         return "[ERROR] No usable features in row to build section bodies."
 
     # Render each section's full open-body-close so the LLM can reproduce verbatim.
-    from section_tags import render_section_span
+    from data.section_tags import render_section_span
     section_spans: list[str] = []
     for name, body in bodies.items():
         section_spans.append(render_section_span(name, body))

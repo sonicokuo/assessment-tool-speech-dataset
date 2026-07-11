@@ -112,7 +112,7 @@ def _score_section(generated: str, target: str, section: str, parser, scorer) ->
 def main() -> int:
     import numpy as np
     import torch
-    from sfs import HybridClaimParser, SFSScorer
+    from eval.sfs import HybridClaimParser, SFSScorer
 
     # Lazy-import inference machinery
     sys.path.insert(0, str(REPO / "scripts"))

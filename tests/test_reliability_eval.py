@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from reliability_eval import (  # noqa: E402
+from eval.reliability_eval import (  # noqa: E402
     risk_coverage_curve,
     aurc,
     random_abstention_curve,

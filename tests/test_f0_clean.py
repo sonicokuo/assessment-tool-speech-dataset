@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from f0_clean import (  # noqa: E402
+from data.f0_clean import (  # noqa: E402
     parse_overlap_windows_samples,
     f0_stats_voiced_nonoverlap,
 )

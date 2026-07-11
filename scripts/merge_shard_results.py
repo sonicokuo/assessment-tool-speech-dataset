@@ -17,7 +17,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-from text_metrics import compute_generation_metrics  # noqa: E402
+from eval.text_metrics import compute_generation_metrics  # noqa: E402
 
 
 def main():

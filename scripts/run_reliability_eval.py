@@ -62,17 +62,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")
 sys.path.insert(0, SRC)
 
-from adapter import build_adapter                       # noqa: E402
-from ckpt_io import load_llm_state_dict                 # noqa: E402
-from feature_set import (                               # noqa: E402
+from model.adapter import build_adapter                       # noqa: E402
+from data.ckpt_io import load_llm_state_dict                 # noqa: E402
+from data.feature_set import (                               # noqa: E402
     SUPERVISED_FEATURES,
     FEATURE_NAMES,
     RECOVERABLE_FEATURES,
     ILL_POSED_UNDER_OVERLAP_FEATURES,
     extract_scalars,
 )
-from reliability_eval import risk_coverage_report, risk_coverage_curve  # noqa: E402
-from sfs import ClaimParser, SFSScorer                  # noqa: E402
+from eval.reliability_eval import risk_coverage_report, risk_coverage_curve  # noqa: E402
+from eval.sfs import ClaimParser, SFSScorer                  # noqa: E402
 
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 from peft import LoraConfig, get_peft_model                    # noqa: E402
@@ -124,7 +124,7 @@ def build_model(config: dict, checkpoint: dict, device: torch.device):
 
     # LoRA wrap (v21 is LoRA r16). Mirror inference.py exactly via the shared helper.
     if config.get("lora_rank"):
-        from peft_config import lora_config_kwargs
+        from model.peft_config import lora_config_kwargs
         llm = get_peft_model(llm, LoraConfig(**lora_config_kwargs(config)))
         log(f"[LoRA] rank={config['lora_rank']} alpha={config.get('lora_alpha')}")
 

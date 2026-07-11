@@ -23,7 +23,7 @@ import random
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from sfs import (  # noqa: E402
+from eval.sfs import (  # noqa: E402
     Claim,
     SFSScorer,
     ToleranceConfig,
@@ -32,7 +32,7 @@ from sfs import (  # noqa: E402
     PERCEPTUAL_JND,
     DEFAULT_TOLERANCE_CONFIG,
 )
-from metrics_calibrated import (  # noqa: E402
+from eval.metrics_calibrated import (  # noqa: E402
     norm_cdf,
     normal_quantile,
     estimate_noise_model,

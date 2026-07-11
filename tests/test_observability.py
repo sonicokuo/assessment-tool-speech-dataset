@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import build_descriptions_observability as bdo  # noqa: E402
-from sfs import (  # noqa: E402
+from eval.sfs import (  # noqa: E402
     AbstentionDetector,
     Claim,
     ClaimParser,

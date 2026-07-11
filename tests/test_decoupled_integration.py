@@ -28,11 +28,11 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from decoupled_grounding import (  # noqa: E402
+from training.decoupled_grounding import (  # noqa: E402
     DecoupledGroundingHead,
     decoupled_grounding_loss_term,
 )
-from feature_set import N_FEATURES  # noqa: E402
+from data.feature_set import N_FEATURES  # noqa: E402
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

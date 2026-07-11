@@ -66,7 +66,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 sys.path.insert(0, str(REPO / "src"))
 
 from feature_verbalization import _build_section_bodies  # noqa: E402
-from section_tags import SECTION_TAGS, render_section_span  # noqa: E402
+from data.section_tags import SECTION_TAGS, render_section_span  # noqa: E402
 
 
 PART_SLICES = {
@@ -227,8 +227,9 @@ def build_description(row: dict, fallback_warned: dict | None = None,
         ratio = float(row.get("overlap_ratio", "") or 0)
     except (TypeError, ValueError):
         ratio = 0.0
-    if ratio > 0:
-        text += " F0 and formant estimates are unreliable during overlap windows."
+    f0_hedged = not (str(row.get("f0_mean_hz", "") or "").strip())
+    if ratio > 0 and f0_hedged:
+        text += " F0, formant, and voice-quality estimates are unreliable during overlap windows."
     text = text.strip()
     if untagged:
         text = _strip_tags(text)
@@ -347,21 +348,25 @@ def main() -> int:
             stem = os.path.splitext(fname)[0]
             if not stem:
                 continue
-            # [R4] Substitute well-posed clean-frame F0 for the mixture F0.
+            # [R4-recoverability] Hedge the speaker-intrinsic CLASS (f0 + voice quality)
+            # when the target speaker is not sufficiently isolable to estimate reliably:
+            # clean (non-overlap) voiced fraction < HEDGE_TAU. s1clean clips (overlap_ratio==0)
+            # are always recoverable -> assert. Ties abstention to physical recoverability.
+            HEDGE_TAU = 0.20
+            base_fname = fname.replace("_s1clean.wav", ".wav")
+            frac = 1.0
             if clean_f0 is not None:
-                cf = clean_f0.get(fname)
+                cf = clean_f0.get(base_fname)
                 if cf is not None:
-                    cm = cf.get("f0_mean_hz")
-                    undefined = cm is None or (isinstance(cm, float) and math.isnan(cm))
-                    if undefined:
-                        # F0 unmeasurable here -> omit it; the overlap hedge stands.
-                        row["f0_mean_hz"] = ""
-                        row["f0_sd_hz"] = ""
-                    else:
-                        row["f0_mean_hz"] = str(cm)
-                        cs = cf.get("f0_sd_hz")
-                        row["f0_sd_hz"] = ("" if (cs is None or (isinstance(cs, float)
-                                          and math.isnan(cs))) else str(cs))
+                    fv = cf.get("clean_voiced_frac")
+                    frac = 0.0 if fv is None else float(fv)
+            try:
+                _ovl = float(row.get("overlap_ratio", "") or 0)
+            except (TypeError, ValueError):
+                _ovl = 0.0
+            if _ovl > 0 and frac < HEDGE_TAU:
+                for _c in ("f0_mean_hz", "f0_sd_hz", "hnr", "jitter_local_pct", "shimmer"):
+                    row[_c] = ""
             text = build_description(row, fallback_warned, untagged=args.untagged,
                                      drop_overlap_segments=args.no_overlap_segments,
                                      drop_duration=args.no_duration)

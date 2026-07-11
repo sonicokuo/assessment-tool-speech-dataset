@@ -27,13 +27,13 @@ if "mamba_ssm" not in sys.modules:
     _stub.Mamba = object
     sys.modules["mamba_ssm"] = _stub
 
-from reliability_head import (  # noqa: E402
+from model.reliability_head import (  # noqa: E402
     ReliabilityHead,
     heteroscedastic_nll,
     LOGVAR_MIN,
     LOGVAR_MAX,
 )
-from feature_set import N_FEATURES, FEATURE_SCALES  # noqa: E402
+from data.feature_set import N_FEATURES, FEATURE_SCALES  # noqa: E402
 
 
 def test_head_output_shapes_and_positive_sigma():
@@ -171,7 +171,7 @@ def test_nll_gradients_flow_to_both_mean_and_logvar():
 def test_build_adapter_reliability_flag_default_off_is_plain_linear():
     """build_adapter default (reliability_head=False) keeps the plain Linear mean head,
     and forward returns (prefix, tensor) — byte-identical signature to before."""
-    from adapter import build_adapter, AdapterWithAuxHead
+    from model.adapter import build_adapter, AdapterWithAuxHead
     import torch.nn as nn
 
     a = build_adapter("concat-only", lm_dim=8, n_aux_features=N_FEATURES)
@@ -188,7 +188,7 @@ def test_build_adapter_reliability_flag_default_off_is_plain_linear():
 def test_build_adapter_reliability_flag_on_returns_mean_logvar():
     """build_adapter(reliability_head=True) installs ReliabilityHead and forward returns
     (prefix, (mean, log_var)) each (B, F), with sigma > 0."""
-    from adapter import build_adapter, AdapterWithAuxHead
+    from model.adapter import build_adapter, AdapterWithAuxHead
 
     a = build_adapter("concat-only", lm_dim=8, n_aux_features=N_FEATURES,
                       reliability_head=True)

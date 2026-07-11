@@ -556,7 +556,7 @@ def extract_features(wav_path: str, overlap_handle, srmr_model) -> dict:
     # *_clean columns restrict to the single active speaker so the F0 reference
     # is well-posed. Both are written so the GT change stays auditable.
     try:
-        from f0_clean import compute_f0_variation_clean, parse_overlap_windows_samples
+        from data.f0_clean import compute_f0_variation_clean, parse_overlap_windows_samples
         _ovl = result.get('overlap_segments')
         _ovl = '' if (_ovl is None or isinstance(_ovl, float)) else str(_ovl)
         _cf0 = compute_f0_variation_clean(wav_path, parse_overlap_windows_samples(_ovl, int(sr)))

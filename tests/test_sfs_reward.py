@@ -15,7 +15,7 @@ scalar features keyed by name, plus "overlap_segments": [(start, end), ...].
 
 import pytest
 
-from sfs_reward import (
+from training.sfs_reward import (
     extract_completion_text,
     make_sfs_reward_func,
     sfs_f1,
@@ -84,7 +84,7 @@ class TestSfsReward:
     def test_partial_spam_recall_high_but_f1_punished(self):
         """Directly contrast F1 vs recall on the spam text: recall stays high
         (everything mentioned) yet F1 is dragged down by precision."""
-        from sfs import HybridClaimParser, SFSScorer
+        from eval.sfs import HybridClaimParser, SFSScorer
 
         spam = (
             "The SNR is 99.00 dB. The F0 mean is 9.00 Hz. "

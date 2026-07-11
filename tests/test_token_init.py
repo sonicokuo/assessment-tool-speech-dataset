@@ -7,12 +7,12 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from token_init import (  # noqa: E402
+from model.token_init import (  # noqa: E402
     tag_descriptions,
     build_semantic_tag_init,
     semantic_init_new_rows,
 )
-from section_tags import SECTION_TAGS, FEATURE_TAGS, SPECIAL_TOKENS  # noqa: E402
+from data.section_tags import SECTION_TAGS, FEATURE_TAGS, SPECIAL_TOKENS  # noqa: E402
 
 N_OPEN_TAGS = len(SECTION_TAGS) + len(FEATURE_TAGS)  # 15 open tags carry phrases
 

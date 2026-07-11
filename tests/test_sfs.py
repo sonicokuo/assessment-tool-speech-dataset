@@ -1,6 +1,6 @@
 """Tests for Signal Faithfulness Score (SFS) module."""
 
-from sfs import Claim, ClaimParser, HybridClaimParser, SFSScorer, TaggedClaimParser
+from eval.sfs import Claim, ClaimParser, HybridClaimParser, SFSScorer, TaggedClaimParser
 
 
 class TestClaimParser:

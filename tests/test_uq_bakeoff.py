@@ -37,12 +37,12 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from uq_heads import (  # noqa: E402
+from model.uq_heads import (  # noqa: E402
     MDNSNRMapHead,
     MCDropoutSNRMapHead,
     ensemble_uncertainty,
 )
-from uq_bakeoff import (  # noqa: E402
+from experiments.uq_bakeoff import (  # noqa: E402
     continuous_risk_aurc,
     spearman_unc_err,
     calibration_summary,
@@ -350,7 +350,7 @@ class TestRunBakeoff:
 # ════════════════════════════════════════════════════════════════════════════════
 # uq_train — the decoupled trainer's loss DECREASES on a synthetic batch (CPU)
 # ════════════════════════════════════════════════════════════════════════════════
-from uq_train import (  # noqa: E402
+from experiments.uq_train import (  # noqa: E402
     build_head,
     train_step,
     compute_loss,

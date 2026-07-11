@@ -36,7 +36,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from sfs import ClaimParser  # noqa: E402
+from eval.sfs import ClaimParser  # noqa: E402
 
 
 def aggregate(results: list[dict]) -> dict[str, dict]:

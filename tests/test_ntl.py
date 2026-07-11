@@ -20,7 +20,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from ntl import digit_token_ids, number_token_loss
+from model.ntl import digit_token_ids, number_token_loss
 
 
 # ── A tiny fake tokenizer where each digit '0'..'9' is its own single id ──────
@@ -158,7 +158,7 @@ def test_aux_head_dim_tracks_feature_set_12():
     feature_set side (the source of truth) is always asserted; the adapter side is
     asserted whenever the module imports (e.g. on a GPU node / the smoke run).
     """
-    import feature_set
+    import data.feature_set as feature_set
     assert feature_set.N_FEATURES == 12
     # adapter.py imports mamba_ssm at module top; its CUDA init can be unstable on a
     # CPU/login node (segfault, not a catchable exception), so gate on CUDA first.
@@ -166,7 +166,7 @@ def test_aux_head_dim_tracks_feature_set_12():
     if not torch_mod.cuda.is_available():
         pytest.skip("adapter import needs CUDA/mamba_ssm; skipped on CPU host")
     try:
-        import adapter
+        import model.adapter as adapter
     except Exception as e:
         pytest.skip(f"adapter not importable here: {e}")
     assert adapter.N_AUX_FEATURES == feature_set.N_FEATURES == 12

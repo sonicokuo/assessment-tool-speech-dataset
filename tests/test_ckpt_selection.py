@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from ckpt_selection import (  # noqa: E402
+from eval.ckpt_selection import (  # noqa: E402
     rep_n,
     nonascii_frac,
     degeneration_stats,

@@ -23,8 +23,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from sfs import ClaimParser, AbstentionDetector  # noqa: E402
-import metrics_calibrated as mc  # noqa: E402
+from eval.sfs import ClaimParser, AbstentionDetector  # noqa: E402
+import eval.metrics_calibrated as mc  # noqa: E402
 
 
 PARSER = ClaimParser()

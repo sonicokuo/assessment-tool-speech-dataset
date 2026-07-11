@@ -33,7 +33,7 @@ if "mamba_ssm" not in sys.modules:
     stub.Mamba = object
     sys.modules["mamba_ssm"] = stub
 
-from feature_set import N_FEATURES
+from data.feature_set import N_FEATURES
 
 
 # ─── Mocks ─────────────────────────────────────────────────────────

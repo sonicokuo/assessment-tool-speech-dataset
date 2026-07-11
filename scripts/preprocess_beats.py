@@ -35,7 +35,7 @@ import torch
 # Add src/ to path so we can import spec_encoder.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from spec_encoder import SpecEncoder  # noqa: E402
+from model.spec_encoder import SpecEncoder  # noqa: E402
 
 
 SAMPLE_RATE = 16000

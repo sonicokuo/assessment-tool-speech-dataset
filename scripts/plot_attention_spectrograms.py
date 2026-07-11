@@ -242,7 +242,7 @@ def main():
     # Pulled at runtime so renames stay synced.
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-    from section_tags import SECTION_TAGS  # noqa: E402
+    from data.section_tags import SECTION_TAGS  # noqa: E402
     section_order = [s.name for s in SECTION_TAGS]
 
     for entry in entries:

@@ -70,7 +70,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 # feature order is hardcoded as HEAD_KEYS below and asserted against
 # feature_set.SUPERVISED_FEATURES inside compute_head_predictions() (which needs torch
 # anyway), so a drift in the canonical catalog fails loudly before any GPU work.
-from sfs import HybridClaimParser, SFSScorer
+from eval.sfs import HybridClaimParser, SFSScorer
 
 # Reuse the trustworthy eval's bootstrap + degeneracy + GT-from-target logic so the
 # numbers are directly comparable with checkpoints/v17_decoupled/trustworthy_eval.json.
@@ -253,9 +253,9 @@ def compute_head_predictions(config: dict, checkpoint_path: str, test_dir: str,
     filenames so a crash is cheap.
     """
     import torch  # local import so --score_only path stays torch-free
-    from decoupled_grounding import DecoupledGroundingHead
-    from dataset import PreprocessedDataset
-    from feature_set import N_FEATURES, SUPERVISED_FEATURES
+    from training.decoupled_grounding import DecoupledGroundingHead
+    from data.dataset import PreprocessedDataset
+    from data.feature_set import N_FEATURES, SUPERVISED_FEATURES
 
     # Guard against catalog drift: HEAD_KEYS (hardcoded for the torch-free splice path)
     # MUST equal the canonical SUPERVISED_FEATURES order the head was trained on.
