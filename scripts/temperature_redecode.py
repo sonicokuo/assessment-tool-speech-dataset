@@ -172,8 +172,21 @@ def main() -> int:
         row = [100.0 * counts[t][nm] / n for t in temps]
         v = ""
         if nm in ("hnr", "f0_mean", "f0_sd", "shimmer"):
-            v = ("GREEDY AMPLIFICATION — decode fix" if len(row) > 1 and row[-1] > 20
-                 else "COLLAPSED PRIOR — needs retrain")
+            # ⚠️ AN UNDEFINED VERDICT MUST NOT DEFAULT TO THE ALARMING ONE. The old form was
+            # `GREEDY AMPLIFICATION if len(row) > 1 and row[-1] > 20 else COLLAPSED PRIOR`, so a
+            # SINGLE-temperature run (--temps 0.0) could never satisfy `len(row) > 1` and printed
+            # "COLLAPSED PRIOR — needs retrain" next to a measured 98.3% emission. That inverts
+            # the reading of a successful run, and it is what the fw2 probe reported.
+            # Emission level is decidable from one temperature; only the GREEDY-vs-PRIOR
+            # DISCRIMINATION needs two, so say so instead of guessing.
+            if row[-1] > 80.0:
+                v = "EMITS — no collapse"
+            elif len(row) > 1:
+                v = ("GREEDY AMPLIFICATION — decode fix" if row[-1] > 20
+                     else "COLLAPSED PRIOR — needs retrain")
+            else:
+                v = (f"LOW ({row[-1]:.1f}%) — rerun with --temps 0.0,1.0 to tell "
+                     f"greedy-amplification from a collapsed prior")
         elif nm == "jitter":
             v = "matched control (must stay high)"
         print(f"{nm:<16}" + "".join(f"{x:9.1f}%" for x in row) + f"   {v}")
