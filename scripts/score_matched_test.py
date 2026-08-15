@@ -10,6 +10,10 @@ under overlap, so f0-SRCC is naturally restricted to assert conditions — no ov
 Usage:
     python scripts/score_matched_test.py GT.json PRED_A.json [PRED_B.json ...]
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'src'))
+from data.feature_set import (SUPERVISED_FEATURES,  # noqa: E402
+                              ILL_POSED_UNDER_OVERLAP_FEATURES)
 import json
 import statistics
 import sys
@@ -76,7 +80,17 @@ except Exception:  # manual Spearman fallback
         dy = sum((b - my) ** 2 for b in ry) ** 0.5
         return num / (dx * dy) if dx > 0 and dy > 0 else float("nan")
 
-FEATS = ["snr", "srmr", "f0_mean", "speaking_rate", "pause_count", "pause_rate", "overlap_ratio"]
+# ⚠️ NEVER HARDCODE THIS LIST. It read
+#   ["snr","srmr","f0_mean","speaking_rate","pause_count","pause_rate","overlap_ratio"]
+# — 7 of the supervised features, silently omitting f0_sd, jitter, shimmer and hnr. THREE of
+# those four are exactly the features the fw2 target fix restored from 0.0% to 98.3% emission,
+# so every free-decode panel scored with this file reported ONE of the five ill-posed features
+# and looked complete while doing it. Derive from the single source of truth and assert, so a
+# feature can never again be dropped from a panel without the run failing.
+FEATS = [f[0] if isinstance(f, (tuple, list)) else str(f) for f in SUPERVISED_FEATURES]
+assert set(ILL_POSED_UNDER_OVERLAP_FEATURES) <= set(FEATS), (
+    f"ill-posed features missing from the scored panel: "
+    f"{sorted(set(ILL_POSED_UNDER_OVERLAP_FEATURES) - set(FEATS))}")
 ROBUST = ["srmr", "snr", "speaking_rate", "pause_count", "pause_rate"]
 
 _P = sfs.ClaimParser()

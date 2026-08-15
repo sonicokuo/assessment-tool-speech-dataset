@@ -39,6 +39,8 @@ def main() -> int:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--test_dir", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--dump_repr", action="store_true",
+                    help="also save mean+std pooled ADAPTER prefix tokens as <out>_repr.npz")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
@@ -46,6 +48,7 @@ def main() -> int:
     names = [f[0] if isinstance(f, (tuple, list)) else str(f) for f in SUPERVISED_FEATURES]
     ck = torch.load(a.checkpoint, map_location="cpu", weights_only=False)
     cfg = ck.get("config", {}) or {}
+    dump_repr = bool(getattr(a, 'dump_repr', False))
     zero_ovl = bool(cfg.get("zero_overlap_input", False))
 
     adapter = build_adapter(
@@ -70,6 +73,7 @@ def main() -> int:
         files = files[: a.limit]
 
     out = []
+    reprs, repr_names = [], []
     with torch.no_grad():
         for i, fn in enumerate(files):
             d = torch.load(os.path.join(a.test_dir, fn), map_location="cpu", weights_only=False)
@@ -88,6 +92,17 @@ def main() -> int:
                 lv = lv.mean(dim=1)
             rec = {"filename": fn[:-3],
                    "aux_mean": v[0, :len(names)].float().cpu().tolist()}
+            if dump_repr:
+                # OUR ADAPTER REPRESENTATION (mean+std pooled prefix tokens). Needed because the
+                # 3-arm abstention comparison built its features from the FROZEN WavLM tensor, so
+                # arms B and C read the identical matrix and "B-C isolates our representation" was
+                # false: only the appended point estimate differed. To compare our representation
+                # against pooled frozen WavLM, the confidence model has to actually SEE this.
+                pref = r[0] if isinstance(r, (tuple, list)) else r
+                if torch.is_tensor(pref) and pref.dim() == 3:
+                    reprs.append(torch.cat([pref[0].mean(0), pref[0].std(0)])
+                                 .float().cpu().numpy())
+                    repr_names.append(fn[:-3])
             if lv is not None:
                 # store SIGMA directly (exp(0.5*log_var)); the gate thresholds sigma, and
                 # storing it here means the risk-coverage curve never needs another forward pass
@@ -97,6 +112,12 @@ def main() -> int:
                 print(f"  {i+1}/{len(files)}", flush=True)
 
     json.dump(out, open(a.out, "w"))
+    if dump_repr and reprs:
+        import numpy as _np
+        _np.savez_compressed(a.out.replace(".json", "") + "_repr.npz",
+                             repr=_np.stack(reprs), filenames=_np.array(repr_names))
+        print(f"[repr] wrote {a.out.replace('.json','')}_repr.npz  "
+              f"{len(reprs)} x {reprs[0].shape[0]} (mean+std pooled prefix tokens)")
     has_sigma = sum(1 for r in out if "sigma" in r)
     print(f"\nwrote {a.out}  clips={len(out)}  with sigma={has_sigma}  "
           f"features={len(names)}  zero_overlap_input={zero_ovl}")
