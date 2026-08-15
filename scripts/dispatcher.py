@@ -266,7 +266,19 @@ JOBS = [
     # per-claim gap but moves the credit from the sigma head to the post-hoc predictor. The
     # reviewer's next question is immediate: give the RIDGE the same post-hoc predictor. Arms B
     # and C share clips, folds and GBM hyperparameters, so B-C isolates our REPRESENTATION.
-    dict(name="abstention_3arm", gpu=False,
+    # ---- DISABLED 2026-08-15 (G.2v). This job's DESIGN is void, not merely its data:
+    #   * it builds features from the FROZEN WavLM tensor, so arms B and C read an IDENTICAL
+    #     matrix and "B - C isolates our representation" is false — only the appended point
+    #     estimate differs;
+    #   * KFold is UNGROUPED while every clip has a twin with byte-identical GT on 9/11
+    #     features, leaking +17-29% onto the GBM arms but not the ridge point estimate;
+    #   * arms B/C are cross-validated ON TEST while sigma (arm A) only ever saw TRAIN, so the
+    #     A-vs-B gap compares out-of-sample against in-sample.
+    # Re-enable only after the rewrite: GroupKFold on the twin base stem, selectors fit on DEV
+    # (aux_sigma_s73_dev.json already exists and is used by nothing), fixed FEATURE_SCALES
+    # normalisation, the audited src/eval/faithfulness_metrics module instead of hand-rolled
+    # AURC, and arm B reading the ADAPTER representation (dump_aux_sigma --dump_repr).
+    dict(name="abstention_3arm", gpu=False, disabled=True,
          produces=f"{SH}/abstention_3arm_s73.json",
          needs=[f"{SH}/aux_sigma_s73.json"],
          cmd=f"{PY} -u scripts/abstention_3arm.py "
@@ -546,6 +558,9 @@ def main() -> int:
                 status["done"].append(nm)
                 continue
             if nm in running or nm in failed:
+                continue
+            if j.get("disabled"):
+                status["skipped"][nm] = "disabled: design void, see G.2v"
                 continue
             if in_flight(j):
                 # adopted from a previous dispatcher instance (or this one, pre-restart)
