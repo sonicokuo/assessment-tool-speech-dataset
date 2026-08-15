@@ -42,17 +42,31 @@ ROBUST5 = ["snr", "srmr", "speaking_rate", "pause_count", "pause_rate"]
 ILLPOSED = ["f0_mean", "f0_sd", "jitter", "shimmer", "hnr"]
 
 
-def aurc(conf: np.ndarray, err: np.ndarray) -> float:
-    """Area under the risk-coverage curve. Sort by confidence (most confident first), sweep
-    coverage 1/n..1, risk = mean error over the retained set. Lower is better."""
+def _auc_from_order(e: np.ndarray) -> float:
+    risks = np.cumsum(e) / np.arange(1, e.size + 1)
+    return float(risks.mean())
+
+
+def aurc(conf: np.ndarray, err: np.ndarray) -> tuple[float, float]:
+    """(AURC, E-AURC) for a confidence signal.
+
+    ⚠️ RAW AURC CANNOT COMPARE TWO DIFFERENT SYSTEMS. Each system's risk is ITS OWN absolute
+    error, so a more ACCURATE model gets a lower AURC even when its confidence ordering is no
+    better — and the abstention claim is only about the ordering. The first run of this script
+    reported ours winning 11 of 11 on raw AURC, which is exactly what a pure accuracy advantage
+    would produce.
+
+    E-AURC (Geifman, Uziel & El-Yaniv, ICLR 2019, arXiv:1805.08206) subtracts the AURC that a
+    PERFECT confidence ordering would achieve on the SAME error vector, leaving only the quality
+    of the ordering. That is the comparable quantity.
+    """
     ok = np.isfinite(conf) & np.isfinite(err)
     conf, err = conf[ok], err[ok]
     if conf.size < 20:
-        return float("nan")
-    order = np.argsort(conf)                       # ascending "uncertainty" = keep the low ones
-    e = err[order]
-    risks = np.cumsum(e) / np.arange(1, e.size + 1)
-    return float(risks.mean())
+        return float("nan"), float("nan")
+    a = _auc_from_order(err[np.argsort(conf)])     # ascending uncertainty = keep low ones first
+    a_opt = _auc_from_order(np.sort(err))          # oracle ordering: smallest errors first
+    return a, a - a_opt
 
 
 def main() -> int:
@@ -103,10 +117,12 @@ def main() -> int:
         X.append(np.concatenate([af.mean(0).numpy(), af.std(0).numpy()]).astype(np.float32))
     X = np.stack(X)
     X = (X - X.mean(0)) / (X.std(0) + 1e-6)
-    print("pooled encoder features", flush=True)
+    is_clean = np.array([r["stem"].endswith("_s1clean") for r in keep])
+    print(f"pooled encoder features  (clean twins: {int(is_clean.sum())})", flush=True)
 
-    print(f"\n{'feature':<15}{'AURC ours':>11}{'AURC ridge+UQ':>15}{'winner':>10}")
-    print("-" * 52)
+    print(f"\n{'feature':<15}{'E-AURC ours':>13}{'E-AURC ridge':>14}{'winner':>10}"
+          f"{'(raw ours)':>12}{'(raw ridge)':>13}")
+    print("-" * 78)
     summary = {}
     kf = KFold(n_splits=a.folds, shuffle=True, random_state=0)
     for j, nm in enumerate(names):
@@ -132,22 +148,41 @@ def main() -> int:
                 random_state=0).fit(Xe[tr], err_ridge[tr]).predict(Xe[te])
 
         err_ours = np.abs(yh_ours - y)
+        # ⚠️ CONSTANT-GT LEAK GUARD (ported from oracle_error_ceiling.py, where the same defect
+        # scored 0.965). Where GT is constant within a condition, err = |yhat - const| is a
+        # DETERMINISTIC FUNCTION of yhat — and yhat is one of the error-predictor's inputs, so
+        # the ridge's confidence model predicts its own input and wins spuriously. On clean clips
+        # overlap_ratio GT is exactly 0 for all 3000, which produced a 4x "ridge win" out of line
+        # with every other feature. Void the row rather than report an artifact.
+        cl_ = is_clean[ok]
+        const_cell = ((cl_.sum() > 50 and float(np.std(y[cl_])) < 1e-6)
+                      or ((~cl_).sum() > 50 and float(np.std(y[~cl_])) < 1e-6))
+        if const_cell:
+            print(f"{nm:<15}{'VOID — GT constant within a condition (err = f(input))':>60}")
+            summary[nm] = {"voided": "constant GT within condition"}
+            continue
         # Scale-free comparison: both risks are normalised by the feature's own error scale, so
         # AURC values are comparable across features and neither system is flattered by units.
-        s = float(np.mean(err_ours) + np.mean(err_ridge)) / 2.0 or 1.0
-        a_ours = aurc(sg, err_ours / s) if np.isfinite(sg).any() else float("nan")
-        a_ridge = aurc(conf_ridge, err_ridge / s)
-        win = ("ours" if np.isfinite(a_ours) and a_ours < a_ridge else
-               "ridge+UQ" if np.isfinite(a_ridge) else "-")
-        print(f"{nm:<15}{a_ours:11.4f}{a_ridge:15.4f}{win:>10}")
-        summary[nm] = {"aurc_ours": a_ours, "aurc_ridge_uq": a_ridge, "winner": win}
+        # Normalise each system by ITS OWN mean error, so E-AURC is a scale-free statement about
+        # the ORDERING alone and neither side is flattered by being the more accurate estimator.
+        so = float(np.mean(err_ours)) or 1.0
+        sr = float(np.mean(err_ridge)) or 1.0
+        a_ours, e_ours = (aurc(sg, err_ours / so) if np.isfinite(sg).any()
+                          else (float("nan"), float("nan")))
+        a_ridge, e_ridge = aurc(conf_ridge, err_ridge / sr)
+        win = ("ours" if np.isfinite(e_ours) and e_ours < e_ridge else
+               "ridge+UQ" if np.isfinite(e_ridge) else "-")
+        print(f"{nm:<15}{e_ours:13.4f}{e_ridge:14.4f}{win:>10}"
+              f"{a_ours:12.4f}{a_ridge:13.4f}")
+        summary[nm] = {"eaurc_ours": e_ours, "eaurc_ridge_uq": e_ridge,
+                       "aurc_ours": a_ours, "aurc_ridge_uq": a_ridge, "winner": win}
 
     for panel, feats in (("ROBUST5", ROBUST5), ("ILL-POSED", ILLPOSED)):
-        o = np.nanmean([summary[f]["aurc_ours"] for f in feats if f in summary])
-        r = np.nanmean([summary[f]["aurc_ridge_uq"] for f in feats if f in summary])
-        print(f"\n{panel}: ours {o:.4f} vs ridge+UQ {r:.4f} -> "
+        o = np.nanmean([summary[f]["eaurc_ours"] for f in feats if f in summary])
+        r = np.nanmean([summary[f]["eaurc_ridge_uq"] for f in feats if f in summary])
+        print(f"\n{panel} E-AURC: ours {o:.4f} vs ridge+UQ {r:.4f} -> "
               f"{'OURS WINS' if o < r else 'RIDGE+UQ WINS'}")
-        summary[f"_panel_{panel}"] = {"ours": float(o), "ridge_uq": float(r)}
+        summary[f"_panel_{panel}"] = {"eaurc_ours": float(o), "eaurc_ridge_uq": float(r)}
 
     json.dump(summary, open(a.out, "w"), indent=2)
     print(f"\nwrote {a.out}")

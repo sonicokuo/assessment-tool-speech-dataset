@@ -57,6 +57,18 @@ def live_jobids() -> list[str]:
             if len(ln.split()) > 1 and ln.split()[1] == "RUNNING"]
 
 
+def gpu_procs(jid: str) -> int:
+    """How many processes are ACTUALLY on this allocation's GPU.
+
+    Counting only the dispatcher's own launches is not enough: jobs started by hand (the
+    6000-clip evals) are invisible to it, so it over-subscribed one allocation to 47 GB while
+    another sat completely idle. Ask the GPU instead of trusting bookkeeping.
+    """
+    out = sh(f"srun --jobid={jid} --overlap nvidia-smi "
+             f"--query-compute-apps=pid --format=csv,noheader 2>/dev/null", timeout=45)
+    return len([ln for ln in out.splitlines() if ln.strip()])
+
+
 # ---------------------------------------------------------------- result gates
 def gate_ceiling_high(_):
     """Q9 (MDN / residual head) runs only if per-claim ranking is ACHIEVABLE.
@@ -172,6 +184,48 @@ JOBS = [
              f"--pt_dir {SH}/data/processed_layer7/test "
              f"--out {SH}/uq_ridge_baseline.json"),
 
+    # ---- CRITICAL PATH as of the G.2j retraction. All three shipping arms trained on `fw`
+    # (checkpoint-verified), whose clean clips carry ZERO f0/hnr/shimmer supervision. Every
+    # LM-side voice-panel number is therefore structurally untestable, not negative. This retrain
+    # is the fix — and the SAME run also repairs the aux-MSE masking (train.py:1068) that leaves
+    # those five heads trained on clean clips only, which is why they lose to the ridge 11/11.
+    # The `.fw2.yaml` config points at the corrected targets for TRAINING, not just eval.
+    dict(name="retrain_fw2_s73", gpu=True,
+         produces=f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/TRAINING_COMPLETE", needs=[],
+         # RESUME-AWARE. 4 epochs is ~8h but allocations here are ~6-8h, so this WILL hit a
+         # wall. train.py checkpoints `last.pt` per epoch; without --resume_from the dispatcher
+         # would restart it from scratch on every relaunch and never finish. The shell picks the
+         # flag at launch time, so the first run starts fresh and every relaunch continues.
+         cmd=(f"L={SH}/checkpoints/full/l7audioonly_fw2_seed73/last.pt; "
+              f"R=\"\"; [ -f \"$L\" ] && R=\"--resume_from $L\"; "
+              f"{PY} -u src/train.py "
+              f"--config {RV}/configs/config.l7audioonly.s73.fw2RETRAIN.yaml $R "
+              f"&& touch {SH}/checkpoints/full/l7audioonly_fw2_seed73/TRAINING_COMPLETE")),
+
+    # ---- DECIDES WHERE THE RETRAIN SHOULD AIM. Is the ridge deficit caused by SUPERVISION
+    # MASKING (train.py:1068 drops 5 features on overlapped clips) or by POOLING (the ridge uses
+    # mean+std; our head is mean-only, and f0_sd IS a variability statistic)? A 2x2 linear probe
+    # on the same frozen features answers it with no training. CPU-only.
+    dict(name="ridge_probe_2x2", gpu=False,
+         produces=f"{SH}/ridge_probe_2x2.json", needs=[],
+         cmd=f"{PY} -u scripts/ridge_probe_2x2.py "
+             f"--train_dir {SH}/data/processed_layer7/train "
+             f"--test_dir {SH}/data/processed_layer7/test "
+             f"--train_csv {SH}/data/features_corrected_merged/train-100.csv "
+             f"--test_csv {SH}/data/features_corrected_merged/test.csv "
+             f"--out {SH}/ridge_probe_2x2.json"),
+
+    # Second seed on the CORRECTED targets. Two seeds is the minimum for any stability claim,
+    # and this fills the otherwise-idle allocation: the 2x2 ridge probe is CPU-only sklearn, so
+    # it leaves that node's H100 completely unused.
+    dict(name="retrain_fw2_s42", gpu=True,
+         produces=f"{SH}/checkpoints/full/l7audioonly_fw2_seed42/TRAINING_COMPLETE", needs=[],
+         cmd=(f"L={SH}/checkpoints/full/l7audioonly_fw2_seed42/last.pt; "
+              f"R=\"\"; [ -f \"$L\" ] && R=\"--resume_from $L\"; "
+              f"{PY} -u src/train.py "
+              f"--config {RV}/configs/config.l7audioonly.s42.fw2RETRAIN.yaml $R "
+              f"&& touch {SH}/checkpoints/full/l7audioonly_fw2_seed42/TRAINING_COMPLETE")),
+
     dict(name="pitch_probe_seed42", gpu=True,
          produces=f"{SH}/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "
@@ -206,6 +260,12 @@ def main() -> int:
         """
         log = f"{SH}/logs/dispatch_{job['name']}.log"
         if not os.path.exists(log):
+            return False
+        # A CRASHED job is never in flight, however recently its log was touched. The
+        # termination message itself refreshes the mtime, so mtime alone said "alive" for the
+        # full staleness window while crashed() said "dead" — the job was popped and re-skipped
+        # every pass, producing an infinite [retry] loop that never relaunched anything.
+        if crashed(job):
             return False
         return (time.time() - os.path.getmtime(log)) < stale_after
 
@@ -256,10 +316,9 @@ def main() -> int:
                 else:
                     print(f"[retry] {nm} (attempt {attempts.get(nm, 0)}): {why}", flush=True)
 
-        slots = {i: a.per_node for i in ids}
-        for nm, jid in running.items():
-            if jid in slots:
-                slots[jid] -= 1
+        # Capacity from MEASURED occupancy, so hand-launched work counts too.
+        slots = {i: max(0, a.per_node - gpu_procs(i)) for i in ids}
+        print(f"[capacity] {slots}", flush=True)
 
         status = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "allocations": ids,
                   "running": dict(running), "done": [], "skipped": {}, "pending": [],
@@ -292,11 +351,13 @@ def main() -> int:
                     print(f"[skip] {nm}: {why}", flush=True)
                     continue
                 print(f"[gate-pass] {nm}: {why}", flush=True)
-            free = [i for i, n in slots.items() if n > 0]
+            # LEAST-LOADED, not first-with-capacity. `free[0]` always picked the lowest job ID,
+            # so one allocation was packed to two heavy jobs while another sat idle.
+            free = sorted((n, i) for i, n in slots.items() if n > 0)
             if not free:
                 status["pending"].append(nm)
                 continue
-            jid = free[0]
+            jid = free[-1][1]                       # most free slots wins
             log = f"{SH}/logs/dispatch_{nm}.log"
             # setsid puts the job in its OWN session and process group, so it survives the
             # dispatcher being restarted. Without it the srun children stayed in tmux's process
