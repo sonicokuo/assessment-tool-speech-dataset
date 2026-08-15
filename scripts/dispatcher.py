@@ -385,6 +385,39 @@ JOBS = [
              f"{SH}/data/descriptions_corrected_fw2.json {SH}/freedecode_unmasked_s73.json "
              f"> {SH}/freedecode_unmasked_s73.scored.txt 2>&1"),
 
+    # ---- SEED 42 OF THE UNMASKED ARM. Now REQUIRED, not optional: the corrected ridge baseline
+    # (TUNED L7 = 0.7200 / 0.5372, not the untuned 0.7035 / 0.5153 first used) puts our ill-posed
+    # margin at +0.0100, only ~1.5x the fw2 ill-posed seed spread of 0.0067. One seed cannot
+    # carry that claim. Resume-aware, same as the other retrains.
+    dict(name="retrain_unmasked_s42", gpu=True,
+         produces=f"{SH}/checkpoints/full/l7audioonly_unmasked_seed42/TRAINING_COMPLETE",
+         needs=[],
+         cmd=(f"L={SH}/checkpoints/full/l7audioonly_unmasked_seed42/last.pt; "
+              f"R=\"\"; [ -f \"$L\" ] && R=\"--resume_from $L\"; "
+              f"{PY} -u src/train.py "
+              f"--config {RV}/configs/config.l7audioonly.s42.unmasked.yaml $R "
+              f"&& touch {SH}/checkpoints/full/l7audioonly_unmasked_seed42/TRAINING_COMPLETE")),
+
+    dict(name="aux_readout_unmasked_s42", gpu=True,
+         produces=f"{SH}/aux_l7_unmasked_s42.json",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed42/TRAINING_COMPLETE"],
+         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+             f"{SH}/checkpoints/full/l7audioonly_unmasked_seed42/best.pt "
+             f"{SH}/data/processed_layer7/test "
+             f"{SH}/data/features_corrected_merged/test.csv "
+             f"{SH}/aux_l7_unmasked_s42.json 0 zero_overlap"),
+
+    # Sigma error-ranking on the unmasked arm: the other half of the abstention regression test.
+    # Ran attached once and died with the ssh session; belongs in the dispatcher, detached.
+    dict(name="residual_head_unmasked", gpu=False,
+         produces=f"{SH}/residual_head_unmasked_s73.json",
+         needs=[f"{SH}/aux_sigma_unmasked_s73.json"],
+         cmd=f"{PY} -u scripts/residual_error_head.py "
+             f"--aux_sigma {SH}/aux_sigma_unmasked_s73.json "
+             f"--features_csv {SH}/data/features_corrected_merged/test.csv "
+             f"--pt_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/residual_head_unmasked_s73.json"),
+
     dict(name="pitch_probe_seed42", gpu=True,
          produces=f"{SH}/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "
