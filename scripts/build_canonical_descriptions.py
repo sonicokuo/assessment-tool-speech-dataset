@@ -59,7 +59,7 @@ unreliable on a 2-speaker mixture and are ABSTAINED: no number is stated.
 All abstained features are grouped into ONE hedge sentence, emitted in place of
 the f0_mean clause (the first abstained slot in fixed order), e.g.
 
-    "Because the speakers overlap heavily (0.8162 overlap ratio), the pitch and
+    "Because the speakers overlap heavily (0.82 overlap ratio), the pitch and
      voice-quality measures (F0, jitter, shimmer, HNR) cannot be reliably
      estimated from the mixture and are not reported."
 
@@ -116,6 +116,7 @@ import json
 import math
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 
@@ -125,19 +126,32 @@ from pathlib import Path
 # clean_json_key: the key to look up in --clean_features (recoverable scalars).
 #   f0_mean / f0_sd come from --clean_f0 (handled specially). hnr / jitter /
 #   shimmer have no clean JSON, so their clean key is None and they read the CSV.
+#
+# NUMERIC SURFACE FORM (2026-07-16, F15): every float format is the CONSTANT-WIDTH
+# two-decimal "{:.2f}" (pause_count stays an integer). Mixed widths (srmr "3.2667",
+# speaking/pause rates "5.317") misalign digit position vs magnitude for a
+# digit-by-digit tokenizer (Singh & Strouse, arXiv:2402.14903; R4 in the 2026-07-13
+# training-method memo). This changes TRAINING TARGETS — it takes effect at the next
+# descriptions rebuild + retrain; already-built JSONs and running jobs are untouched.
 FEATURE_ORDER: list[tuple[str, str, str | None, str]] = [
     ("snr",               "snr_db",                          "snr_db",                          "{:.2f}"),
-    ("srmr",              "srmr",                            "srmr",                            "{:.4f}"),
-    ("hnr",               "hnr_db",                          None,                              "{:.2f}"),
+    ("srmr",              "srmr",                            "srmr",                            "{:.2f}"),
+    # BUGFIX 2026-07-28: these read "hnr_db" / "shimmer_pct", which do NOT exist in
+    # features_corrected_merged/*.csv (the columns are "hnr" / "shimmer"). The lookup
+    # failed silently, so hnr and shimmer were VALUED IN 0 OF 39,800 TARGETS — never
+    # supervised in text at all. jitter escaped only because "jitter_local_pct" happens
+    # to be spelled correctly. assert_feature_columns_exist() below now makes this class
+    # of typo loud instead of silent.
+    ("hnr",               "hnr",                             None,                              "{:.2f}"),
     ("f0_mean",           "f0_mean_hz",                      None,                              "{:.2f}"),  # clean_f0
     ("f0_sd",             "f0_sd_hz",                        None,                              "{:.2f}"),  # clean_f0
     ("jitter",            "jitter_local_pct",                None,                              "{:.2f}"),
-    ("shimmer",           "shimmer_pct",                     None,                              "{:.2f}"),
-    ("speaking_rate",     "praat_speaking_rate_syl_sec",     "praat_speaking_rate_syl_sec",     "{:.3f}"),
-    ("articulation_rate", "praat_articulation_rate_syl_sec", "praat_articulation_rate_syl_sec", "{:.3f}"),
+    ("shimmer",           "shimmer",                         None,                              "{:.2f}"),
+    ("speaking_rate",     "praat_speaking_rate_syl_sec",     "praat_speaking_rate_syl_sec",     "{:.2f}"),
+    ("articulation_rate", "praat_articulation_rate_syl_sec", "praat_articulation_rate_syl_sec", "{:.2f}"),
     ("pause_count",       "praat_pause_count",               "praat_pause_count",               "{:d}"),
-    ("pause_rate",        "praat_pause_rate_per_min",        "praat_pause_rate_per_min",        "{:.3f}"),
-    ("overlap_ratio",     "overlap_ratio",                   None,                              "{:.4f}"),
+    ("pause_rate",        "praat_pause_rate_per_min",        "praat_pause_rate_per_min",        "{:.2f}"),
+    ("overlap_ratio",     "overlap_ratio",                   None,                              "{:.2f}"),
 ]
 
 # Features whose number is unreliable under heavy overlap -> abstained (grouped
@@ -257,7 +271,8 @@ def _hedge_sentence(overlap_ratio: float | None) -> str:
     AbstentionDetector recognizes the pitch hedge.
     """
     if overlap_ratio is not None:
-        ov = f" ({overlap_ratio:.4f} overlap ratio)"
+        # Two-decimal surface form (F15) — matches FEATURE_ORDER's "{:.2f}".
+        ov = f" ({overlap_ratio:.2f} overlap ratio)"
     else:
         ov = ""
     return (
@@ -265,6 +280,34 @@ def _hedge_sentence(overlap_ratio: float | None) -> str:
         f"measures (F0, jitter, shimmer, HNR) cannot be reliably estimated from "
         f"the mixture and are not reported."
     )
+
+
+def assert_feature_columns_exist(fieldnames: Sequence[str], *, strict: bool = True) -> list[str]:
+    """Fail loudly when a FEATURE_ORDER csv_column is absent from the CSV header.
+
+    Every lookup in resolve_value goes through row.get(csv_col), which returns None for a
+    misspelled column exactly as it does for a genuinely missing measurement -- so a typo
+    silently deletes a feature from every target instead of raising. That is precisely how
+    "hnr_db" and "shimmer_pct" removed hnr and shimmer from all 39,800 targets without a
+    single warning. f0_mean / f0_sd are exempt: they legitimately resolve from --clean_f0
+    and only fall back to the CSV for clean-by-construction rows.
+
+    Returns the list of missing columns (empty when clean).
+    """
+    have = set(fieldnames or ())
+    missing = [
+        col for name, col, _clean_key, _fmt in FEATURE_ORDER
+        if col not in have and name not in ("f0_mean", "f0_sd")
+    ]
+    if missing and strict:
+        raise SystemExit(
+            "[FATAL] FEATURE_ORDER references CSV columns that do not exist: "
+            f"{missing}\nCSV header: {sorted(have)}\n"
+            "A missing column is indistinguishable from a missing measurement, so the "
+            "affected features would be silently dropped from EVERY target. Fix the "
+            "column name in FEATURE_ORDER (or pass a CSV that has it) before rebuilding."
+        )
+    return missing
 
 
 # ── GT resolution ────────────────────────────────────────────────────────────
@@ -290,20 +333,48 @@ def resolve_value(
     Returns None when the value is missing / NaN (caller omits the clause).
     """
     if short_name in ("f0_mean", "f0_sd"):
-        if clean_f0 is None:
-            return None
-        cf = clean_f0.get(filename)
-        if not cf:
-            return None
         key = "f0_mean_hz" if short_name == "f0_mean" else "f0_sd_hz"
-        return _to_float(cf.get(key))
+        if clean_f0 is not None:
+            cf = clean_f0.get(filename)
+            if cf:
+                v = _to_float(cf.get(key))
+                if v is not None:
+                    return v
+        # BUGFIX 2026-07-28: clean_f0_{split}.json is keyed ONLY by MIXTURE filenames --
+        # it predates the s1clean augmentation, so it covers 3000/3000 mix clips and
+        # 0/3000 s1clean clips. Every clean clip therefore lost its f0 clause, leaving
+        # f0 valued in 0.32% of dev targets (~0.63 clips per 200-clip val subset, which
+        # is why val/srcc_f0_mean could only ever read +1 or -1).
+        #
+        # The fallback is DELIBERATELY NARROW. The original rule -- never emit
+        # mixture-contaminated pitch -- is correct and is preserved: we fall back to the
+        # CSV only when the row's audio is clean BY CONSTRUCTION (an _s1clean clip is the
+        # isolated s1 stem) or when the pipeline explicitly marked the row as having had
+        # clean f0 substituted. A raw mixture row with no clean_f0 entry still returns
+        # None. Verified on 2894 test clips: clean_f0[<mix>.wav][f0_mean_hz] equals the
+        # CSV f0_mean_hz of the matching _s1clean row EXACTLY (max diff 0.00 Hz), so this
+        # returns the same clean-stem number the JSON would have.
+        is_clean_by_construction = "_s1clean" in filename
+        substituted = str(row.get("f0_clean_substituted", "")).strip().lower() in (
+            "1", "true", "yes"
+        )
+        if is_clean_by_construction or substituted:
+            return _to_float(row.get(csv_col))
+        return None
 
     if short_name == "overlap_ratio":
-        # Oracle VAD overlap preferred; else the (pyannote) overlap_ratio column.
-        v = _to_float(row.get("overlap_ratio_vad"))
-        if v is None:
-            v = _to_float(row.get("overlap_ratio"))
-        return v
+        # 2026-08-03: the "oracle VAD overlap preferred" path is REMOVED. It was
+        # aspirational -- the column it preferred is empty on every clip that matters.
+        # Measured over all 39,800 rows of features_corrected_merged/{train-100,dev,test}:
+        #   mixture rows (19,900): overlap_ratio_vad is NaN on 19,900 / 19,900
+        #   s1clean rows (19,900): overlap_ratio_vad == overlap_ratio on 19,900 / 19,900
+        #   rows where the vad column would yield a DIFFERENT value: 0
+        # So the fallback fired on 100% of mixtures and the preference was a no-op. Keeping
+        # it was a live hazard: anything later written into that column would silently
+        # override the working source with no error -- the same silent-precedence failure
+        # as the hnr_db/shimmer_pct rename that zeroed two features across every target.
+        # If a real VAD-derived overlap is ever produced, re-add this deliberately.
+        return _to_float(row.get("overlap_ratio"))
 
     # Recoverable scalars with a clean-features key: clean GT preferred.
     if clean_key is not None and clean_features is not None:
@@ -321,13 +392,17 @@ def overlap_for_decision(
 ) -> float:
     """The overlap ratio used for the abstention decision.
 
-    Same source as the reported overlap_ratio: oracle overlap_ratio_vad when
-    present, else overlap_ratio, else 0.0 (a clip with no overlap column is a
-    clean single-speaker recording -> nothing abstained).
+    Same source as the reported overlap_ratio: the `overlap_ratio` column, else 0.0
+    (a clip with no overlap column is a clean single-speaker recording -> nothing
+    abstained).
+
+    2026-08-03: the `overlap_ratio_vad` preference was removed here for the same reason
+    as in resolve_value -- that column is NaN on 100% of mixture rows across all three
+    splits, so the preference never once fired on a clip where abstention matters. This
+    function decides WHETHER TO ABSTAIN, so a silent wrong-source override here would be
+    the most damaging place in the codebase for it.
     """
-    v = _to_float(row.get("overlap_ratio_vad"))
-    if v is None:
-        v = _to_float(row.get("overlap_ratio"))
+    v = _to_float(row.get("overlap_ratio"))
     if v is None:
         return 0.0
     return v
@@ -436,6 +511,11 @@ def main(argv=None) -> int:
     if not args.features_csv.exists():
         print(f"ERROR: features_csv {args.features_csv} not found", file=sys.stderr)
         return 2
+
+    # Validate the header BEFORE building anything: a misspelled column silently deletes
+    # a feature from every target (see assert_feature_columns_exist).
+    with args.features_csv.open() as _f:
+        assert_feature_columns_exist(csv.DictReader(_f).fieldnames)
 
     clean_features = _load_json(args.clean_features)
     clean_f0 = _load_json(args.clean_f0)

@@ -296,10 +296,28 @@ def test_invalid_grounding_mode_raises():
 
 
 def test_default_beta_maps_to_catalog():
+    """β comes from the catalog where present, else 0.0 — the code's ACTUAL contract.
+
+    This test used to index `DEFAULT_BITS_BETA[nm]` directly, which asserts that every
+    canonical feature has a catalog entry. It does not: the catalog carries 8 of the 11
+    features (jitter, shimmer and hnr were never added), so the test raised KeyError while
+    the production code was behaving correctly — `decoupled_grounding.py:373,385` has always
+    read `DEFAULT_BITS_BETA.get(nm, 0.0)`.
+
+    Fixed by testing the real contract rather than backfilling three invented β values into
+    a lane that was built and trained but never evaluated. Inventing them would have been
+    worse than the bug: fabricated constants read as authoritative later, which is exactly
+    how a target-recoverability figure (0.726) propagated into three memos as head quality.
+    """
     head = DecoupledGroundingHead(d_model=8, d_patch=8, grounding_mode="bottleneck")
     beta = head.bits_beta.tolist()
     for i, nm in enumerate(feature_names()):
-        assert abs(beta[i] - DEFAULT_BITS_BETA[nm]) < 1e-6, f"{nm} β mismatch"
+        expected = DEFAULT_BITS_BETA.get(nm, 0.0)
+        assert abs(beta[i] - expected) < 1e-6, f"{nm} β mismatch (expected {expected})"
+    # features absent from the catalog must default to exactly 0.0, not to anything invented
+    missing = [nm for nm in feature_names() if nm not in DEFAULT_BITS_BETA]
+    for nm in missing:
+        assert beta[feature_names().index(nm)] == 0.0, f"{nm} not in catalog -> must be 0.0"
     # global features β=0, overlap_ratio 0.05, pauses 0.02.
     assert beta[_SNR] == 0.0 and abs(beta[_OVR] - 0.05) < 1e-6
 

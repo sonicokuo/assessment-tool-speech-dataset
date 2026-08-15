@@ -26,8 +26,9 @@ helper) so they are CPU-unit-testable:
         mean_SRCC(reliable, non-degenerate)  -  lam_nmae * mean_nMAE
      with a HARD BLEU/ROUGE-L FLUENCY FLOOR (returns -inf below the floor so a
      numerically-good but degenerate-prose checkpoint can never win). `snr` is
-     excluded per the memo (its scalar SRCC sits ~0 on Libri2Mix and only adds
-     variance); features with too few paired clips are also excluded.
+     INCLUDED since the B2 flip (2026-07-11 recalibration, see
+     DEGENERATE_SELECTION_FEATURES below); `overlap_ratio` is excluded (FiLM
+     conditioning leak); features with too few paired clips are also excluded.
   3. ema                   — exponential moving average to DENOISE the selection
      signal across eval steps.
   4. avg_state_dicts       — SWA / model-soup parameter averaging over the last
@@ -78,6 +79,34 @@ SELECTION_FEATURES: tuple[str, ...] = tuple(FEATURE_NAMES)
 #     waveform" measure means overlap_ratio does not belong in it.
 # Kept as a named set (not hard-coded into composite_score) so it is auditable.
 DEGENERATE_SELECTION_FEATURES: frozenset[str] = frozenset({"overlap_ratio"})
+
+# ── THE frozen headline set (fix F8, 2026-07-15 metric-consistency audit) ────
+# ONE headline, defined ONCE, here. The in-training val selector (train.py §6)
+# and the test-time reporting scripts (scripts/score_inference_vs_clean.py,
+# scripts/bandfree_val_eval.py) must IMPORT this constant rather than keep
+# their own lists — the audit found the val selector (5 robust features) and
+# the test reporter (~8 features incl f0_mean/f0_sd and a stale
+# articulation_rate row) had silently diverged.
+# Membership rationale:
+#   * snr IN  — independently sampled 0-40 dB on the corrected data, one of the
+#     strongest learned features (B2 flip; see DEGENERATE_SELECTION_FEATURES).
+#   * srmr, speaking_rate, pause_count, pause_rate IN — recoverable from the mix.
+#   * f0_mean / f0_sd OUT — diagnosed ill-posed / mode-collapsing (2026-07-13);
+#     report them in the ill-posed / abstention panel, never in the headline mean.
+#   * overlap_ratio OUT — the model's FiLM conditioning input (partial leak).
+#   * articulation_rate OUT — dropped from the supervised set 2026-06-24.
+HEADLINE_FEATURES: tuple[str, ...] = (
+    "snr", "srmr", "speaking_rate", "pause_count", "pause_rate",
+)
+# Import-time consistency checks: the headline is exactly the recoverable set
+# minus the degenerate (conditioning-leak) set, and a subset of the supervised
+# selection features — drift in any of the three is caught immediately.
+assert frozenset(HEADLINE_FEATURES) == RECOVERABLE_FEATURES - DEGENERATE_SELECTION_FEATURES, (
+    "HEADLINE_FEATURES must equal RECOVERABLE_FEATURES minus DEGENERATE_SELECTION_FEATURES"
+)
+assert frozenset(HEADLINE_FEATURES) <= frozenset(SELECTION_FEATURES), (
+    "HEADLINE_FEATURES must be a subset of SELECTION_FEATURES"
+)
 
 # Minimum paired (pred, gt) clips before a feature's SRCC/nMAE is trusted in the
 # composite. Below this the rank correlation is pure sampling noise.
@@ -230,8 +259,9 @@ def composite_score(
       * in `reliable_features` (the recoverable set; ill-posed features under
         overlap are excluded — the model is meant to hedge there, not be ranked
         on its number),
-      * NOT in `degenerate_features` (snr-scalar by default; ~0 SRCC, pure
-        variance per the memo),
+      * NOT in `degenerate_features` (overlap_ratio by default — the FiLM
+        conditioning input, a partial leak; snr is NOT degenerate and stays IN
+        since the B2 flip),
       * NON-DEGENERATE in the data: has >= `min_pairs` paired clips and a defined
         SRCC (>=2 pairs, non-zero variance).
 
@@ -264,23 +294,38 @@ def headline_band_free_means(
 ) -> dict:
     """Headline band-free aggregates over the SAME feature set `composite_score` uses.
 
-    Returns ``{"mean_srcc", "mean_nmae", "features_used", "n_features"}`` where the
-    means are over features that are reliable, NOT degenerate (snr-scalar excluded),
-    and have >= ``min_pairs`` paired clips with a defined statistic. ``mean_srcc`` is
-    THE headline reporting number ("mean SRCC over reliable features, snr excluded").
-    Surfaced as its own function so train.py can log it directly instead of leaving it
-    buried inside `composite_score` — the logged `val/srcc_mean` is a different, raw
-    all-feature mean and must not be mistaken for this.
+    Returns ``{"mean_srcc", "mean_nmae", "mean_coverage", "features_used",
+    "n_features"}``. The SRCC/nMAE means are over features that are reliable, NOT
+    degenerate (overlap_ratio excluded; snr is INCLUDED since the B2 flip — with
+    the default reliable/degenerate sets this filter yields exactly
+    ``HEADLINE_FEATURES``), and have >= ``min_pairs`` paired clips with a defined
+    statistic. ``mean_srcc`` is THE headline reporting number ("mean SRCC over the
+    robust headline features, snr included"). Surfaced as its own function so
+    train.py can log it directly instead of leaving it buried inside
+    `composite_score` — the logged `val/srcc_mean` is a different, raw all-feature
+    mean and must not be mistaken for this.
+
+    ``mean_coverage`` is averaged over ALL reliable non-degenerate features
+    WITHOUT the min_pairs gate. Rationale (2026-07-15 audit risk 3): SRCC pairs
+    form only where a claim parses, so under asymmetric degeneration two models
+    are silently scored on different clip subsets — coverage must always be
+    visible beside the SRCC, including for a feature whose emission collapsed
+    below min_pairs (that is precisely when it matters most).
     """
     reliable = frozenset(reliable_features)
     degenerate = frozenset(degenerate_features)
 
     srccs: list[float] = []
     nmaes: list[float] = []
+    covs: list[float] = []
     used: list[str] = []
     for f, stats in per_feature.items():
         if f not in reliable or f in degenerate:
             continue
+        # Coverage is collected BEFORE the min_pairs gate (see docstring).
+        cov = stats.get("coverage")
+        if cov is not None:
+            covs.append(cov)
         if stats.get("n", 0) < min_pairs:
             continue
         s = stats.get("srcc")
@@ -294,6 +339,7 @@ def headline_band_free_means(
     return {
         "mean_srcc": (sum(srccs) / len(srccs)) if srccs else 0.0,
         "mean_nmae": (sum(nmaes) / len(nmaes)) if nmaes else 0.0,
+        "mean_coverage": (sum(covs) / len(covs)) if covs else 0.0,
         "features_used": used,
         "n_features": len(srccs),
     }

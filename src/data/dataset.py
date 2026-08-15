@@ -10,7 +10,14 @@ from torch.utils.data import Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data.feature_set import N_FEATURES, build_nums_target, extract_scalars
+from data.feature_set import (
+    N_FEATURES,
+    assert_supervised_columns_exist,
+    build_nums_target,
+    extract_scalars,
+    hedge_mask,
+    validate_f0_source,
+)
 
 
 class PreprocessedDataset(Dataset):
@@ -27,9 +34,13 @@ class PreprocessedDataset(Dataset):
         features_csv: str | None = None,
         snr_map_dir: str | None = None,
         srmr_map_dir: str | None = None,
+        zero_overlap_input: bool = False,
     ):
         self.data_dir = data_dir
         self.files = sorted([f for f in os.listdir(data_dir) if f.endswith(".pt")])
+        # See the [zero_overlap_input] note in __getitem__. Default False → byte-identical
+        # to every existing run; only an explicit config opt-in changes behaviour.
+        self.zero_overlap_input = bool(zero_overlap_input)
 
         self.descriptions = None
         if descriptions_path and os.path.exists(descriptions_path):
@@ -68,8 +79,19 @@ class PreprocessedDataset(Dataset):
         # in train.py automatically skips contributions from clips with no scalars.
         self.feature_csv_map: dict[str, dict] = {}
         if features_csv and os.path.exists(features_csv):
+            # F11 (2026-07-16): fail loud if the CSV's f0 columns are not the
+            # clean-substituted build (audit risk 10 — the noisy-NAMED f0_*_hz
+            # columns are only safe when overwritten in-place with clean-frame
+            # values; a raw mixture CSV would silently train aux-MSE/nums-CE on
+            # ill-posed f0).
+            validate_f0_source(features_csv)
             with open(features_csv) as f:
-                for row in csv.DictReader(f):
+                reader = csv.DictReader(f)
+                # 2026-07-28: a RENAMED column reads exactly like a missing measurement,
+                # so a schema drift silently strips a feature's aux-MSE/NLL supervision.
+                # That is how hnr/shimmer were lost from every target. Stop, don't warn.
+                assert_supervised_columns_exist(reader.fieldnames)
+                for row in reader:
                     self.feature_csv_map[row["filename"]] = row
 
     def __len__(self):
@@ -83,9 +105,25 @@ class PreprocessedDataset(Dataset):
         stem = os.path.splitext(self.files[idx])[0]
         filename = cached.get("filename", self.files[idx])
 
+        # [zero_overlap_input] P1 / item 52b (2026-08-08). `overlap_info` is derived from
+        # ORACLE Silero VAD on the CLEAN s1/s2 STEMS (src/preprocess.py:19-21) — information
+        # that does not exist at test time in any deployment. That is not label leakage (fixed
+        # 2026-04 by removing clip_overlap_ratio) but ORACLE INFORMATION AT INFERENCE, and it
+        # is corrosive to the abstention claim: a blind control showed f0's graded uncertainty
+        # collapse from rho +1.000 to -0.900 once the channel is zeroed, i.e. the calibration
+        # was manufactured from the input rather than heard. Measured at inference (full 6000):
+        # headline -0.017, ill-posed panel +0.026, f0_mean +0.112.
+        # Zeroing HERE (not deleting the channel) keeps OverlapEmbedding/cond_proj in the graph,
+        # so the parameter count is IDENTICAL to the oracle-conditioned arm and the comparison
+        # is matched — an embedding of a zero tensor is just a learned constant bias.
+        # No re-preprocessing needed.
+        _oi = cached["overlap_info"]
+        if self.zero_overlap_input:
+            _oi = torch.zeros_like(_oi)
+
         result = {
             "audio_features": cached["audio_features"],
-            "overlap_info": cached["overlap_info"],
+            "overlap_info": _oi,
             "filename": filename,
             "overlap_segments": cached.get("overlap_segments", []),
         }
@@ -132,14 +170,19 @@ class PreprocessedDataset(Dataset):
             row = self.feature_csv_map.get(filename)
             if row is not None:
                 scalars, mask = extract_scalars(row)
-                result["gt_scalars"] = scalars              # (13,)
-                result["gt_mask"] = mask                    # (13,) bool
-                result["target_nums"] = build_nums_target(row)
+                result["gt_scalars"] = scalars              # (N_FEATURES,)
+                result["gt_mask"] = mask                    # (N_FEATURES,) bool — PRESENCE (NLL uses this)
+                # B3: hedge mask (True where an ill-posed feature is abstained under heavy
+                # overlap). The MSE + nums-CE channels abstain on these; the NLL keeps the
+                # full presence mask. Hedge the nums target too so it agrees with the prose.
+                result["hedge_mask"] = hedge_mask(row)      # (N_FEATURES,) bool
+                result["target_nums"] = build_nums_target(row, hedge=True)
             else:
                 # Filename not in CSV — emit zero scalars + all-False mask so the loss
                 # contributes nothing for this clip. Empty nums target → train.py skips.
                 result["gt_scalars"] = torch.zeros(N_FEATURES, dtype=torch.float32)
                 result["gt_mask"] = torch.zeros(N_FEATURES, dtype=torch.bool)
+                result["hedge_mask"] = torch.zeros(N_FEATURES, dtype=torch.bool)
                 result["target_nums"] = ""
 
         return result
@@ -262,5 +305,7 @@ def collate_fn(batch):
         out["gt_scalars"] = torch.stack([item["gt_scalars"] for item in batch], dim=0)
         out["gt_mask"] = torch.stack([item["gt_mask"] for item in batch], dim=0)
         out["target_nums"] = [item["target_nums"] for item in batch]
+        if "hedge_mask" in batch[0]:      # B3: point-estimate-channel abstention mask
+            out["hedge_mask"] = torch.stack([item["hedge_mask"] for item in batch], dim=0)
 
     return out

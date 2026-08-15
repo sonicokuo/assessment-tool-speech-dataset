@@ -1,8 +1,8 @@
-"""Canonical 12-feature list for the new-project multi-task training and the aux regression head.
+"""Canonical 11-feature list for the new-project multi-task training and the aux regression head.
 
 Single source of truth for:
   - The numerical target string used in forward A ("snr=15.66 srmr=4.5 ...").
-  - The (B, 12) scalar tensor + mask used by the aux regression head's MSE.
+  - The (B, 11) scalar tensor + mask used by the aux regression head's MSE.
 
 The order matches the canonical descriptions builder
 (scripts/build_canonical_descriptions.py), which emits the 12 features in this
@@ -29,7 +29,9 @@ Update history:
 
 from __future__ import annotations
 
+import csv
 import math
+import os
 
 import torch
 
@@ -37,21 +39,30 @@ import torch
 # (short_name, csv_column, format_string)
 # Order matches the canonical descriptions builder (scripts/build_canonical_descriptions.py):
 #   snr, srmr, hnr, f0_mean, f0_sd, jitter, shimmer, speaking_rate,
+#
+# NUMERIC SURFACE FORM (2026-07-16, F15): every format is a CONSTANT-WIDTH two-decimal
+# "{:.2f}". Mixed decimal widths (srmr "3.2667", jitter/shimmer "1.7458" vs snr "15.66")
+# break digit-position/magnitude alignment for a digit-by-digit tokenizer — the same
+# fractional digit lands at a different token position per feature, diluting the
+# audio→digit gradient (Singh & Strouse, arXiv:2402.14903; R4 in the 2026-07-13
+# training-method memo). This changes TRAINING TARGETS: it takes effect at the next
+# dataset rebuild + retrain, and has no effect on already-built targets or running jobs.
+# pause_count keeps integer emission via _INT_FEATURES (its fmt entry is never used).
 SUPERVISED_FEATURES: list[tuple[str, str, str]] = [
     ("snr",               "snr_db",                          "{:.2f}"),
-    ("srmr",              "srmr",                            "{:.4f}"),
+    ("srmr",              "srmr",                            "{:.2f}"),
     ("f0_mean",           "f0_mean_hz",                      "{:.2f}"),
     ("f0_sd",             "f0_sd_hz",                        "{:.2f}"),
-    ("speaking_rate",     "praat_speaking_rate_syl_sec",     "{:.3f}"),
-    ("pause_count",       "praat_pause_count",               "{:d}"),
-    ("pause_rate",        "praat_pause_rate_per_min",        "{:.3f}"),
-    ("overlap_ratio",     "overlap_ratio",                   "{:.4f}"),
-    ("jitter",            "jitter_local_pct",                "{:.4f}"),
-    ("shimmer",           "shimmer",                         "{:.4f}"),
+    ("speaking_rate",     "praat_speaking_rate_syl_sec",     "{:.2f}"),
+    ("pause_count",       "praat_pause_count",               "{:.2f}"),  # int-cast wins (see _INT_FEATURES)
+    ("pause_rate",        "praat_pause_rate_per_min",        "{:.2f}"),
+    ("overlap_ratio",     "overlap_ratio",                   "{:.2f}"),
+    ("jitter",            "jitter_local_pct",                "{:.2f}"),
+    ("shimmer",           "shimmer",                         "{:.2f}"),
     ("hnr",               "hnr",                             "{:.2f}"),
 ]
 
-N_FEATURES: int = len(SUPERVISED_FEATURES)  # 12
+N_FEATURES: int = len(SUPERVISED_FEATURES)  # 11 (voice patch 2026-06-24 dropped articulation_rate)
 
 
 # Per-feature scales used to NORMALIZE the auxiliary-head MSE / heteroscedastic NLL.
@@ -157,25 +168,214 @@ def _to_float(val):
         return float("nan")
 
 
-def build_nums_target(row: dict) -> str:
+# ── F11: clean-f0 GT fail-loud validation (2026-07-15 audit risk 10) ─────────
+# SUPERVISED_FEATURES maps ("f0_mean", "f0_mean_hz") and ("f0_sd", "f0_sd_hz") —
+# noisy-NAMED (mixture-measured) columns. They are only safe as GT because the
+# shipped CSVs were clean-substituted IN PLACE (scripts/make_clean_f0_csv.py
+# overwrites f0_*_hz with clean-frame values, writing *_cleanf0.csv / *_cleangt.csv).
+# One wrong --features_csv silently trains/evals on noisy mixture f0. These helpers
+# let a call site fail loud instead.
+#
+# STRICT_CLEAN_F0: opt-in module flag. Default False = behavior byte-identical to
+# before. When a dataset owner sets it True (data.feature_set.STRICT_CLEAN_F0 = True),
+# build_nums_target / extract_scalars refuse to run until validate_f0_source() has
+# been called once for the features CSV feeding the run.
+STRICT_CLEAN_F0: bool = False
+_F0_SOURCE_VALIDATED: bool = False
+
+# Sentinel marker column convention: a CSV column named `f0_clean_substituted` whose
+# value is 1 declares "f0_*_hz in this file hold clean-frame values".
+_F0_SENTINEL_COLUMN = "f0_clean_substituted"
+# Filename convention already in use: features_aug_train_cleangt.csv, dev_cleanf0.csv.
+_F0_CLEAN_NAME_MARKERS = ("cleanf0", "cleangt")
+_F0_CLEAN_NAMED_COLUMNS = ("f0_mean_hz_clean", "f0_sd_hz_clean")
+_F0_NOISY_NAMED_COLUMNS = ("f0_mean_hz", "f0_sd_hz")
+
+
+def assert_clean_f0_csv(csv_path_or_rows, filename: str | None = None) -> None:
+    """Fail loud if a features CSV's f0 columns may hold noisy MIXTURE values.
+
+    2026-07-15 audit risk 10: f0_mean_hz / f0_sd_hz are noisy-named columns that are
+    only clean because make_clean_f0_csv.py substituted them in place; a config that
+    points at a raw features CSV silently trains on ill-posed mixture f0.
+
+    Accepts either a CSV path (str / os.PathLike) or already-loaded rows (a dict row
+    or an iterable of dict rows; pass `filename` to enable the name-convention check).
+
+    Passes when ANY of these hold:
+      (a) explicitly clean-NAMED columns exist (f0_mean_hz_clean / f0_sd_hz_clean);
+      (b) the sentinel column `f0_clean_substituted` exists with value 1;
+      (c) the CSV filename contains 'cleanf0' or 'cleangt' (existing convention);
+      (d) the CSV has no f0_mean_hz / f0_sd_hz column at all (no f0 GT to poison).
+
+    Otherwise raises RuntimeError naming the file and the risk.
+    """
+    first_row: dict | None = None
+    if isinstance(csv_path_or_rows, (str, os.PathLike)):
+        path = os.fspath(csv_path_or_rows)
+        if filename is None:
+            filename = os.path.basename(path)
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            columns = list(reader.fieldnames or [])
+            first_row = next(iter(reader), None)
+    elif isinstance(csv_path_or_rows, dict):
+        first_row = csv_path_or_rows
+        columns = list(first_row.keys())
+    else:
+        rows = list(csv_path_or_rows)
+        first_row = rows[0] if rows else None
+        columns = list(first_row.keys()) if first_row else []
+
+    # (d) no noisy-named f0 columns at all → nothing to validate.
+    if not any(c in columns for c in _F0_NOISY_NAMED_COLUMNS):
+        return
+    # (a) explicitly clean-named columns present.
+    if any(c in columns for c in _F0_CLEAN_NAMED_COLUMNS):
+        return
+    # (b) sentinel marker column with value 1 (column presence alone suffices when
+    # the file has a header but no data rows).
+    if _F0_SENTINEL_COLUMN in columns:
+        if first_row is None:
+            return
+        sentinel = str(first_row.get(_F0_SENTINEL_COLUMN, "")).strip()
+        if sentinel in ("1", "1.0", "true", "True"):
+            return
+    # (c) filename convention.
+    if filename is not None and any(
+        marker in os.path.basename(filename).lower() for marker in _F0_CLEAN_NAME_MARKERS
+    ):
+        return
+
+    name = filename if filename is not None else "<in-memory rows>"
+    raise RuntimeError(
+        f"clean-f0 GT check FAILED for {name!r}: this CSV has noisy-NAMED f0 columns "
+        f"(f0_mean_hz/f0_sd_hz) with no evidence of clean-frame substitution — no "
+        f"f0_mean_hz_clean/f0_sd_hz_clean columns, no {_F0_SENTINEL_COLUMN}=1 sentinel "
+        f"column, and the filename does not contain 'cleanf0'/'cleangt'. Using it as GT "
+        f"silently trains/scores on ill-posed MIXTURE f0 (2026-07-15 audit risk 10). "
+        f"Regenerate it with scripts/make_clean_f0_csv.py (or add the sentinel column) "
+        f"before pointing --features_csv at it."
+    )
+
+
+def assert_supervised_columns_exist(fieldnames, *, strict: bool = True) -> list:
+    """Fail loudly when a SUPERVISED_FEATURES csv_col is absent from the CSV header.
+
+    THE SAME CLASS OF BUG THAT ERASED hnr AND shimmer FROM EVERY TRAINING TARGET
+    (2026-07-28). `scripts/build_canonical_descriptions.py` asked for "hnr_db" /
+    "shimmer_pct" while features_corrected_merged/*.csv had been regenerated as "hnr" /
+    "shimmer". `row.get()` returns None identically for "column renamed" and "measurement
+    missing", so the features vanished from 39,800 targets without one warning.
+
+    This is the aux-head/nums-target side of the same lookup. A rename here would silently
+    zero the MSE/NLL supervision for that feature and mask it out of the presence mask, so
+    the abstention head would train on a feature it never actually sees -- indistinguishable
+    from "this clip has no measurement". Better to stop the run than to burn a node on it.
+
+    Escape hatch for legitimately partial CSVs (cross-domain sets such as AMI genuinely
+    lack the temporal columns): set AQUA_ALLOW_MISSING_FEATURE_COLS=1, which downgrades
+    this to a printed warning naming exactly which features go unsupervised.
+
+    Returns the list of missing columns (empty when clean).
+    """
+    have = set(fieldnames or ())
+    missing = [(name, col) for name, col, _fmt in SUPERVISED_FEATURES if col not in have]
+    if not missing:
+        return []
+    detail = ", ".join(f"{n} -> {c!r}" for n, c in missing)
+    if not strict or os.environ.get("AQUA_ALLOW_MISSING_FEATURE_COLS") == "1":
+        print(f"[feature_set][WARNING] CSV header lacks {len(missing)} supervised column(s): "
+              f"{detail}. These features will be UNSUPERVISED (masked out) for this run.")
+        return [c for _n, c in missing]
+    raise RuntimeError(
+        f"features_csv is missing {len(missing)} SUPERVISED_FEATURES column(s): {detail}\n"
+        f"CSV header: {sorted(have)}\n"
+        "A renamed column is indistinguishable from a missing measurement, so these "
+        "features would train with silently empty supervision (this is exactly how hnr and "
+        "shimmer were lost from every target on 2026-07-28). Fix the column name in "
+        "SUPERVISED_FEATURES, or set AQUA_ALLOW_MISSING_FEATURE_COLS=1 if the CSV is "
+        "genuinely partial (e.g. a cross-domain set without the temporal features)."
+    )
+
+
+def validate_f0_source(csv_path_or_rows, filename: str | None = None) -> None:
+    """One-shot call site for the dataset: run assert_clean_f0_csv and record success
+    so the STRICT_CLEAN_F0 gate in build_nums_target / extract_scalars is satisfied."""
+    global _F0_SOURCE_VALIDATED
+    assert_clean_f0_csv(csv_path_or_rows, filename=filename)
+    _F0_SOURCE_VALIDATED = True
+
+
+def _strict_clean_f0_gate() -> None:
+    """No-op unless STRICT_CLEAN_F0 is set (default off → behavior identical)."""
+    if STRICT_CLEAN_F0 and not _F0_SOURCE_VALIDATED:
+        raise RuntimeError(
+            "feature_set.STRICT_CLEAN_F0 is enabled but validate_f0_source(features_csv) "
+            "was never called — refusing to build f0 GT from a possibly-noisy CSV "
+            "(f0_mean_hz/f0_sd_hz are mixture-named columns; 2026-07-15 audit risk 10)."
+        )
+
+
+# Overlap threshold at/above which the ill-posed (speaker-intrinsic) features are HEDGED
+# (abstained). MUST match the canonical prose builder's abstain rule
+# (scripts/build_canonical_descriptions.py: overlap_ratio >= 0.5) so the prose, the nums-CE
+# target, and the aux-MSE target all agree on which features are abstained (the B3 fix for the
+# "hedge-only-on-prose" bug). The NLL deliberately does NOT use this — see hedge_mask().
+HEDGE_OVERLAP_TAU: float = 0.5
+
+
+def _hedged_features(row: dict) -> frozenset[str]:
+    """Set of feature short-names abstained for this clip: the ILL_POSED features when
+    overlap_ratio >= HEDGE_OVERLAP_TAU, else empty. Recovered from the CSV with the same
+    deterministic rule the canonical builder used — NEVER parsed from the prose."""
+    ov = _to_float(row.get("overlap_ratio"))
+    if math.isnan(ov) or ov < HEDGE_OVERLAP_TAU:
+        return frozenset()
+    return ILL_POSED_UNDER_OVERLAP_FEATURES
+
+
+def hedge_mask(row: dict) -> "torch.Tensor":
+    """(N_FEATURES,) bool tensor — True where the feature is HEDGED for this clip
+    (ill-posed AND overlap_ratio >= HEDGE_OVERLAP_TAU). NEVER True for a recoverable/counting
+    feature. Used to build the point-estimate (aux-MSE + nums-CE) mask so those channels stop
+    fitting mix-noisy values on hedged clips. The heteroscedastic-NLL / sigma head does NOT use
+    this mask (it keeps the presence mask so it still sees the hard pairs and learns high sigma
+    there — the observability signal). Order matches SUPERVISED_FEATURES."""
+    hedged = _hedged_features(row)
+    return torch.tensor([name in hedged for name in FEATURE_NAMES], dtype=torch.bool)
+
+
+def build_nums_target(row: dict, hedge: bool = False) -> str:
     """Build the bare-numbers training target for B-full's forward A.
 
     Args:
         row: dict mapping CSV column name → raw value (string or already-parsed float).
+        hedge: when True, emit "na" for the ill-posed features on high-overlap clips
+            (overlap_ratio >= HEDGE_OVERLAP_TAU), so the nums-CE target agrees with the hedged
+            prose instead of training the mix-noisy F0/voice values (B3 fix). Recoverable
+            features are always emitted. Default False = byte-identical to before.
 
     Returns:
         Fixed-order space-separated string like
-            "snr=15.66 hnr=8.34 f0_mean=152.46 f0_sd=53.18 ... duration=10.435"
-        with "na" substituted for missing measurements (e.g. silent clips have no F0).
+            "snr=15.66 hnr=8.34 f0_mean=152.46 f0_sd=53.18 ..."
+        with "na" substituted for missing measurements (e.g. silent clips have no F0) and,
+        when hedge=True, for the abstained ill-posed features under heavy overlap.
+        All non-integer values use the constant two-decimal surface form (F15).
 
     Note:
         - Integer-typed features (pause_count) are formatted without decimals.
         - "Genuine zero" features (overlap_ratio, pause_count, pause_rate) are emitted as
-          their numeric value (0.0000 / 0 / 0.000) rather than "na" when zero, because
+          their numeric value (0.00 / 0 / 0.00) rather than "na" when zero, because
           zero is a real measurement for those.
     """
+    _strict_clean_f0_gate()
+    hedged = _hedged_features(row) if hedge else frozenset()
     parts: list[str] = []
     for short_name, csv_col, fmt in SUPERVISED_FEATURES:
+        if short_name in hedged:
+            parts.append(f"{short_name}=na")
+            continue
         raw = row.get(csv_col)
         val = _to_float(raw)
         if math.isnan(val) and short_name not in _GENUINE_ZERO_FEATURES:
@@ -201,6 +401,7 @@ def extract_scalars(row: dict) -> tuple[torch.Tensor, torch.Tensor]:
     The mask is used by compute_loss to zero out MSE contribution from missing slots,
     so the aux head isn't penalized for "this clip has no F0".
     """
+    _strict_clean_f0_gate()
     scalars = torch.zeros(N_FEATURES, dtype=torch.float32)
     mask = torch.zeros(N_FEATURES, dtype=torch.bool)
     for i, (short_name, csv_col, _fmt) in enumerate(SUPERVISED_FEATURES):

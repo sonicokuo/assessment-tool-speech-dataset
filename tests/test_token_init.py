@@ -14,7 +14,7 @@ from model.token_init import (  # noqa: E402
 )
 from data.section_tags import SECTION_TAGS, FEATURE_TAGS, SPECIAL_TOKENS  # noqa: E402
 
-N_OPEN_TAGS = len(SECTION_TAGS) + len(FEATURE_TAGS)  # 15 open tags carry phrases
+N_OPEN_TAGS = len(SECTION_TAGS) + len(FEATURE_TAGS)  # 19 open tags (7 sections + 12 features)
 
 
 # ── catalog → descriptions ───────────────────────────────────────────────────
@@ -153,12 +153,13 @@ def test_padded_embedding_uses_tokenizer_boundary_not_emb_rows():
     # Mirror Qwen3-8B: padding gap (emb_pad - len_tok) LARGER than tokens added,
     # so ALL new ids fall inside the gap (below emb_pad) and the bug drops them all.
     len_tok = 100        # real tokenizer length before add
-    emb_pad = 150        # embedding matrix rows before add (gap = 50 > 19 added)
+    emb_pad = 150        # embedding matrix rows before add (gap = 50 > 23 added)
     dim = 8
 
     tok = _PaddedVocabTok(len_tok)
     added = tok.add_tokens(SPECIAL_TOKENS)   # mirrors train.py add_tokens(...)
-    assert added == len(SPECIAL_TOKENS) == 19
+    # 2026-06-24 voice patch: 7 sections + </sec> + 12 feature tags + </f> + 2 range = 23
+    assert added == len(SPECIAL_TOKENS) == 23
     # EVERY new id sits inside the padding gap (below emb_pad) → triggers the bug
     new_ids = [tok.convert_tokens_to_ids(t) for t in SPECIAL_TOKENS]
     assert min(new_ids) == len_tok and max(new_ids) < emb_pad
@@ -166,10 +167,11 @@ def test_padded_embedding_uses_tokenizer_boundary_not_emb_rows():
     # (bug) padded embedding row count as the boundary → 0 open tags matched
     assert len(build_semantic_tag_init(tok, emb_pad)) == 0
 
-    # (fix) pre-add tokenizer length as the boundary → all 15 open tags matched
+    # (fix) pre-add tokenizer length as the boundary → all 19 open tags matched
+    # (7 section opens + 12 feature opens; 2026-06-24 voice patch added 3 feature tags)
     new_token_start = len(tok) - added       # == len_tok
     row_map = build_semantic_tag_init(tok, new_token_start)
-    assert len(row_map) == N_OPEN_TAGS == 15
+    assert len(row_map) == N_OPEN_TAGS == 19
 
     # Build a padded+resized embedding table and mean-init the tail rows exactly
     # like train.py (rows >= emb_pad get the SAME pretrained-mean vector).
@@ -181,7 +183,7 @@ def test_padded_embedding_uses_tokenizer_boundary_not_emb_rows():
     mean_row = emb.weight[emb_pad].clone()   # the identical mean-init vector
 
     n = semantic_init_new_rows(emb.weight, None, new_token_start, row_map)
-    assert n == N_OPEN_TAGS == 15            # (a) 15 initialized, not 0
+    assert n == N_OPEN_TAGS == 19            # (a) 19 initialized, not 0
 
     # (b) the initialized open-tag rows are NOT all identical, and each differs
     #     from the plain mean-init vector (semantic, not mean, init).

@@ -1,3 +1,15 @@
+
+> ⚠️ **VOID WORKED EXAMPLE — flagged 2026-08-09.** The numbers instantiating Theorem T4b
+> (`g = 0.1295`, `n = 18000`, Hoeffding half-width 0.022, Spearman sigma-vs-error +0.281) come
+> from `$SHARED/logs/reliability_v21_final.log` (2026-06-22, **v21 checkpoint**). That predates
+> the 2026-07-25 aux-head POOLING-DILUTION fix, which invalidated ALL pre-fix aux/sigma-head
+> results — the sigma head had been trained on randomly rescaled inputs. **The THEOREM is
+> unaffected; the WORKED EXAMPLE must be re-instantiated on a post-fix arm.** Note also that
+> this is a THIRD AURC loss definition (0/1 SFS-tolerance correctness, pooled across features),
+> distinct from both the binary-miscoverage and continuous-absolute-error definitions used
+> elsewhere — see `EXPLAINABILITY_2026-08-07.md` §1.19. Always state the loss.
+
+
 Now I have all the numerical anchors. Let me write the complete formal framework.
 
 The framework is self-contained mathematics. I'll deliver it as my final response (per instructions, no .md report file). Here is the complete formal writeup.

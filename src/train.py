@@ -9,6 +9,8 @@ Usage:
 import argparse
 import math
 import os
+import random
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +71,7 @@ from eval.ckpt_selection import (
     should_save_best,
     passes_degeneration_guard,
     degeneration_stats,
+    update_best_bleu,
 )
 # Band-free, lower-variance checkpoint selection (research Q1 protocol):
 # continuous SRCC/nMAE composite with a hard BLEU fluency floor + EMA smoothing,
@@ -79,6 +82,7 @@ from eval.selection_metric import (
     headline_band_free_means,
     ema,
     SELECTION_FEATURES,
+    HEADLINE_FEATURES,
 )
 from data.feature_set import RECOVERABLE_FEATURES
 from data.ckpt_io import (
@@ -235,6 +239,25 @@ def _tokenize_with_eos(
     return target_ids, attn_mask
 
 
+def _val_eos_ids(tokenizer: PreTrainedTokenizerBase) -> list[int]:
+    """Both Qwen enders for decode stopping (F1, 2026-07-16).
+
+    Post-trained Qwen3 sets tokenizer.eos_token = <|im_end|> (151645) while the
+    base/document ender is <|endoftext|> (151643); the model's own
+    generation_config stops on BOTH. Training supervises tokenizer.eos_token_id,
+    but on raw (non-chat-template) inputs the pretrained prior can emit
+    <|endoftext|> instead; a single-id stop set sails past it and the generation
+    continues as off-task boilerplate (a documented Qwen-family failure class).
+    Returns a deduplicated list; on tokenizers without <|endoftext|> this
+    degrades to [eos_token_id].
+    """
+    ids = [tokenizer.eos_token_id]
+    eot = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    if eot is not None and eot != tokenizer.unk_token_id and eot not in ids:
+        ids.append(eot)
+    return ids
+
+
 def unlikelihood_token_loss(logits, target_ids, target_mask, eps: float = 1e-6):
     """Token-level unlikelihood (Welleck et al., ICLR 2020, arXiv:1908.04319).
 
@@ -254,6 +277,96 @@ def unlikelihood_token_loss(logits, target_ids, target_mask, eps: float = 1e-6):
     p_cand = torch.gather(p, 2, ctx.clamp(min=0))
     ul = -(torch.log(torch.clamp(1.0 - p_cand, min=eps)) * valid.float()).sum()
     return ul / valid.float().sum().clamp(min=1.0)
+
+
+# [ditto] Sentence-level anti-repetition on PSEUDO-repetitive data (Xu et al.,
+# NeurIPS 2022, "Learning to Break the Loop"). We tile ONE sentence from each
+# clip's prose target k times and penalize the LM's probability of re-emitting
+# it — unlikelihood only on the copies AFTER the first occurrence. Design
+# constraint (2026-07-15 memo): our real targets INTENTIONALLY repeat the
+# sentence FRAME with different values ("The X is <v>." x N), so the penalty is
+# applied ONLY to these constructed IDENTICAL-sentence tilings, never to the
+# natural targets. Gated behind lambda_ditto > 0 (default 0.0) — one extra LM
+# forward per batch when on, byte-identical training when off.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split prose into sentences on terminal punctuation. Pure, regex-based —
+    good enough for the templated quality descriptions ('The X is <v>. ...')."""
+    return [s.strip() for s in _SENT_SPLIT_RE.split(text or "") if s.strip()]
+
+
+def build_ditto_tiled_batch(
+    tokenizer: PreTrainedTokenizerBase,
+    target_texts: list[str],
+    max_length: int,
+    device: torch.device,
+    rng: "random.Random | None" = None,
+    k_min: int = 8,
+    k_max: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-clip pseudo-repetitive sequences: one target sentence tiled k times.
+
+    For each clip: sample ONE sentence from its prose target, tile it k times
+    (k uniform in [k_min, k_max]), truncate to max_length tokens. The first copy
+    is tokenized sentence-initial and every later copy with a leading space (the
+    mid-text BPE form), so the token stream matches what a looping decoder would
+    actually emit. No EOS is appended — the sequence is a NEGATIVE example, its
+    ending is never supervised.
+
+    Returns:
+        tiled_ids:    (B, L) long — tiled token ids, padded with pad/eos id.
+        penalty_mask: (B, L) long — 1 exactly on the tokens of the 2nd..k-th
+                      copies (the repetitions AFTER the first occurrence), 0 on
+                      the first copy and on padding. An empty target yields an
+                      all-zero row (contributes nothing to the loss).
+    """
+    rng = rng or random
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    ids_rows: list[list[int]] = []
+    pen_rows: list[list[int]] = []
+    for text in target_texts:
+        sents = _split_sentences(text)
+        sent = rng.choice(sents) if sents else ""
+        if not sent:
+            ids_rows.append([])
+            pen_rows.append([])
+            continue
+        k = rng.randint(k_min, k_max)
+        first = list(tokenizer.encode(sent, add_special_tokens=False))
+        rep = list(tokenizer.encode(" " + sent, add_special_tokens=False))
+        ids = (first + rep * (k - 1))[:max_length]
+        n_first = min(len(first), len(ids))
+        pen_rows.append([0] * n_first + [1] * (len(ids) - n_first))
+        ids_rows.append(ids)
+
+    L = max((len(r) for r in ids_rows), default=1) or 1
+    B = len(ids_rows)
+    tiled_ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
+    penalty_mask = torch.zeros((B, L), dtype=torch.long, device=device)
+    for i, (ids, pen) in enumerate(zip(ids_rows, pen_rows)):
+        if ids:
+            tiled_ids[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+            penalty_mask[i, : len(pen)] = torch.tensor(pen, dtype=torch.long, device=device)
+    return tiled_ids, penalty_mask
+
+
+def ditto_unlikelihood_loss(logits, target_ids, penalty_mask, eps: float = 1e-6):
+    """-log(1 - p(repeated token)) averaged over the penalized positions.
+
+    logits (B,L,V) must be ALIGNED so logits[b, j] is the distribution predicting
+    target_ids[b, j] (the caller does the next-token shift, same convention as
+    number_token_loss). penalty_mask (B,L) is 1 only on repetition tokens AFTER
+    the first sentence copy — the first occurrence and padding contribute 0.
+    """
+    p = torch.nn.functional.softmax(logits.float(), dim=-1)
+    p_tgt = torch.gather(p, 2, target_ids.clamp(min=0).unsqueeze(-1)).squeeze(-1)  # (B, L)
+    mask = penalty_mask.float()
+    loss = -(torch.log(torch.clamp(1.0 - p_tgt, min=eps)) * mask).sum()
+    return loss / mask.sum().clamp(min=1.0)
 
 
 def _build_section_ctx(
@@ -485,6 +598,72 @@ def _get_digit_ids(tokenizer: PreTrainedTokenizerBase) -> torch.Tensor:
     return cached
 
 
+# [ntl] F13 (2026-07-16): the model.ntl.number_token_loss in this repo is the
+# EXPECTED-VALUE form, |E_pred - target_digit| (an L1 on the expectation, the
+# NTL-MSE family) — NOT the Wasserstein/CDF form its docstring's "WAS/abs" name
+# suggests. The two differ on multimodal digit distributions: mass split evenly
+# on y-1 and y+1 scores 0 under |E - y| but 1 under true W1. Zausinger et al.
+# (ICML 2025) prefer WAS exactly for that case, so the CDF form below is the
+# default (`ntl_form: "was"`); `ntl_form: "mse"` selects the legacy
+# expected-value penalty. Lives here (not model/ntl.py) per file ownership.
+def number_token_loss_was(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    digit_ids: torch.Tensor,
+    target_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """NTL-WAS: Wasserstein-1 (CDF) distance on digit-target positions.
+
+    Same contract as model.ntl.number_token_loss (logits (B,S,V) aligned to
+    target_ids (B,S); digit_ids (10,) in value order; target_mask 1 at content),
+    but the per-position penalty is the TRUE W1 between the predicted digit
+    distribution and the one-hot target:
+
+        W1 = sum_{k=0..9} | CDF_pred(k) - CDF_onehot(k) |
+           = sum_d p_d * |d - target_digit|          (point-mass target)
+
+    0 when concentrated on the correct digit, grows with ordinal distance, and
+    (unlike |E_pred - y|) cannot be gamed by symmetric multimodal mass. Returns
+    a graph-connected 0.0 when the batch has no digit-target positions.
+    """
+    if logits.dim() != 3:
+        raise ValueError(f"logits must be (B, S, V); got shape {tuple(logits.shape)}")
+    if target_ids.shape != logits.shape[:2]:
+        raise ValueError(
+            f"target_ids {tuple(target_ids.shape)} must match logits[:2] "
+            f"{tuple(logits.shape[:2])}"
+        )
+    device = logits.device
+    digit_ids = digit_ids.to(device)
+    # Same digit-position masking as model.ntl.number_token_loss.
+    eq = target_ids.unsqueeze(-1) == digit_ids.view(1, 1, -1)   # (B, S, 10) bool
+    is_digit = eq.any(dim=-1)                                    # (B, S) bool
+    tgt_value = eq.float().argmax(dim=-1)                        # (B, S) in 0..9
+    if target_mask is not None:
+        is_digit = is_digit & target_mask.to(device).bool()
+    if not bool(is_digit.any()):
+        return (logits.sum() * 0.0)
+    digit_logits = logits.index_select(dim=-1, index=digit_ids)  # (B, S, 10)
+    p = torch.softmax(digit_logits.float(), dim=-1)              # (B, S, 10)
+    cdf_pred = torch.cumsum(p, dim=-1)                           # (B, S, 10)
+    # One-hot target's CDF is the step function 1[k >= target_digit].
+    ks = torch.arange(10, device=device).view(1, 1, -1)
+    cdf_true = (ks >= tgt_value.unsqueeze(-1)).to(cdf_pred.dtype)
+    w1 = (cdf_pred - cdf_true).abs().sum(dim=-1)                 # (B, S)
+    mask_f = is_digit.to(w1.dtype)
+    return (w1 * mask_f).sum() / mask_f.sum().clamp(min=1.0)
+
+
+def _ntl_loss(logits, target_ids, digit_ids, target_mask, form: str) -> torch.Tensor:
+    """Dispatch the NTL penalty by config `ntl_form`: 'was' (CDF Wasserstein-1,
+    default) or 'mse' (legacy expected-digit |E - y| from model.ntl)."""
+    if form == "was":
+        return number_token_loss_was(logits, target_ids, digit_ids, target_mask=target_mask)
+    if form == "mse":
+        return number_token_loss(logits, target_ids, digit_ids, target_mask=target_mask)
+    raise ValueError(f"ntl_form must be 'was' or 'mse', got {form!r}")
+
+
 def _ce_against_target(
     llm: nn.Module,
     embed_layer: nn.Module,
@@ -495,6 +674,7 @@ def _ce_against_target(
     max_length: int,
     device: torch.device,
     section_ctx: dict | None = None,
+    prefix_mask: torch.Tensor | None = None,
     return_ntl_tensors: bool = False,
     return_hidden: bool = False,
 ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
@@ -524,6 +704,10 @@ def _ce_against_target(
                         professor's "LM generates a query vector" design.
     """
     target_ids, target_attn = _tokenize_with_eos(tokenizer, target_text, max_length, device)
+    # BUGFIX 2026-07-25: training passed NO attention_mask, so the LM attended over
+    # (a) collate-zero-padded PREFIX positions and (b) padded TARGET positions —
+    # neither exists at inference (batch=1), a systematic train/inference mismatch.
+    # prefix_mask is (B, N) 1 at real prefix tokens; None keeps legacy behavior.
 
     prompt_embeds = embed_layer(prompt_ids.expand(prefix_embeds.shape[0], -1))
     target_embeds = embed_layer(target_ids)
@@ -550,35 +734,40 @@ def _ce_against_target(
     target_labels[target_attn == 0] = -100
     labels = torch.cat([ignore_labels, target_labels], dim=1)
 
+    attn_mask = None
+    if prefix_mask is not None:
+        B_ = prefix_embeds.shape[0]
+        attn_mask = torch.cat([
+            prefix_mask.to(device=device, dtype=torch.long),
+            torch.ones((B_, prompt_embeds.shape[1]), dtype=torch.long, device=device),
+            target_attn.to(torch.long),
+        ], dim=1)
     outputs = llm(inputs_embeds=inputs_embeds, labels=labels,
+                  attention_mask=attn_mask,
                   output_hidden_states=return_hidden)
     if not return_ntl_tensors and not return_hidden:
         return outputs.loss
 
-    # ── Token-grounding hidden states (M1) ───────────────────────────────────
-    # last-layer hidden states at the L target positions [N+P, N+P+L), plus the
-    # per-position content mask. The number the LM emits lives in these hidden
-    # states; the TokenGroundingHead uses them (mean-pooled here for the global
-    # query) to attend over the audio prefix. output_hidden_states=False is the
-    # HF default, so the return_hidden=False path is byte-identical to before.
-    if return_hidden:
-        L = target_ids.shape[1]
-        prose_hidden = outputs.hidden_states[-1][:, N + P:N + P + L, :]  # (B, L, D)
-        return outputs.loss, prose_hidden, target_attn
-
-    # ── NTL tensor extraction (no extra LM forward) ──────────────────────────
-    # outputs.logits is (B, S, V), S = N + P + L. HF's CE shifts internally:
-    # logits[:, i] predicts token at position i+1. The L target tokens sit at
-    # sequence positions [N+P, N+P+L). So the distribution that predicts the
-    # target token at target-index j is logits[:, (N+P) + j - 1]. Sliced over
-    # j in [0, L): logits[:, N+P-1 : N+P+L-1]. Aligns ntl_logits[b, j] with
-    # target_ids[b, j] exactly as CE does, so NTL reads the same predictions.
+    # Compose the requested extras from the SINGLE forward above. BOTH can be requested
+    # together (the M3 recipe with unlikelihood on): the NTL/UL logits AND the token-
+    # grounding hidden states are sliced from the same `outputs`, so token-grounding is no
+    # longer starved when want_ntl (the D1/B5 bug). Return order: ntl tensors first (if any),
+    # then hidden tensors (if any) — the caller unpacks to match its requested flags.
     L = target_ids.shape[1]
-    start = N + P - 1
-    ntl_logits = outputs.logits[:, start:start + L, :]   # (B, L, V)
-    ntl_target_ids = target_ids                          # (B, L)
-    ntl_target_mask = target_attn                        # (B, L) 1 at content incl. EOS
-    return outputs.loss, ntl_logits, ntl_target_ids, ntl_target_mask
+    result: list = [outputs.loss]
+    if return_ntl_tensors:
+        # HF shifts CE internally: logits[:, i] predicts token i+1; the L target tokens sit at
+        # [N+P, N+P+L), so the distribution predicting target-index j is logits[:, N+P-1+j].
+        # ntl_target_mask = target_attn is 1 at content (incl. EOS), 0 at padding.
+        start = N + P - 1
+        ntl_logits = outputs.logits[:, start:start + L, :]        # (B, L, V)
+        result += [ntl_logits, target_ids, target_attn]
+    if return_hidden:
+        # last-layer hidden states at the L target positions — the TokenGroundingHead query
+        # source (the number the LM emits lives here). output_hidden_states was set True above.
+        prose_hidden = outputs.hidden_states[-1][:, N + P:N + P + L, :]  # (B, L, D)
+        result += [prose_hidden, target_attn]
+    return tuple(result)
 
 
 def compute_loss(
@@ -631,11 +820,27 @@ def compute_loss(
     # tuple — split it so the MSE path keeps using the predicted MEAN and the new NLL
     # term (below) gets both mean and log_var. With the plain head, scalar_pred is the
     # mean tensor and reliability_log_var stays None (NLL term is then skipped).
-    out = adapter(audio_features, overlap_info)
+    # BUGFIX 2026-07-25: thread per-clip unpadded lengths so the aux/reliability
+    # head pools over REAL positions only (collate zero-pads to batch max; the
+    # unmasked mean was a train/inference mismatch on the abstention head).
+    _alens = batch.get("audio_lens") if batch is not None else None
+    out = adapter(audio_features, overlap_info, lengths=_alens) if _alens is not None \
+        else adapter(audio_features, overlap_info)
     if isinstance(out, tuple):
         prefix_embeds, scalar_pred = out
     else:
         prefix_embeds, scalar_pred = out, None
+
+    # (B, N) 1 at REAL prefix tokens so the LM ignores collate zero-padding
+    # (BUGFIX 2026-07-25: no attention_mask was passed, so padded prefix
+    # positions were attended during training but absent at inference).
+    _pfx_attn_mask = None
+    if _alens is not None:
+        _n_in, _n_out = audio_features.shape[1], prefix_embeds.shape[1]
+        _r = max(_n_in / max(_n_out, 1), 1.0)
+        _pl = (_alens.to(device).float() / _r).ceil().long().clamp(1, _n_out)
+        _pfx_attn_mask = (torch.arange(_n_out, device=device).unsqueeze(0)
+                          < _pl.unsqueeze(1)).long()
 
     reliability_log_var = None
     if isinstance(scalar_pred, tuple):
@@ -659,8 +864,9 @@ def compute_loss(
     # [token_grounding] M1: when enabled, ask the prose forward to also hand back the
     # last-layer hidden states at the target positions (the query source). Gated behind
     # lambda_token_grounding>0 AND a head being present; otherwise the default forward
-    # (output_hidden_states=False) is byte-identical to the baseline. NTL and token-
-    # grounding are not used together (the M3 recipe sets lambda_ntl=0).
+    # (output_hidden_states=False) is byte-identical to the baseline. When want_ntl is ALSO
+    # true (e.g. unlikelihood on), both extras are pulled from the SAME forward (see the
+    # want_ntl and want_tg branch below) — grounding is no longer starved.
     lambda_token_grounding = float(config.get("lambda_token_grounding", 0.0))
     want_tg = (
         lambda_token_grounding > 0.0
@@ -669,13 +875,29 @@ def compute_loss(
     )
     prose_hidden = None
     prose_hidden_mask = None
-    if want_ntl:
+    if want_ntl and want_tg:
+        # D1/B5 fix: NTL/unlikelihood AND token-grounding both on -> get both extras from
+        # ONE forward. Previously `elif want_tg` was unreachable when want_ntl, so grounding
+        # silently never fired (loss_token_grounding logged as a constant).
+        (lm_loss_prose, ntl_logits, ntl_target_ids, ntl_target_mask,
+         prose_hidden, prose_hidden_mask) = _ce_against_target(
+            llm, embed_layer, tokenizer,
+            prefix_embeds, prompt_ids, target_text,
+            max_length=config["max_target_length"],
+            device=device,
+            section_ctx=section_ctx,
+            prefix_mask=_pfx_attn_mask,
+            return_ntl_tensors=True,
+            return_hidden=True,
+        )
+    elif want_ntl:
         lm_loss_prose, ntl_logits, ntl_target_ids, ntl_target_mask = _ce_against_target(
             llm, embed_layer, tokenizer,
             prefix_embeds, prompt_ids, target_text,
             max_length=config["max_target_length"],
             device=device,
             section_ctx=section_ctx,
+            prefix_mask=_pfx_attn_mask,
             return_ntl_tensors=True,
         )
     elif want_tg:
@@ -685,6 +907,7 @@ def compute_loss(
             max_length=config["max_target_length"],
             device=device,
             section_ctx=section_ctx,
+            prefix_mask=_pfx_attn_mask,
             return_hidden=True,
         )
     else:
@@ -694,21 +917,26 @@ def compute_loss(
             max_length=config["max_target_length"],
             device=device,
             section_ctx=section_ctx,
+            prefix_mask=_pfx_attn_mask,
         )
     metrics["loss_lm_prose"] = float(lm_loss_prose.detach().item())
 
     # [ntl] Ordinal digit penalty on the prose target's digit positions. Masked to
     # content tokens (no padding), 0 when there are no digit targets in the batch.
-    ntl_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    # F13 (2026-07-16): form-dispatched via `ntl_form` ('was' default = true
+    # CDF Wasserstein-1; 'mse' = legacy |E_pred - digit|), and the SAME penalty
+    # is also applied to the NUMS forward's digit positions below — the nums
+    # channel is ~75% digits, so it is where the ordinal gradient matters most.
+    # loss_ntl_prose / loss_ntl_nums are logged separately; loss_ntl = their sum.
+    ntl_form = str(config.get("ntl_form", "was")).lower()
+    digit_ids = _get_digit_ids(tokenizer) if want_ntl else None
+    ntl_loss_prose = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
     if want_ntl:
-        digit_ids = _get_digit_ids(tokenizer)
-        ntl_loss = number_token_loss(
+        ntl_loss_prose = _ntl_loss(
             ntl_logits.float(), ntl_target_ids, digit_ids,
-            target_mask=ntl_target_mask,
+            ntl_target_mask, ntl_form,
         ).to(lm_loss_prose.dtype)
-        metrics["loss_ntl"] = float(ntl_loss.detach().item())
-    else:
-        metrics["loss_ntl"] = 0.0
+    metrics["loss_ntl_prose"] = float(ntl_loss_prose.detach().item())
 
     # [unlikelihood] Welleck-2020 token-level UL on the same prose ntl_logits (no extra
     # forward). Counters training-time repetition. 0 when lambda_unlikelihood <= 0.
@@ -716,6 +944,36 @@ def compute_loss(
     if lambda_unlikelihood > 0.0 and want_ntl:
         ul_loss = unlikelihood_token_loss(ntl_logits, ntl_target_ids, ntl_target_mask).to(lm_loss_prose.dtype)
     metrics["loss_ul"] = float(ul_loss.detach().item())
+
+    # [ditto] F14 (2026-07-16): sentence-level anti-repetition on a CONSTRUCTED
+    # pseudo-repetitive tiling of one target sentence per clip (Xu et al.,
+    # NeurIPS 2022). ONE extra LM forward on (prefix + prompt + tiled target);
+    # -log(1-p) only on the copies AFTER the first occurrence, so the natural
+    # targets' intentional frame repetition ("The X is <v>." with DIFFERENT
+    # values) is never penalized — the tiling guarantees identical sentences.
+    # lambda_ditto <= 0 (default) → byte-identical training, no extra forward.
+    ditto_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    lambda_ditto = float(config.get("lambda_ditto", 0.0))
+    if lambda_ditto > 0.0:
+        tiled_ids, ditto_pen = build_ditto_tiled_batch(
+            tokenizer, target_text, config["max_target_length"], device,
+        )
+        if bool(ditto_pen.any()):
+            ditto_prompt_embeds = embed_layer(prompt_ids.expand(prefix_embeds.shape[0], -1))
+            ditto_embeds = embed_layer(tiled_ids)
+            ditto_inputs = torch.cat(
+                [prefix_embeds, ditto_prompt_embeds, ditto_embeds], dim=1)
+            ditto_out = llm(inputs_embeds=ditto_inputs)
+            _Nd = prefix_embeds.shape[1]
+            _Pd = ditto_prompt_embeds.shape[1]
+            _Ld = tiled_ids.shape[1]
+            # Next-token shift: logits[:, N+P-1+j] predicts tiled_ids[:, j]
+            # (same alignment as the NTL slice in _ce_against_target).
+            ditto_logits = ditto_out.logits[:, _Nd + _Pd - 1:_Nd + _Pd - 1 + _Ld, :]
+            ditto_loss = ditto_unlikelihood_loss(
+                ditto_logits, tiled_ids, ditto_pen,
+            ).to(lm_loss_prose.dtype)
+    metrics["loss_ditto"] = float(ditto_loss.detach().item())
 
     # [section_readout] Grounding loss. Regresses each section's acoustic scalar
     # out of z = alpha · V.detach() (the attention output), pushing alpha onto
@@ -739,6 +997,12 @@ def compute_loss(
 
     # Numbers CE loss (B-full forward A, optional)
     lm_loss_nums = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
+    # [ntl] F13 (2026-07-16): NTL previously applied ONLY to the prose forward's
+    # logits; the nums channel (~75% digit tokens — exactly where ordinal
+    # supervision pays) got plain CE. When want_ntl, the nums forward now also
+    # hands back its shifted logits (no extra forward) and the same ntl_form
+    # penalty is computed on them.
+    ntl_loss_nums = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
     has_nums = (target_nums is not None
                 and any(t for t in target_nums)
                 and float(config.get("lambda_nums", 0.0)) > 0.0)
@@ -756,15 +1020,34 @@ def compute_loss(
             # If prompt_nums_ids is None we fall back to prompt_ids (legacy single-prompt setup,
             # which causes both completions to live under the same prompt key).
             nums_prompt = prompt_nums_ids if prompt_nums_ids is not None else prompt_ids
-            lm_loss_nums = _ce_against_target(
-                llm, embed_layer, tokenizer,
-                prefix_subset, nums_prompt, nums_subset,
-                max_length=nums_max_len,
-                device=device,
-            )
+            if want_ntl:
+                (lm_loss_nums, nums_ntl_logits, nums_ntl_ids,
+                 nums_ntl_mask) = _ce_against_target(
+                    llm, embed_layer, tokenizer,
+                    prefix_subset, nums_prompt, nums_subset,
+                    max_length=nums_max_len,
+                    device=device,
+                    return_ntl_tensors=True,
+                )
+                ntl_loss_nums = _ntl_loss(
+                    nums_ntl_logits.float(), nums_ntl_ids, digit_ids,
+                    nums_ntl_mask, ntl_form,
+                ).to(lm_loss_prose.dtype)
+            else:
+                lm_loss_nums = _ce_against_target(
+                    llm, embed_layer, tokenizer,
+                    prefix_subset, nums_prompt, nums_subset,
+                    max_length=nums_max_len,
+                    device=device,
+                )
         metrics["loss_lm_nums"] = float(lm_loss_nums.detach().item())
     else:
         metrics["loss_lm_nums"] = 0.0
+    metrics["loss_ntl_nums"] = float(ntl_loss_nums.detach().item())
+    # Total NTL term (prose + nums channels); `loss_ntl` keeps the legacy key so
+    # existing wandb panels / log parsers stay valid.
+    ntl_loss = ntl_loss_prose + ntl_loss_nums
+    metrics["loss_ntl"] = float(ntl_loss.detach().item())
 
     # Aux regression head MSE (optional, requires scalar_pred + GT)
     mse_loss = torch.tensor(0.0, device=device, dtype=lm_loss_prose.dtype)
@@ -776,14 +1059,24 @@ def compute_loss(
     )
     if has_mse:
         gt_scalars_d = gt_scalars.to(device).to(scalar_pred.dtype)
-        gt_mask_d = gt_mask.to(device).to(scalar_pred.dtype)
-        # Normalize per-feature squared error by typical magnitude so all 13 features
+        # B3: the point-estimate (MSE) channel abstains on HEDGED ill-posed slots (heavy
+        # overlap) so it stops fitting mix-noisy F0/voice values — matching the hedged prose
+        # and nums targets. The heteroscedastic NLL below keeps the FULL presence mask so the
+        # sigma head still sees the hard pairs and learns high sigma there. hedge_mask is bool
+        # (True where abstained); absent -> falls back to the plain presence mask.
+        gt_mask_b = gt_mask.to(device)
+        hedge_b = batch.get("hedge_mask") if batch is not None else None
+        if hedge_b is not None:
+            mse_mask_d = (gt_mask_b & ~hedge_b.to(device)).to(scalar_pred.dtype)
+        else:
+            mse_mask_d = gt_mask_b.to(scalar_pred.dtype)
+        # Normalize per-feature squared error by typical magnitude so all features
         # contribute roughly equally. Without this, F0 (~150 Hz) dominates the sum
         # 1000x over overlap_ratio (~0.5) and the adapter optimizes only for F0.
         scales = torch.tensor(FEATURE_SCALES, device=device, dtype=scalar_pred.dtype)
         per_feat_se = ((scalar_pred - gt_scalars_d) / scales) ** 2   # (B, n_feat) — unit-free
-        masked = per_feat_se * gt_mask_d                              # (B, n_feat)
-        denom = gt_mask_d.sum().clamp(min=1.0)
+        masked = per_feat_se * mse_mask_d                            # (B, n_feat)
+        denom = mse_mask_d.sum().clamp(min=1.0)
         mse_loss = masked.sum() / denom
         metrics["loss_mse"] = float(mse_loss.detach().item())
     else:
@@ -805,6 +1098,13 @@ def compute_loss(
     )
     if has_nll:
         from model.reliability_head import heteroscedastic_nll
+        # Stirn faithful-heteroscedastic: if the mean is detached from the NLL, its ONLY
+        # gradient is the plain-MSE aux term; lambda_mse<=0 would leave μ untrained -> garbage.
+        if bool(config.get("stirn_stop_grad", False)) and float(config.get("lambda_mse", 0.0)) <= 0.0:
+            raise ValueError(
+                "stirn_stop_grad=True requires lambda_mse>0 (the MSE is the mean's only gradient "
+                "once the NLL detaches it). Set lambda_mse>0 or stirn_stop_grad=false."
+            )
         gt_scalars_n = gt_scalars.to(device).to(scalar_pred.dtype)
         gt_mask_n = gt_mask.to(device)
         scales_n = torch.tensor(FEATURE_SCALES, device=device, dtype=scalar_pred.dtype)
@@ -812,6 +1112,9 @@ def compute_loss(
             scalar_pred, reliability_log_var.to(scalar_pred.dtype),
             gt_scalars_n, mask=gt_mask_n, scales=scales_n,
             beta=float(config.get("beta_nll", 0.0)),   # Seitzer 2022 β-NLL; 0.0 = plain Kendall & Gal
+            # Stirn 2023: detach the mean so the NLL trains σ only; the mean keeps learning
+            # from the plain-MSE aux term below (REQUIRES lambda_mse > 0 — asserted at config load).
+            stop_grad_mean=bool(config.get("stirn_stop_grad", False)),
         ).to(lm_loss_prose.dtype)
         metrics["loss_nll"] = float(nll_loss.detach().item())
         # Mean predicted σ over present slots — a quick "is the head using its
@@ -965,12 +1268,16 @@ def compute_loss(
     lambda_nll = float(config.get("lambda_nll", 0.0))
 
     total = lambda_prose * lm_loss_prose + lambda_nums * lm_loss_nums + lambda_mse * mse_loss
-    # [ntl] add the Number Token Loss on prose digit positions (ntl_loss is 0 when
-    # lambda_ntl <= 0 or the batch has no digit targets). lambda_ntl default 0.3
-    # (paper default); it is the ordinal complement to the prose CE, so it scales
-    # the same prose forward's digit gradient — keep it modest to preserve fluency.
+    # [ntl] add the Number Token Loss on the PROSE + NUMS digit positions
+    # (F13: ntl_loss = ntl_prose + ntl_nums; each 0 when lambda_ntl <= 0 or its
+    # channel has no digit targets). lambda_ntl default 0.3 (paper default); it
+    # is the ordinal complement to the CE terms, sharing their forwards' digit
+    # gradients — keep it modest to preserve fluency.
     total = total + lambda_ntl * ntl_loss
     total = total + lambda_unlikelihood * ul_loss
+    # [ditto] add the sentence-level anti-repetition penalty (0 when
+    # lambda_ditto <= 0, the default — training is then byte-identical).
+    total = total + lambda_ditto * ditto_loss
     # [reliability_head] add the heteroscedastic NLL term (nll_loss is 0 when the head
     # is absent or lambda_nll == 0). Note: NLL and plain MSE can be used together (NLL
     # trains the variance, MSE keeps a clean mean gradient) or NLL alone — set
@@ -1086,6 +1393,13 @@ def train(config: dict) -> None:
     adapter = build_adapter(
         config["adapter_variant"], lm_dim=lm_hidden_size,
         reliability_head=bool(config.get("reliability_head", False)),
+        # T1: prefix token rate. 8 (default) = 6.25 tok/s / 160 ms per token; 4 = 12.5 tok/s.
+        # Absent from a config -> 8, so every existing YAML and checkpoint is unchanged.
+        compression=int(config.get("compression", 8)),
+        # "mean" (default) reproduces every prior run exactly. "linear_softmax" is the
+        # localisation fix: mean pooling measurably cannot localise (attribution entropy
+        # 0.93-0.997 where 1.0 is flat, clip-specificity NEGATIVE on 8/11 features).
+        aux_pool=str(config.get("aux_pool", "mean")),
     ).to(device).to(torch.bfloat16)
     if config.get("reliability_head", False):
         print(f"[reliability_head] heteroscedastic aux head ON "
@@ -1424,25 +1738,38 @@ def train(config: dict) -> None:
     # [snr_map] optional oracle dense local-SNR-map target dirs (build-A), per split.
     # {split: path} dict or a single path; None → no dense targets → snr_map_loss_term
     # no-ops (default-off byte-identical).
-    snr_map_dir = config.get("snr_map_dir")
-    if isinstance(snr_map_dir, dict):
-        train_snr_dir = snr_map_dir.get("train") or snr_map_dir.get("train-100")
-        val_snr_dir = snr_map_dir.get("val") or snr_map_dir.get("dev")
-    else:
-        train_snr_dir = val_snr_dir = snr_map_dir
+    # A dir set while its lambda is 0 costs a per-clip file read every epoch and feeds it
+    # straight to a term that multiplies by 0. The bsigma configs ship snr_map_dir with
+    # lambda_snr_map: 0.0, which was ~41.7k wasted reads per epoch (~167k per 4-epoch run)
+    # on NFS. Gate the LOAD on the weight, not just the term, so no config can reintroduce
+    # it by omission.
+    def _map_dirs(key: str, lam_key: str) -> tuple[str | None, str | None]:
+        d = config.get(key)
+        if d and float(config.get(lam_key, 0.0)) == 0.0:
+            print(f"[{key}] set but {lam_key}=0 → NOT loading targets "
+                  f"(would be a per-clip read discarded by a zero-weighted term)")
+            return None, None
+        if isinstance(d, dict):
+            return (d.get("train") or d.get("train-100"), d.get("val") or d.get("dev"))
+        return d, d
+
+    train_snr_dir, val_snr_dir = _map_dirs("snr_map_dir", "lambda_snr_map")
 
     # [srmr_map] optional oracle 2D SRMR-modulation-map target dirs (build-A), per split.
     # Same {split: path} dict or single path convention; None → no targets → no-op.
-    srmr_map_dir = config.get("srmr_map_dir")
-    if isinstance(srmr_map_dir, dict):
-        train_srmr_dir = srmr_map_dir.get("train") or srmr_map_dir.get("train-100")
-        val_srmr_dir = srmr_map_dir.get("val") or srmr_map_dir.get("dev")
-    else:
-        train_srmr_dir = val_srmr_dir = srmr_map_dir
+    train_srmr_dir, val_srmr_dir = _map_dirs("srmr_map_dir", "lambda_srmr_map")
 
+    # [zero_overlap_input] item 52b — audio-only arm. See dataset.py __getitem__.
+    _zero_ovl = bool(config.get("zero_overlap_input", False))
+    if _zero_ovl:
+        print("[zero_overlap_input] ENABLED — overlap_info zeroed at load time. The model "
+              "receives NO overlap segmentation, oracle or estimated. OverlapEmbedding/"
+              "cond_proj stay in the graph so the parameter count is IDENTICAL to the "
+              "oracle-conditioned arm (embedding of zeros = learned constant bias).")
     train_set = PreprocessedDataset(
         train_dir, config["descriptions_path"], features_csv=train_csv,
         snr_map_dir=train_snr_dir, srmr_map_dir=train_srmr_dir,
+        zero_overlap_input=_zero_ovl,
     )
     # The dataset keys descriptions by clip stem and looks up the CURRENT split's
     # stems in whatever JSON it is handed. The legacy single combined JSON (e.g.
@@ -1457,6 +1784,7 @@ def train(config: dict) -> None:
     val_set = PreprocessedDataset(
         val_dir, val_descriptions_path, features_csv=val_csv,
         snr_map_dir=val_snr_dir, srmr_map_dir=val_srmr_dir,
+        zero_overlap_input=_zero_ovl,
     )
     assert train_set.descriptions is not None, f"Descriptions not found: {config['descriptions_path']}"
     print(f"Loaded: train={len(train_set)}, val={len(val_set)}")
@@ -1572,7 +1900,13 @@ def train(config: dict) -> None:
     best_val_sfs_f1 = float("-inf")
     # Running max of clean-epoch BLEU; the degeneration guard uses it as a
     # RELATIVE floor so a fluency collapse (high SFS, low BLEU) can't be selected.
+    # F4 (2026-07-16): persisted in every checkpoint and restored on resume —
+    # it previously reset to None on --resume_from, silently resetting the floor.
     best_val_bleu = None
+    # F5 (2026-07-16): the last selection decision string ("composite_ema
+    # improved, clean" / "sfs improved but degenerate (...)"), persisted in
+    # every checkpoint so a frozen best.pt is diagnosable from the ckpt alone.
+    last_save_reason = None
     wandb_run_id = None
 
     # ── Band-free composite selection state (research Q1 protocol) ────────────
@@ -1633,9 +1967,18 @@ def train(config: dict) -> None:
             best_srcc_robust = checkpoint["best_srcc_robust"]
         if checkpoint.get("composite_ema") is not None:
             composite_ema = checkpoint["composite_ema"]
+        # F4 (2026-07-16): restore the BLEU-floor reference + last decision
+        # string. Verified missing from pre-fix ckpts (last.pt carried
+        # best_srcc_robust/composite_ema but NO best_val_bleu), so every resume
+        # cold-started the guard's relative BLEU floor. Absent keys → None
+        # (cold start), same back-compat convention as composite_ema above.
+        if checkpoint.get("best_val_bleu") is not None:
+            best_val_bleu = checkpoint["best_val_bleu"]
+        last_save_reason = checkpoint.get("last_save_reason")
         wandb_run_id = checkpoint.get("wandb_run_id")
         print(f"Resumed from epoch {start_epoch}, best_val_sfs_f1={best_val_sfs_f1:.4f}, "
-              f"best_val_composite={best_val_composite:.4f}")
+              f"best_val_composite={best_val_composite:.4f}, "
+              f"best_val_bleu={best_val_bleu}")
 
     # Wandb. `wandb_entity` in the YAML pins the team account so contributors
     # don't have to remember to export WANDB_ENTITY every session. Passing
@@ -1840,10 +2183,19 @@ def train(config: dict) -> None:
                 }
                 # [ntl] surface the Number Token Loss when active (0 / absent when
                 # lambda_ntl <= 0). THE signal for whether digit accuracy is being
-                # supervised ordinally rather than nominally.
+                # supervised ordinally rather than nominally. F13: the prose/nums
+                # channel split is logged too so each channel's ordinal gradient
+                # is visible on its own curve.
                 if loss_metrics.get("loss_ntl", 0.0):
                     log_payload["train_loss_ntl"] = loss_metrics["loss_ntl"]
+                    log_payload["train_loss_ntl_prose"] = loss_metrics.get("loss_ntl_prose", 0.0)
+                    log_payload["train_loss_ntl_nums"] = loss_metrics.get("loss_ntl_nums", 0.0)
                     log_payload["lambda_ntl"] = float(config.get("lambda_ntl", 0.0))
+                # [ditto] surface the sentence-level anti-repetition penalty when
+                # active (0 / absent when lambda_ditto <= 0).
+                if loss_metrics.get("loss_ditto", 0.0):
+                    log_payload["train_loss_ditto"] = loss_metrics["loss_ditto"]
+                    log_payload["lambda_ditto"] = float(config.get("lambda_ditto", 0.0))
                 # [section_readout] surface the grounding loss + per-feature MAE
                 # (computed in compute_loss but otherwise discarded). These are
                 # THE signal for whether attention is becoming grounded.
@@ -1861,6 +2213,22 @@ def train(config: dict) -> None:
                     for k, v in loss_metrics.items():
                         if k.startswith("decoupled_mae/"):
                             log_payload[f"train_{k}"] = v
+                # [token_grounding] surface the M1 grounding loss (+ pooled / Liu components).
+                # Previously computed into `metrics` but NEVER logged — an observability gap
+                # that made it impossible to confirm grounding was firing from wandb alone.
+                if "loss_token_grounding" in loss_metrics:
+                    log_payload["train_loss_token_grounding"] = loss_metrics["loss_token_grounding"]
+                    log_payload["lambda_token_grounding"] = float(config.get("lambda_token_grounding", 0.0))
+                    for k in ("loss_tg_pooled", "loss_tg_liu"):
+                        if k in loss_metrics:
+                            log_payload[f"train_{k}"] = loss_metrics[k]
+                # [reliability_head] surface the heteroscedastic NLL + mean predicted sigma —
+                # THE observability-abstention signal; previously computed but never logged.
+                if "loss_nll" in loss_metrics:
+                    log_payload["train_loss_nll"] = loss_metrics["loss_nll"]
+                    log_payload["lambda_nll"] = float(config.get("lambda_nll", 0.0))
+                    if "reliability_sigma_mean" in loss_metrics:
+                        log_payload["train_reliability_sigma_mean"] = loss_metrics["reliability_sigma_mean"]
                 # [bottleneck] surface the bits penalty + per-feature meanbits — THE
                 # signal for whether the keep-mask is sparsifying onto evidence.
                 if "loss_bits" in loss_metrics:
@@ -2067,10 +2435,14 @@ def train(config: dict) -> None:
                             max_new_tokens=config.get("max_target_length", 256),
                             do_sample=False,
                             pad_token_id=tokenizer.pad_token_id,
-                            # Stop on the SAME EOS the target was trained to emit
-                            # (_tokenize_with_eos appends tokenizer.eos_token_id). Explicit
-                            # so decode termination can't drift from the model-config default.
-                            eos_token_id=tokenizer.eos_token_id,
+                            # F1 (2026-07-16): stop on BOTH Qwen enders, matching the
+                            # model's shipped generation_config eos_token_id list.
+                            # Training supervises tokenizer.eos_token_id (<|im_end|> on
+                            # the post-trained model), but on raw non-chat inputs the
+                            # pretrained prior can emit the document ender
+                            # <|endoftext|>; stopping on a single id sails past it and
+                            # the generation continues as off-task boilerplate.
+                            eos_token_id=_val_eos_ids(tokenizer),
                         )
                         gen_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
 
@@ -2196,7 +2568,8 @@ def train(config: dict) -> None:
             # ── Band-free composite (research Q1 protocol) ─────────────────────
             # Continuous per-feature SRCC / nMAE / coverage over the canonical 12
             # features, joined to the target-parsed clean GT. The composite =
-            # mean_SRCC(reliable, non-degenerate, snr-excluded) - lam_nmae*mean_nMAE
+            # mean_SRCC(reliable, non-degenerate; snr INCLUDED since the
+            # 2026-07-11 recalibration, overlap_ratio excluded) - lam_nmae*mean_nMAE
             # with a HARD BLEU floor; EMA-smoothed across epochs to denoise the
             # selection signal. These are logged regardless of select_metric so the
             # curve is always visible; they only DRIVE selection when
@@ -2223,9 +2596,11 @@ def train(config: dict) -> None:
             # distinct so the headline number is never confused with the raw one:
             #   * bf_srcc_mean_all = raw mean over EVERY feature with a defined SRCC
             #     (snr INCLUDED, no min_pairs gate) — a diagnostic, NOT the headline.
-            #   * headline = mean SRCC over RELIABLE features, snr EXCLUDED, min_pairs
-            #     gated — THE reported number, computed by the same helper the
-            #     composite uses, so logged == selected components exactly.
+            #   * headline = mean SRCC over RELIABLE features (snr INCLUDED since
+            #     the 2026-07-11 recalibration; overlap_ratio excluded as the
+            #     FiLM conditioning input), min_pairs gated — THE reported number,
+            #     computed by the same helper the composite uses, so logged ==
+            #     selected components exactly.
             _srccs = [v["srcc"] for v in bf_pf.values() if v["srcc"] is not None]
             _nmaes = [v["nmae"] for v in bf_pf.values() if v["nmae"] is not None]
             _covs = [v["coverage"] for v in bf_pf.values()]
@@ -2235,9 +2610,10 @@ def train(config: dict) -> None:
             headline = headline_band_free_means(bf_pf, RECOVERABLE_FEATURES)
             # [§6 selection] plain mean SRCC over the 5 robust features (snr INCLUDED,
             # f0 + overlap_ratio EXCLUDED) — the fixed, un-smoothed selection signal the
-            # plan specifies (no nMAE, no EMA, no gated composite).
-            _ROBUST5 = ("srmr", "snr", "speaking_rate", "pause_count", "pause_rate")
-            _rv = [bf_pf[f]["srcc"] for f in _ROBUST5
+            # plan specifies (no nMAE, no EMA, no gated composite). HEADLINE_FEATURES
+            # is the frozen module constant in eval.selection_metric (single source
+            # of truth; import-time asserted against RECOVERABLE_FEATURES).
+            _rv = [bf_pf[f]["srcc"] for f in HEADLINE_FEATURES
                    if f in bf_pf and bf_pf[f].get("srcc") is not None]
             srcc_robust = (sum(_rv) / len(_rv)) if _rv else None
 
@@ -2255,13 +2631,21 @@ def train(config: dict) -> None:
                 "val_loss_mse": avg_val_mse,
                 "train_loss_epoch": avg_train_loss,
                 "epoch": epoch + 1,
-                "val_sfs_precision": avg_sfs_p,
-                "val_sfs_recall": avg_sfs_r,
-                "val_sfs_f1": avg_sfs_f1,
+                # RETIRED-metric telemetry. These three are the tolerance-BAND
+                # precision/recall/F1 that the 2026-06-23 decision retired for saturating
+                # ~0.95 and being non-discriminative. They are logged under _RETIRED names
+                # because they are the most flattering numbers in the project (0.96+) and
+                # sit one click away from the real ones in wandb — the failure mode is a
+                # retired 0.96 landing in a paper by accident, not by decision.
+                # THE HEADLINE METRIC IS val/srcc_robust (band-free SRCC/nMAE/coverage).
+                # The internal variable names and checkpoint keys keep the old spelling on
+                # purpose: they are load-bearing for resume back-compat and for the
+                # select_metric=='sfs_f1' fallback path, so renaming them would be a risky
+                # refactor of the selection state machine for zero analytic gain.
+                "val_bandF1_RETIRED": avg_sfs_f1,
+                "val_bandPrecision_RETIRED": avg_sfs_p,
+                "val_bandRecall_RETIRED": avg_sfs_r,
             }
-            # val_sfs_f1 is now a DEPRECATED selection axis (saturates; computed on
-            # a small subset) — kept logged for back-compat/curves only. The
-            # composite below is the selection signal when select_metric=='composite'.
             if table is not None:  # gated by log_val_samples_table (default False)
                 log_dict["val_samples"] = table
             # [section_readout] held-out grounding loss + per-feature MAE. Watch
@@ -2287,25 +2671,41 @@ def train(config: dict) -> None:
             # per-feature SRCC / nMAE. These stream online (they are plain scalars,
             # not a heavy table artifact), so the selection curve is visible even
             # with log_val_samples_table off.
-            # HEADLINE reporting number (mean SRCC over reliable feats, snr excluded)
-            # — the one to read/quote. val/srcc_mean_all is the raw all-feature mean
-            # (snr-included) and must NOT be mistaken for the headline.
+            # HEADLINE reporting number (mean SRCC over reliable feats; snr
+            # INCLUDED since the 2026-07-11 recalibration, overlap_ratio excluded)
+            # — the one to read/quote. val/srcc_mean_all is the raw all-feature
+            # mean (no min_pairs gate) and must NOT be mistaken for the headline.
             log_dict["val/srcc_mean_reliable"] = headline["mean_srcc"]
             if srcc_robust is not None:
                 log_dict["val/srcc_robust"] = srcc_robust   # [§6] the selection signal
             log_dict["val/nmae_mean_reliable"] = headline["mean_nmae"]
             log_dict["val/n_headline_features"] = headline["n_features"]
-            log_dict["val/srcc_mean_all"] = bf_srcc_mean_all
-            log_dict["val/nmae_mean_all"] = bf_nmae_mean_all
+            # RENAMED 2026-08-07 (item 50). The old key was `val/srcc_mean_all`, which reads
+            # like a more comprehensive headline and is NOT — it is inflated by `overlap_ratio`,
+            # an INPUT ECHO (rho 0.9999 with the mean of overlap_info[:,0]). Measured on the
+            # 6000-clip test set: robust5 0.6926 vs all-7 0.6786 vs all-7-minus-overlap_ratio
+            # 0.6365. The all-mean lands near the headline only because overlap_ratio (0.931)
+            # CANCELS f0_mean (0.356) — two errors, not agreement. The name now carries the
+            # warning so it cannot be quoted innocently.
+            log_dict["val/_diag_srcc_mean_all_LEAKY"] = bf_srcc_mean_all
+            log_dict["val/_diag_nmae_mean_all_LEAKY"] = bf_nmae_mean_all
             log_dict["val/coverage_mean"] = bf_coverage_mean
             log_dict["val/composite"] = avg_composite
             log_dict["val/composite_ema"] = composite_ema
+            # D-item 42 (2026-08-08): wandb groups panels by the "/"-delimited prefix, so
+            # `val/srcc_snr` lands in the flat `val` panel next to unrelated scalars and the
+            # 11 per-feature curves are impossible to read together. `val/srcc/snr` puts them
+            # in their own section. BOTH keys are logged for ONE phase so historical runs stay
+            # comparable in the same charts; drop the flat keys after the next campaign.
             for _feat, _stats in bf_pf.items():
                 if _stats["srcc"] is not None:
-                    log_dict[f"val/srcc_{_feat}"] = _stats["srcc"]
+                    log_dict[f"val/srcc/{_feat}"] = _stats["srcc"]
+                    log_dict[f"val/srcc_{_feat}"] = _stats["srcc"]        # legacy, drop later
                 if _stats["nmae"] is not None:
-                    log_dict[f"val/nmae_{_feat}"] = _stats["nmae"]
-                log_dict[f"val/coverage_{_feat}"] = _stats["coverage"]
+                    log_dict[f"val/nmae/{_feat}"] = _stats["nmae"]
+                    log_dict[f"val/nmae_{_feat}"] = _stats["nmae"]        # legacy, drop later
+                log_dict[f"val/coverage/{_feat}"] = _stats["coverage"]
+                log_dict[f"val/coverage_{_feat}"] = _stats["coverage"]    # legacy, drop later
                 # per-feature paired-clip count — lets you see which features cleared
                 # min_pairs and actually entered the headline mean (audit blind spot).
                 log_dict[f"val/n_{_feat}"] = _stats.get("n", 0)
@@ -2363,6 +2763,12 @@ def train(config: dict) -> None:
                 "best_val_composite": best_val_composite,
                 "best_srcc_robust": best_srcc_robust,
                 "composite_ema": composite_ema,
+                # F4 (2026-07-16): the guard's relative-BLEU-floor reference was
+                # the ONE tracker missing from ckpts — resume reset it to None.
+                # All selection-tracker state now round-trips through every save.
+                "best_val_bleu": best_val_bleu,
+                # F5: last selection decision string (why best.pt was/wasn't saved).
+                "last_save_reason": last_save_reason,
                 "wandb_run_id": wandb_run_id,
                 "config": config,
                 "added_special_tokens": list(TAG_SPECIAL_TOKENS) if config.get("tagged_mode") else [],
@@ -2432,24 +2838,40 @@ def train(config: dict) -> None:
         # ── Best-checkpoint selection ─────────────────────────────────────────
         # select_metric switches the axis:
         #   'composite' (DEFAULT) — EMA-smoothed band-free composite (continuous
-        #     SRCC/nMAE, snr excluded) with a HARD BLEU fluency floor baked into
+        #     SRCC/nMAE; snr INCLUDED since the 2026-07-11 recalibration,
+        #     overlap_ratio excluded) with a HARD BLEU fluency floor baked into
         #     composite_score, plus the same degeneration guard as a backstop.
         #     Lower-variance + non-saturating per the research Q1 protocol.
-        #   'sfs_f1' — the legacy degeneration-gated val_sfs_f1 argmax, BYTE-FOR-BYTE
-        #     unchanged (the block below is identical to the pre-band-free code).
-        # best_val_bleu is updated identically on BOTH paths so the relative BLEU
-        # floor tracks the same running max regardless of which axis selects.
+        #   'sfs_f1' — the legacy degeneration-gated val_sfs_f1 argmax (the block
+        #     below only differs from the pre-band-free code in the F4
+        #     best_val_bleu handling, shared by all paths).
+        # ── Shared degeneration guard (F4/F5, 2026-07-16) ─────────────────────
+        # Computed ONCE per epoch, BEFORE the best_val_bleu update, and shared
+        # by all three selection paths + the select/* telemetry below.
+        # best_val_bleu is a CLEAN-epoch running max ("best clean BLEU seen so
+        # far"): pre-fix it updated even on withheld epochs, so a degenerate
+        # high-BLEU epoch could ratchet the relative floor up and reject every
+        # later legitimate epoch. update_best_bleu only raises it when the
+        # guard passes.
+        _deg = degeneration_stats(val_gen_texts)
+        _guard_ok, _guard_reason = passes_degeneration_guard(
+            val_bleu, best_val_bleu,
+            _deg["rep_n_max"], _deg["nonascii_frac"],
+            _deg["frac_clips_nonascii"], _deg["frac_clips_high_rep"],
+        )
+        best_val_bleu = update_best_bleu(best_val_bleu, val_bleu, _guard_ok)
         if select_metric == "sfs_f1":
-            # ── Legacy path (unchanged) ───────────────────────────────────────
+            # ── Legacy path ───────────────────────────────────────────────────
             # Degeneration-aware selection: SFS only parses numbers, so it is blind to
             # fluency/structural collapse (tag-spam, repetition, foreign-token runs) —
             # an SFS argmax can select a degenerate checkpoint. Gate it on a BLEU /
             # rep-n / non-ASCII guard over this epoch's generations (ckpt_selection.py).
+            # (should_save_best recomputes the same guard internally; equivalent to
+            # `improved and _guard_ok` — kept for the pure-function unit tests.)
             _save_best, _save_reason = should_save_best(
                 avg_sfs_f1, best_val_sfs_f1, val_bleu, best_val_bleu, val_gen_texts,
             )
-            if val_bleu is not None:
-                best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
+            last_save_reason = _save_reason
             if (not _save_best) and avg_sfs_f1 is not None and avg_sfs_f1 > best_val_sfs_f1:
                 print(f"  [select] withheld best.pt despite val_sfs_f1={avg_sfs_f1:.4f}: {_save_reason}")
             if _save_best:
@@ -2470,28 +2892,21 @@ def train(config: dict) -> None:
             # Select best.pt on the unsmoothed mean SRCC over {srmr, snr,
             # speaking_rate, pause_count, pause_rate} vs clean GT (f0 + overlap_ratio
             # excluded). No nMAE, no EMA, no composite — exactly the §6 selection —
-            # with the same rep-n / non-ASCII / BLEU degeneration guard as a fluency
-            # backstop. best_val_bleu still tracks the running max identically.
-            if val_bleu is not None:
-                best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
+            # with the shared rep-n / non-ASCII / BLEU degeneration guard (F4,
+            # computed once above) as a fluency backstop.
             _save_best = False
             _save_reason = "no eval this epoch"
             if srcc_robust is not None:
                 improved = srcc_robust > best_srcc_robust
-                _deg = degeneration_stats(val_gen_texts)
-                guard_ok, guard_reason = passes_degeneration_guard(
-                    val_bleu, best_val_bleu,
-                    _deg["rep_n_max"], _deg["nonascii_frac"],
-                    _deg["frac_clips_nonascii"], _deg["frac_clips_high_rep"],
-                )
                 if not improved:
                     _save_reason = (f"no srcc_robust improvement "
                                     f"({srcc_robust:.4f} <= best={best_srcc_robust:.4f})")
-                elif not guard_ok:
-                    _save_reason = f"srcc_robust improved but degenerate ({guard_reason})"
+                elif not _guard_ok:
+                    _save_reason = f"srcc_robust improved but degenerate ({_guard_reason})"
                 else:
                     _save_best = True
                     _save_reason = "srcc_robust improved, clean"
+            last_save_reason = _save_reason
             if (not _save_best) and srcc_robust is not None and srcc_robust > best_srcc_robust:
                 print(f"  [select] withheld best.pt despite srcc_robust={srcc_robust:.4f}: {_save_reason}")
             if _save_best:
@@ -2515,27 +2930,20 @@ def train(config: dict) -> None:
             # EMA can't beat best), and the rep-n/non-ASCII degeneration guard is
             # still applied as a backstop for high-BLEU-but-structurally-broken
             # epochs (e.g. tag-spam that keeps BLEU up). Skip on non-eval epochs
-            # (avg_composite is None then).
-            if val_bleu is not None:
-                best_val_bleu = val_bleu if best_val_bleu is None else max(best_val_bleu, val_bleu)
+            # (avg_composite is None then). Guard is the shared one (F4, above).
             _save_best = False
             _save_reason = "no eval this epoch"
             if avg_composite is not None:
                 improved = composite_ema is not None and composite_ema > best_val_composite
-                _deg = degeneration_stats(val_gen_texts)
-                guard_ok, guard_reason = passes_degeneration_guard(
-                    val_bleu, best_val_bleu,
-                    _deg["rep_n_max"], _deg["nonascii_frac"],
-                    _deg["frac_clips_nonascii"], _deg["frac_clips_high_rep"],
-                )
                 if not improved:
                     _save_reason = (f"no composite_ema improvement "
                                     f"(ema={composite_ema:.4f} <= best={best_val_composite:.4f})")
-                elif not guard_ok:
-                    _save_reason = f"composite improved but degenerate ({guard_reason})"
+                elif not _guard_ok:
+                    _save_reason = f"composite improved but degenerate ({_guard_reason})"
                 else:
                     _save_best = True
                     _save_reason = "composite_ema improved, clean"
+            last_save_reason = _save_reason
             if (not _save_best) and avg_composite is not None and \
                     composite_ema is not None and composite_ema > best_val_composite:
                 print(f"  [select] withheld best.pt despite composite_ema={composite_ema:.4f}: {_save_reason}")
@@ -2556,6 +2964,55 @@ def train(config: dict) -> None:
                         metadata={"epoch": epoch, "val_composite": best_val_composite,
                                   "val_sfs_f1": avg_sfs_f1},
                     )
+
+        # ── Selection observability (F5, 2026-07-16) ──────────────────────────
+        # Numeric select/* keys EVERY epoch so a frozen best.pt shows up in
+        # wandb as a flat select/saved_best=0 line (instead of a silent absence)
+        # and the guard's exact inputs can be replayed offline. The reason
+        # string is printed here and persisted as last_save_reason in every
+        # checkpoint via _ckpt_payload.
+        wandb.log({
+            "epoch": epoch + 1,
+            "select/guard_ok": int(_guard_ok),
+            "select/saved_best": int(_save_best),
+            "select/rep_n_mean": _deg["rep_n_mean"],
+            "select/rep_n_max": _deg["rep_n_max"],
+            "select/frac_clips_high_rep": _deg["frac_clips_high_rep"],
+            "select/frac_clips_nonascii": _deg["frac_clips_nonascii"],
+            "select/nonascii_frac": _deg["nonascii_frac"],
+        })
+        print(f"  [select] guard_ok={int(_guard_ok)} saved_best={int(_save_best)} "
+              f"— {_save_reason}")
+
+        # ── Per-epoch SLIM checkpoint (F3, 2026-07-16) ────────────────────────
+        # ALWAYS keep every epoch's trainable weights (~0.2 GB: adapter + LoRA +
+        # aux heads + tracker state; no optimizer/scheduler, no llm_state_dict
+        # alias) so the peak epoch is never lost again — both recent runs froze
+        # best.pt at ep1 while later epochs held the real peak, and only last.pt
+        # (continuously overwritten) survived. save_epoch_ckpts: false disables;
+        # an F7 artifact epoch still forces the save (it uploads this file).
+        _artifact_every = int(config.get("artifact_every_n_epochs", 2) or 0)
+        _upload_epoch_artifact = _artifact_every > 0 and (epoch + 1) % _artifact_every == 0
+        if config.get("save_epoch_ckpts", True) or _upload_epoch_artifact:
+            epoch_ckpt_path = os.path.join(
+                config["save_dir"], f"epoch_{epoch + 1:03d}_slim.pt")
+            _epoch_payload = _ckpt_payload(epoch, save_optimizer=False)
+            # Drop the llm_state_dict alias: lora_state_dict carries the same slim
+            # dict and every loader (resume path, inference getter) falls back to it.
+            _epoch_payload.pop("llm_state_dict", None)
+            _atomic_save(_epoch_payload, epoch_ckpt_path)
+            print(f"Saved per-epoch slim checkpoint {os.path.basename(epoch_ckpt_path)}")
+            # ── Off-node checkpoint backup every N epochs (F7, 2026-07-16) ────
+            # Previously artifacts uploaded ONLY on save-best, so a run whose
+            # best froze at ep1 had nothing past ep1 backed up off-node.
+            # Best-effort: _upload_to_wandb_artifact swallows wandb outages.
+            if _upload_epoch_artifact:
+                run_name = (wandb.run.name if wandb.run is not None else None) or "run"
+                _upload_to_wandb_artifact(
+                    epoch_ckpt_path,
+                    name=f"ckpt-{run_name}-ep{epoch + 1:03d}",
+                    metadata={"epoch": epoch, "val_srcc_robust": srcc_robust},
+                )
 
         # Save last (for resuming) — keeps optimizer + scheduler so --resume_from works.
         _atomic_save(

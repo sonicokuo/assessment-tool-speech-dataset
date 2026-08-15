@@ -26,7 +26,7 @@ AUDIO_DIM = 1024  # WavLM output dims
 # Old checkpoints (5-channel) are incompatible with this 4-channel layout; retrain after upgrading.
 OVERLAP_FEATURES = 4
 OVERLAP_DIM = 32  # output of OverlapEmbedding to learn representation
-N_AUX_FEATURES = _FS_N_FEATURES  # = feature_set.N_FEATURES (12); aux regression head output size
+N_AUX_FEATURES = _FS_N_FEATURES  # = feature_set.N_FEATURES (11); aux regression head output size
 
 
 # ── Components ──────────────────────────────────────────────
@@ -43,8 +43,23 @@ class OverlapEmbedding(nn.Module):
 
 # Conv Compress Block
 class ConvCompressor(nn.Module):
-    def __init__(self, in_dim: int = AUDIO_DIM, out_dim: int = MODEL_DIM):
+    """Compress WavLM's 50 Hz frames to a prefix token rate.
+
+    `compression` is the TOTAL factor: 8 -> 6.25 tok/s (160 ms/token, the default and what
+    every checkpoint before 2026-07-27 used), 4 -> 12.5 tok/s (80 ms/token). At 6.25 Hz a
+    token spans 160 ms, which aliases syllables (4-7/s) and short pauses (100-300 ms); the
+    two weakest features are exactly speaking_rate and pause_count, so halving the stride is
+    the direct test of the resolution hypothesis (Voxtral's 6.25-vs-12.5 Hz ablation).
+    Only conv2's stride changes, so compression=8 is byte-identical to the previous code.
+    """
+
+    def __init__(self, in_dim: int = AUDIO_DIM, out_dim: int = MODEL_DIM,
+                 compression: int = 8):
         super().__init__()
+        if compression not in (4, 8):
+            raise ValueError(f"compression must be 4 or 8, got {compression}")
+        self.compression = compression
+        stride2 = compression // 4          # 8 -> 2, 4 -> 1
         # We can also use average pooling. It has similar effect as we want here but conv layers give weights to eachi dim.
         self.conv1 = nn.Conv1d(
             in_channels=in_dim,
@@ -56,26 +71,27 @@ class ConvCompressor(nn.Module):
             in_channels=out_dim,
             out_channels=out_dim,
             kernel_size=2,
-            stride=2,
+            stride=stride2,
         )
 
         self.gelu = nn.GELU()
 
     def forward(self, audio_features: torch.Tensor) -> torch.Tensor:
-        """(B, T, in_dim) -> (B, T//8, out_dim)"""
+        """(B, T, in_dim) -> (B, T//compression, out_dim)"""
         x = audio_features.transpose(1, 2)  # (B, T, 1024) -> (B, 1024, T)
         x = self.conv1(x)  # (B, 1024, T//4)
         x = self.gelu(x)
-        x = self.conv2(x)  # (B, 1024, T//8)
+        x = self.conv2(x)  # (B, 1024, T//compression)
         x = self.gelu(x)
-        x = x.transpose(1, 2)  # (B, T//8, 1024)
+        x = x.transpose(1, 2)  # (B, T//compression, 1024)
 
         return x
 
     def get_output_length(self, input_length: int) -> int:
         """Calculate output sequence length for a given input length."""
+        stride2 = self.compression // 4
         after_conv1 = (input_length - 4) // 4 + 1
-        after_conv2 = (after_conv1 - 2) // 2 + 1
+        after_conv2 = (after_conv1 - 2) // stride2 + 1
 
         return after_conv2
 
@@ -181,10 +197,18 @@ class SelfAttentionContextBlock(nn.Module):
 
         return pe.unsqueeze(0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
         N = x.shape[1]
-        x += self.pos_enc[:, :N, :]
-        x = self.layers(x)
+        # BUGFIX 2026-07-25: `x +=` mutated the caller's tensor in place.
+        x = x + self.pos_enc[:, :N, :]
+        # collate_fn zero-pads to the batch max. Without a key-padding mask,
+        # self-attention mixes padded positions into every real token (batch>1
+        # training only), which would corrupt any attention-variant A/B.
+        pad_mask = None
+        if lengths is not None:
+            ar = torch.arange(N, device=x.device).unsqueeze(0)
+            pad_mask = ar >= lengths.to(x.device).unsqueeze(1)   # True = ignore
+        x = self.layers(x, src_key_padding_mask=pad_mask)
 
         return x
 
@@ -200,12 +224,15 @@ class ReliabilityAwareAdapter(nn.Module):
         lm_dim: int = LM_DIM,
         n_layers: int = 1,
         context_type: str = "mamba",
+        compression: int = 8,
+        conditioning: str = "film",
     ):
         super().__init__()
         self.context_type = context_type
 
         # ------- Audio Path -------
-        self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=d_model)
+        self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=d_model,
+                                         compression=compression)
 
         # Context Block
         if n_layers < 0:
@@ -227,8 +254,24 @@ class ReliabilityAwareAdapter(nn.Module):
             embed_dim=overlap_dim,
         )
 
-        # ------- FiLM Conditioning -------
-        self.film = FiLMConditioning(lm_dim=lm_dim, overlap_dim=overlap_dim)
+        # ------- Overlap Conditioning -------
+        # `conditioning` selects HOW overlap enters, holding the context block fixed.
+        # This exists because concat-only -> film only isolates FiLM in the NO-CONTEXT
+        # setting, while the shipped model is film-attn. Attention is a far more
+        # expressive mixer than an MLP and could learn the modulation itself, so FiLM
+        # may be redundant precisely where we use it. Answering that needs an
+        # attention + non-FiLM arm (2026-07-29).
+        # NOTE param asymmetry: FiLM is 2*(overlap_dim*lm_dim) ~= 0.26M, concat is
+        # (lm_dim+overlap_dim)*lm_dim ~= 16.9M. The concat arm is therefore LARGER, which
+        # biases against FiLM -- the conservative direction. Report it either way.
+        if conditioning not in ("film", "concat"):
+            raise ValueError(f"conditioning must be 'film' or 'concat', got {conditioning!r}")
+        self.conditioning = conditioning
+        if conditioning == "film":
+            self.film = FiLMConditioning(lm_dim=lm_dim, overlap_dim=overlap_dim)
+        else:
+            # Mirrors ConcatOnlyAdapter's fusion so the two concat arms stay comparable.
+            self.cond_proj = nn.Linear(lm_dim + overlap_dim, lm_dim)
 
         # ------- MLP -------
         self.mlp = nn.Sequential(
@@ -241,10 +284,21 @@ class ReliabilityAwareAdapter(nn.Module):
         self,
         audio_features: torch.Tensor,
         overlap_info: torch.Tensor,
+        lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # ------- Audio Path -------
         x = self.compressor(audio_features)
-        x = self.context(x)
+        # BUGFIX 2026-07-25: map input-frame lengths to POST-CONV lengths and hand
+        # them to the context block, so attention variants get a key-padding mask
+        # instead of attending over collate zero-padding (batch>1 training only).
+        ctx_lens = None
+        if lengths is not None:
+            ratio = max(audio_features.shape[1] / max(x.shape[1], 1), 1.0)
+            ctx_lens = (lengths.to(x.device).float() / ratio).ceil().long().clamp(1, x.shape[1])
+        try:
+            x = self.context(x, lengths=ctx_lens)
+        except TypeError:      # Mamba block takes no lengths (unidirectional, no mask needed)
+            x = self.context(x)
         x = self.proj_up(x)
 
         N = x.shape[1]
@@ -255,8 +309,11 @@ class ReliabilityAwareAdapter(nn.Module):
         o = F.adaptive_avg_pool1d(o, N)
         o = o.transpose(1, 2)  # (B, N, overlap_dim)
 
-        # ------- MLP -------
-        x = self.film(x, o)
+        # ------- Conditioning + MLP -------
+        if self.conditioning == "film":
+            x = self.film(x, o)
+        else:
+            x = self.cond_proj(torch.cat([x, o], dim=-1))
         x = self.mlp(x)
 
         return x
@@ -273,9 +330,13 @@ class ConcatOnlyAdapter(nn.Module):
         overlap_dim: int = OVERLAP_DIM,
         mamba_dim: int = MODEL_DIM,
         lm_dim: int = LM_DIM,
+        compression: int = 8,
     ):
         super().__init__()
-        self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=mamba_dim)
+        # train.py passes compression unconditionally, so EVERY variant must accept it
+        # or the run dies at adapter construction (caught 2026-07-29 before launch).
+        self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=mamba_dim,
+                                         compression=compression)
         self.overlap_embed = OverlapEmbedding(in_features=overlap_features, embed_dim=overlap_dim)
         self.mlp = nn.Sequential(
             nn.Linear(mamba_dim + overlap_dim, lm_dim),
@@ -306,9 +367,13 @@ class SigmoidGateAdapter(nn.Module):
         overlap_dim: int = OVERLAP_DIM,
         mamba_dim: int = MODEL_DIM,
         lm_dim: int = LM_DIM,
+        compression: int = 8,
     ):
         super().__init__()
-        self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=mamba_dim)
+        # train.py passes compression unconditionally, so EVERY variant must accept it
+        # or the run dies at adapter construction (caught 2026-07-29 before launch).
+        self.compressor = ConvCompressor(in_dim=audio_dim, out_dim=mamba_dim,
+                                         compression=compression)
         self.overlap_embed = OverlapEmbedding(in_features=overlap_features, embed_dim=overlap_dim)
         self.proj_up = nn.Linear(mamba_dim, lm_dim)
         self.gate = nn.Linear(overlap_dim, lm_dim)
@@ -344,6 +409,7 @@ class QFormerAdapter(nn.Module):
         overlap_features: int = OVERLAP_FEATURES,
         overlap_dim: int = OVERLAP_DIM,
         lm_dim: int = LM_DIM,
+        compression: int = 8,   # accepted for interface parity; QFormer has no ConvCompressor
         n_queries: int = 32,
         n_heads: int = 8,
     ):
@@ -406,10 +472,39 @@ class AdapterWithAuxHead(nn.Module):
         lm_dim: int = LM_DIM,
         n_features: int = N_AUX_FEATURES,
         reliability_head: bool = False,
+        aux_pool: str = "mean",
     ):
         super().__init__()
         self.inner = inner
         self.reliability_head = bool(reliability_head)
+        # AUX POOLING (added 2026-08-06). "mean" is the historical default and stays
+        # byte-identical. "linear_softmax" exists because MEAN POOLING PROVABLY CANNOT
+        # LOCALISE and we measured exactly that:
+        #
+        #   Exact per-token attributions on 400 test clips (the emitted value decomposes
+        #   as v_f = (1/N)*SUM_t W_f.prefix_t, so each token's share is computable in
+        #   closed form, not estimated). Normalised entropy of |contribution| over time,
+        #   where 1.0 = perfectly uniform:
+        #       snr 0.983 · srmr 0.993 · f0_mean 0.996 · jitter 0.996 · shimmer 0.997
+        #       speaking_rate 0.997 · pause_rate 0.970 · pause_count 0.932
+        #   and clip-SPECIFICITY was NEGATIVE for 8 of 11 features, i.e. a clip's map
+        #   matched OTHER clips' structure better than its own -- the population-average
+        #   map, the same failure that hollowed out the SRMR map (specificity 0.005-0.012).
+        #
+        # The cause is structural, not incidental: with y = mean_t(z_t) every frame
+        # contributes exactly 1/T regardless of content, so nothing in the objective
+        # rewards concentrating evidence. Wang et al., ICASSP 2019 (arXiv 1810.09050)
+        # compare five MIL pooling functions for sound-event localisation and find mean
+        # pooling the WORST, precisely because it rewards flat maps.
+        #
+        # linear_softmax weights each frame by its own magnitude, w_t = |z_t| / SUM|z_t|,
+        # so a frame only matters if it commits. Signed variant of Wang's y = SUM z^2/SUM z
+        # (theirs assumes non-negative detections; our z is signed, e.g. negative SNR dB).
+        # Crucially it PRESERVES exact attribution: contribution_t = w_t * z_t still sums
+        # to the emitted value, so the explainability map stays faithful by construction.
+        if aux_pool not in ("mean", "linear_softmax"):
+            raise ValueError(f"aux_pool must be 'mean' or 'linear_softmax', got {aux_pool!r}")
+        self.aux_pool = aux_pool
         if self.reliability_head:
             # Imported here (not at module top) so adapter.py stays importable in
             # environments that only need the plain adapter. ReliabilityHead is a
@@ -423,14 +518,79 @@ class AdapterWithAuxHead(nn.Module):
         self,
         audio_features: torch.Tensor,
         overlap_info: torch.Tensor,
+        lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, object]:
-        prefix = self.inner(audio_features, overlap_info)   # (B, N, lm_dim)
-        pooled = prefix.mean(dim=1)                         # (B, lm_dim)
+        """`lengths` = per-clip UNPADDED WavLM frame counts (batch["audio_lens"]).
+
+        BUGFIX 2026-07-25: collate_fn zero-pads to the batch max but nothing was
+        threaded through, so the pooled aux/reliability input averaged PADDING
+        during training (batch>1) while inference (batch=1) has none — a
+        train/inference mismatch on exactly the head that drives abstention.
+        None keeps the legacy unmasked mean (byte-identical at batch=1).
+        """
+        try:
+            prefix = self.inner(audio_features, overlap_info, lengths=lengths)
+        except TypeError:      # legacy variants without the lengths kwarg
+            prefix = self.inner(audio_features, overlap_info)   # (B, N, lm_dim)
+        # Valid-frame mask (1 = real, 0 = collate padding); shared by both poolings.
+        if lengths is None:
+            mask = None
+        else:
+            # Map input-frame lengths to post-conv prefix lengths via the actual
+            # compression ratio of this forward (variant-agnostic).
+            n_in, n_out = audio_features.shape[1], prefix.shape[1]
+            L = lengths.to(prefix.device).long()
+            # EXACT valid-output length, not ceil(L/ratio). The rounding matters:
+            # ceil(250/8) = 32 but the true conv output for 250 frames is 31, so the
+            # ceil version marks one padding-contaminated position as valid. Under mean
+            # pooling that leaks 1/32 of one frame (measured output drift 0.079 when the
+            # padded region is filled with garbage); under linear_softmax the same
+            # contaminated frame can carry a large |z| and DOMINATE the magnitude
+            # weighting (drift 1.82, a 23x amplification). Fixed 2026-08-06.
+            comp = getattr(getattr(self.inner, "compressor", None), "get_output_length", None)
+            if comp is not None:
+                s2 = max(int(getattr(self.inner.compressor, "compression", 8)) // 4, 1)
+                a1 = torch.div(L - 4, 4, rounding_mode="floor") + 1      # after conv1
+                plen = torch.div(a1 - 2, s2, rounding_mode="floor") + 1  # after conv2
+            else:                                    # variants without a ConvCompressor
+                ratio = max(n_in / max(n_out, 1), 1.0)
+                plen = torch.div(L.float(), ratio, rounding_mode="floor").long()
+            plen = plen.clamp(1, n_out)
+            mask = (torch.arange(n_out, device=prefix.device).unsqueeze(0)
+                    < plen.unsqueeze(1)).to(prefix.dtype)    # (B, N) 1 = real
+
+        if self.aux_pool == "mean":
+            if mask is None:
+                pooled = prefix.mean(dim=1)                 # (B, lm_dim)
+            else:
+                pooled = (prefix * mask.unsqueeze(-1)).sum(1) / mask.sum(1).clamp(min=1.0).unsqueeze(-1)
+            if self.reliability_head:
+                mean, log_var = self.regress_head(pooled)   # each (B, n_features)
+                return prefix, (mean, log_var)
+            return prefix, self.regress_head(pooled)        # (B, n_features)
+
+        # ── linear_softmax ────────────────────────────────────────────────────────
+        # Apply the head PER FRAME, then pool the OUTPUTS weighted by their own
+        # magnitude. Projecting first is what creates the localisation incentive:
+        # pooling features and projecting afterwards (the "mean" branch) is linear, so
+        # any weighting collapses back into a single averaged vector and the model can
+        # smear evidence for free. Pooling per-frame PREDICTIONS cannot be collapsed.
+        z = self.regress_head(prefix)                       # (B, N, F) or (B, N, 2F)
         if self.reliability_head:
-            mean, log_var = self.regress_head(pooled)       # each (B, n_features)
-            return prefix, (mean, log_var)
-        scalar_pred = self.regress_head(pooled)             # (B, n_features)
-        return prefix, scalar_pred
+            mean_t, logvar_t = z                            # each (B, N, F)
+        else:
+            mean_t, logvar_t = z, None
+        w = mean_t.abs()
+        if mask is not None:
+            w = w * mask.unsqueeze(-1)                      # padded frames get zero weight
+        w = w / w.sum(dim=1, keepdim=True).clamp(min=1e-6)  # (B, N, F), sums to 1 over time
+        mean = (w * mean_t).sum(dim=1)                      # (B, F)
+        if logvar_t is None:
+            return prefix, mean
+        # log-variance pooled with the SAME weights, so the uncertainty is read from the
+        # same frames the value came from rather than from an unrelated average.
+        log_var = (w * logvar_t).sum(dim=1)
+        return prefix, (mean, log_var)
 
 
 # Factory function: build any variant by name
@@ -439,6 +599,7 @@ def build_adapter(
     with_aux_head: bool = True,
     n_aux_features: int = N_AUX_FEATURES,
     reliability_head: bool = False,
+    aux_pool: str = "mean",
     **kwargs,
 ) -> nn.Module:
     """Build an adapter variant by name, optionally wrapped with an aux regression head.
@@ -469,6 +630,13 @@ def build_adapter(
         "sigmoid-gate": lambda **kw: SigmoidGateAdapter(**kw),
         "film": lambda **kw: ReliabilityAwareAdapter(context_type="none", **kw),
         "film-attn": lambda **kw: ReliabilityAwareAdapter(context_type="attn", n_layers=1, **kw),
+        # FiLM ablation HOLDING THE CONTEXT BLOCK FIXED: same attention stack as
+        # film-attn, overlap fused by concat+Linear instead of FiLM. film-attn minus
+        # attn-concat is the marginal value of FiLM in the configuration we ship.
+        "attn-concat": lambda **kw: ReliabilityAwareAdapter(
+            context_type="attn", n_layers=1, conditioning="concat", **kw),
+        "mamba-concat": lambda **kw: ReliabilityAwareAdapter(
+            context_type="mamba", n_layers=1, conditioning="concat", **kw),
         "film-attn-2L": lambda **kw: ReliabilityAwareAdapter(context_type="attn", n_layers=2, **kw),
         "film-mamba": lambda **kw: ReliabilityAwareAdapter(context_type="mamba", n_layers=1, **kw),
         "film-mamba-2L": lambda **kw: ReliabilityAwareAdapter(context_type="mamba", n_layers=2, **kw),
@@ -483,6 +651,6 @@ def build_adapter(
     if with_aux_head:
         return AdapterWithAuxHead(
             inner, lm_dim=lm_dim, n_features=n_aux_features,
-            reliability_head=reliability_head,
+            reliability_head=reliability_head, aux_pool=aux_pool,
         )
     return inner

@@ -115,17 +115,18 @@ def test_observability_sets_partition_all_features():
 def test_build_nums_target_complete_row():
     out = build_nums_target(COMPLETE_ROW)
     print(f"\nCOMPLETE: {out}")
-    # All 11 slots present, fixed order.
+    # All 11 slots present, fixed order. F15 (2026-07-16): constant two-decimal
+    # surface form on every float slot (digit-position/magnitude alignment).
     assert "snr=15.66" in out
-    assert "srmr=5.1569" in out
+    assert "srmr=5.16" in out
     assert "f0_mean=152.46" in out
     assert "f0_sd=53.18" in out
-    assert "speaking_rate=5.610" in out
+    assert "speaking_rate=5.61" in out
     assert "pause_count=1" in out          # integer, no decimal
-    assert "pause_rate=5.317" in out
-    assert "overlap_ratio=0.7928" in out
-    assert "jitter=2.7732" in out
-    assert "shimmer=14.1259" in out
+    assert "pause_rate=5.32" in out
+    assert "overlap_ratio=0.79" in out
+    assert "jitter=2.77" in out
+    assert "shimmer=14.13" in out
     assert "hnr=8.34" in out
     # duration + articulation_rate are in the CSV but NOT supervised features.
     assert "duration=" not in out
@@ -146,10 +147,10 @@ def test_build_nums_target_silent_row_uses_na():
     assert "jitter=na" in out
     assert "shimmer=na" in out
     assert "speaking_rate=na" in out
-    # Genuine zeros are NOT na
-    assert "overlap_ratio=0.0000" in out
+    # Genuine zeros are NOT na (F15: two-decimal surface form)
+    assert "overlap_ratio=0.00" in out
     assert "pause_count=0" in out
-    assert "pause_rate=0.000" in out
+    assert "pause_rate=0.00" in out
 
 
 def test_build_nums_target_fixed_order_across_rows():

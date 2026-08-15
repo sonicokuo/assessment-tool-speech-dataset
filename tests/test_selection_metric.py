@@ -1,4 +1,4 @@
-"""CPU-isolated unit tests for src/selection_metric.py.
+"""CPU-isolated unit tests for src/eval/selection_metric.py.
 
 No GPU and no train-loop imports — only the pure selection primitives plus the
 HybridClaimParser / feature_set they depend on. Run with:
@@ -16,10 +16,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from eval.selection_metric import (  # noqa: E402
     band_free_val_scores,
     composite_score,
+    headline_band_free_means,
     ema,
     avg_state_dicts,
     SELECTION_FEATURES,
     DEGENERATE_SELECTION_FEATURES,
+    HEADLINE_FEATURES,
 )
 from data.feature_set import RECOVERABLE_FEATURES  # noqa: E402
 
@@ -194,6 +196,61 @@ class TestCompositeScore:
         s1 = composite_score(pf, RECOVERABLE_FEATURES, lam_nmae=1.0)
         assert s0 == pytest.approx(0.8)
         assert s1 == pytest.approx(0.8 - 1.0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HEADLINE_FEATURES — the frozen ROBUST5 (F8, 2026-07-15 audit)
+# ═══════════════════════════════════════════════════════════════════════════
+class TestHeadlineFeaturesFrozen:
+    def test_exact_robust5(self):
+        # ONE headline, frozen. Any change here is a deliberate metric change and
+        # must be made in selection_metric.py (the single source of truth), never
+        # in a consuming script.
+        assert HEADLINE_FEATURES == (
+            "snr", "srmr", "speaking_rate", "pause_count", "pause_rate",
+        )
+
+    def test_membership_policy(self):
+        # snr IN since the B2 flip; f0 (ill-posed / mode-collapsing) belongs to the
+        # abstention panel; overlap_ratio is the FiLM conditioning leak;
+        # articulation_rate was dropped from the supervised set 2026-06-24.
+        assert "snr" in HEADLINE_FEATURES
+        for banned in ("f0_mean", "f0_sd", "overlap_ratio", "articulation_rate"):
+            assert banned not in HEADLINE_FEATURES
+
+    def test_consistent_with_recoverable_minus_degenerate(self):
+        assert (
+            frozenset(HEADLINE_FEATURES)
+            == RECOVERABLE_FEATURES - DEGENERATE_SELECTION_FEATURES
+        )
+        assert frozenset(HEADLINE_FEATURES) <= frozenset(SELECTION_FEATURES)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# headline_band_free_means — mean_coverage (F10) beside the SRCC/nMAE means
+# ═══════════════════════════════════════════════════════════════════════════
+class TestHeadlineMeansCoverage:
+    def test_mean_coverage_ignores_min_pairs_gate(self):
+        # A feature whose emission collapsed (0 pairs) must NOT vanish from
+        # mean_coverage even though it is gated out of mean_srcc — that silent
+        # subset shrinkage is exactly what coverage exists to expose.
+        pf = {
+            "srmr":          {"srcc": 0.8, "nmae": 0.2, "coverage": 1.0, "n": 50},
+            "speaking_rate": {"srcc": 0.6, "nmae": 0.4, "coverage": 0.5, "n": 50},
+            "pause_rate":    {"srcc": None, "nmae": None, "coverage": 0.0, "n": 0},
+            # degenerate (overlap_ratio): excluded from ALL headline aggregates
+            "overlap_ratio": {"srcc": 0.9, "nmae": 0.1, "coverage": 1.0, "n": 50},
+        }
+        h = headline_band_free_means(pf, RECOVERABLE_FEATURES, min_pairs=5)
+        assert h["mean_srcc"] == pytest.approx((0.8 + 0.6) / 2)
+        assert set(h["features_used"]) == {"srmr", "speaking_rate"}
+        # coverage mean over srmr, speaking_rate AND the collapsed pause_rate
+        assert h["mean_coverage"] == pytest.approx((1.0 + 0.5 + 0.0) / 3)
+
+    def test_mean_coverage_key_always_present(self):
+        h = headline_band_free_means({}, RECOVERABLE_FEATURES)
+        assert h["mean_coverage"] == 0.0
+        assert h["mean_srcc"] == 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════

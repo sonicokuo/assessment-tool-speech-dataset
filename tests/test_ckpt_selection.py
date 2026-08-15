@@ -14,6 +14,7 @@ from eval.ckpt_selection import (  # noqa: E402
     passes_degeneration_guard,
     should_save_best,
     seeded_val_indices,
+    update_best_bleu,
 )
 
 CLEAN = (
@@ -134,14 +135,48 @@ def test_guard_tolerates_a_few_looping_clips():
     assert ok, reason
 
 
-def test_guard_rejects_catastrophic_single_clip_backstop():
-    # A single clip that is essentially one token repeated (rep_n ~ 0.99) is so
-    # broken it trips the high catastrophic backstop even alone.
+def test_guard_ignores_rep_n_max_single_clip():
+    # 2026-07-16: the rep_n_max "catastrophic backstop" is REMOVED. It is a
+    # max-statistic, so it scales with n: with 200 val clips the single worst
+    # clip is statistically guaranteed >0.95, and the offline replay showed the
+    # backstop fired at EVERY epoch >= 2 in BOTH recent runs, freezing best.pt
+    # at ep1. A single 0.99 clip with a low clip FRACTION must now pass.
     ok, reason = passes_degeneration_guard(
         bleu=20.0, best_bleu=20.0, rep_n_max=0.99, nonascii_frac_val=0.0,
-        frac_clips_high_rep=1 / 32,   # only one clip, below the fraction gate
+        frac_clips_high_rep=1 / 200,   # only one clip, below the fraction gate
     )
-    assert not ok and "rep_n_max" in reason
+    assert ok, reason
+
+
+def test_guard_passes_exact_replay_numbers():
+    # The EXACT numbers from the 2026-07-16 offline replay of the frozen runs:
+    # rep_n_max=0.98 (the one worst clip out of 200) with frac_clips_high_rep
+    # 0.405 (< the 0.5 gate). The old backstop rejected this every epoch;
+    # it must now PASS the guard.
+    ok, reason = passes_degeneration_guard(
+        bleu=25.0, best_bleu=25.0, rep_n_max=0.98, nonascii_frac_val=0.0,
+        frac_clips_high_rep=0.405,
+    )
+    assert ok, reason
+
+
+def test_guard_rejects_majority_loop_fraction():
+    # frac_clips_high_rep=0.51 (> the 0.5 gate) is real batch-level collapse
+    # and must still FAIL — the fraction gate, not rep_n_max, owns this case.
+    ok, reason = passes_degeneration_guard(
+        bleu=25.0, best_bleu=25.0, rep_n_max=0.98, nonascii_frac_val=0.0,
+        frac_clips_high_rep=0.51,
+    )
+    assert not ok and "frac_clips_high_rep" in reason
+
+
+def test_guard_bleu_floor_m3b_ep5_numbers():
+    # The observed m3b ep5 collapse: bleu 15.51 < 0.6 * best 29.59 = 17.754.
+    # The relative BLEU floor is KEPT by the 2026-07-16 fix and must reject.
+    ok, reason = passes_degeneration_guard(
+        bleu=15.51, best_bleu=29.59, rep_n_max=0.1, nonascii_frac_val=0.0,
+    )
+    assert not ok and "bleu" in reason
 
 
 def test_guard_rejects_nonascii():
@@ -183,10 +218,12 @@ def test_guard_relative_floor_not_absolute():
 
 def test_guard_first_epoch_no_bleu_ref_still_checks_repetition():
     # best_bleu None (epoch 1): BLEU check skipped, but repetition still caught
-    # via the clip-fraction gate (most of the batch looping).
+    # via the clip-fraction gate (most of the batch looping). 0.6 > the 0.50
+    # gate. (Was 0.5, which the 2026-07-08 threshold bump 0.15 -> 0.50 silently
+    # made non-rejecting — the strict > never fired at exactly 0.5.)
     ok, reason = passes_degeneration_guard(
         bleu=5.0, best_bleu=None, rep_n_max=0.9, nonascii_frac_val=0.0,
-        frac_clips_high_rep=0.5,
+        frac_clips_high_rep=0.6,
     )
     assert not ok and "frac_clips_high_rep" in reason
 
@@ -236,6 +273,28 @@ def test_no_save_when_majority_of_clips_loop():
     save, reason = should_save_best(0.55, 0.50, bleu=20.0, best_bleu=20.0,
                                     gen_texts=batch)
     assert not save and "degenerate" in reason
+
+
+# ── update_best_bleu (F4: clean-epoch-only floor reference) ──────────────────
+def test_best_bleu_not_updated_on_withheld_epoch():
+    # A guard-FAILING epoch must NOT raise the relative-floor reference, even
+    # if its raw BLEU is a new max — otherwise a degenerate high-BLEU epoch
+    # ratchets the floor up and rejects every later legitimate epoch.
+    assert update_best_bleu(29.59, 35.0, guard_ok=False) == 29.59
+
+
+def test_best_bleu_updated_on_clean_epoch():
+    assert update_best_bleu(29.59, 35.0, guard_ok=True) == 35.0
+    # Clean but lower BLEU keeps the running max.
+    assert update_best_bleu(29.59, 20.0, guard_ok=True) == 29.59
+
+
+def test_best_bleu_none_handling():
+    # First clean epoch seeds the reference; a withheld first epoch does not.
+    assert update_best_bleu(None, 31.5, guard_ok=True) == 31.5
+    assert update_best_bleu(None, 31.5, guard_ok=False) is None
+    # No BLEU this epoch (dep missing / non-eval epoch) → reference unchanged.
+    assert update_best_bleu(29.59, None, guard_ok=True) == 29.59
 
 
 # ── seeded_val_indices ───────────────────────────────────────────────────────

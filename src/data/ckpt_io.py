@@ -49,19 +49,41 @@ CKPT_FORMAT_SLIM = "peft_slim"
 
 # ─── VAL-SUBSET STRATIFICATION ────────────────────────────────────────────────
 # Default overlap-ratio bin edges for stratifying the per-epoch val SFS subset.
-# low ≤ 0.15 < med ≤ 0.45 < high. Chosen around Libri2Mix's overlap distribution
-# (median ~0.4); the exact edges matter less than guaranteeing each regime is
-# represented so the subset's SFS isn't dominated by whichever overlap level
-# happens to be over-sampled by a uniform draw.
-OVERLAP_BIN_EDGES = (0.15, 0.45)
+# low ≤ 0.15 < med ≤ 0.45 < high  -- WRONG EDGES, corrected 2026-08-03.
+#
+# The comment below ("median ~0.4", "the exact edges matter less") was written against an
+# assumed overlap distribution that the data does not have. Measured on the real CSVs:
+#   dev  n=6000:  overlap==0  3000 (50.0%) | 0<ov<0.5  19 (0.32%) | ov>=0.5  2981 (49.7%)
+#   test n=6000:  overlap==0  3000 (50.0%) | 0<ov<0.5  27 (0.45%) | ov>=0.5  2973 (49.6%)
+# The distribution is BIMODAL (a spike at exactly 0 from the s1clean clips, a mode at
+# 0.7-0.9 from the mixtures), not centred on 0.4.
+#
+# The edges ALSO did not line up with the decision threshold that actually matters:
+# HEDGE_OVERLAP_TAU = 0.5 in data/feature_set.py governs abstention, so the boundary the
+# val subset must resolve is 0.5. With edges at 0.45, twelve of the nineteen partial-overlap
+# dev clips fell into "high" and were invisible as boundary cases.
+#
+# Now threshold-aligned: {0} / (0, 0.5) / [0.5, 1]. Note honestly that this does NOT create
+# signal -- the partial bin has 19 clips in all of dev and ~2 in a 200-clip subset, so
+# per-bin abstention statistics remain unmeasurable. It only stops the boundary cases from
+# being silently mislabelled. Measuring graded abstention needs SYNTHESISED partial-overlap
+# clips; no sampling scheme extracts it from 19.
+OVERLAP_BIN_EDGES = (1e-9, 0.5)
 
 
 def overlap_bin(ratio: float, edges: tuple = OVERLAP_BIN_EDGES) -> str:
-    """Map an overlap_ratio in [0,1] to a coarse bin label ('low'/'med'/'high')."""
+    """Map an overlap_ratio in [0,1] to a coarse bin label ('low'/'med'/'high').
+
+    Boundary convention (2026-08-03): the upper edge is EXCLUSIVE, so with edges
+    (1e-9, 0.5) a clip at exactly ratio == 0.5 lands in 'high'. This matters because
+    HEDGE_OVERLAP_TAU = 0.5 abstains on `overlap >= 0.5`; a `<=` comparison here would
+    put the threshold clip itself in the opposite bin from the one whose behaviour it
+    governs. 'low' stays inclusive so that ratio == 0.0 (every s1clean clip) is 'low'.
+    """
     lo, hi = edges
     if ratio <= lo:
         return "low"
-    if ratio <= hi:
+    if ratio < hi:
         return "med"
     return "high"
 

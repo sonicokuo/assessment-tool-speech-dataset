@@ -27,6 +27,12 @@ from peft import LoraConfig, get_peft_model
 from model.adapter import build_adapter
 from data.ckpt_io import load_llm_state_dict
 from data.dataset import PreprocessedDataset
+from eval.inference_resume import (
+    FINGERPRINT_KEY,
+    checkpoint_fingerprint,
+    resolve_resume_output_path,
+    results_fingerprints,
+)
 from eval.sfs import HybridClaimParser, SFSScorer
 from eval.text_metrics import compute_generation_metrics
 from data.section_tags import (
@@ -43,8 +49,41 @@ from model.spec_encoder import SpecEncoder
 
 
 # ── Generation ──────────────────────────────────────────────
-def sample_token(logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
-    """Sample a token from logits with temperature, top-k, and top-p (nucleus) filtering."""
+def _apply_repetition_penalty(logits: torch.Tensor, prev_ids, penalty: float) -> torch.Tensor:
+    """CTRL-style repetition penalty (Keskar 2019): divide the logit of each already-emitted
+    token by `penalty` (>1 discourages repeats). Deterministic — compatible with greedy decoding
+    (top_k=1) and reproducible paper numbers. penalty==1.0 -> no-op."""
+    if penalty == 1.0 or not prev_ids:
+        return logits
+    for tid in set(int(t) for t in prev_ids):
+        v = logits[0, tid]
+        logits[0, tid] = v / penalty if v > 0 else v * penalty
+    return logits
+
+
+def _block_repeat_ngrams(logits: torch.Tensor, prev_ids, n: int) -> torch.Tensor:
+    """No-repeat-ngram (Paulus 2018): -inf any token that would complete an n-gram already seen
+    in prev_ids. Deterministic. n<=0 -> no-op. Useful against the templated-report late-loop."""
+    if n <= 0 or len(prev_ids) < n:
+        return logits
+    prefix = tuple(int(t) for t in prev_ids[-(n - 1):]) if n > 1 else ()
+    for i in range(len(prev_ids) - n + 1):
+        if tuple(int(t) for t in prev_ids[i:i + n - 1]) == prefix:
+            logits[0, int(prev_ids[i + n - 1])] = float("-inf")
+    return logits
+
+
+def sample_token(
+    logits: torch.Tensor, temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0,
+    prev_ids=None, repetition_penalty: float = 1.0, no_repeat_ngram_size: int = 0,
+) -> torch.Tensor:
+    """Sample a token from logits with temperature, top-k, top-p (nucleus) filtering, and
+    optional deterministic repetition control (D4). repetition_penalty=1.0 + no_repeat_ngram_size=0
+    (the defaults) are byte-identical to before. When set, they are applied to the raw logits
+    BEFORE temperature/top-k/top-p, so they also bias greedy (top_k=1) decoding."""
+    if prev_ids:
+        logits = _apply_repetition_penalty(logits, prev_ids, repetition_penalty)
+        logits = _block_repeat_ngrams(logits, prev_ids, no_repeat_ngram_size)
     logits = logits / temperature
 
     if top_k > 0:
@@ -76,6 +115,8 @@ def generate(
     temperature: float = 1.0,
     top_k: int = 0,
     top_p: float = 1.0,
+    repetition_penalty: float = 1.0,      # D4: deterministic; 1.0 = off
+    no_repeat_ngram_size: int = 0,        # D4: deterministic; 0 = off
     section_ctx: dict | None = None,
 ) -> tuple[str, dict]:
     """Generate a quality description from pre-computed features.
@@ -101,9 +142,18 @@ def generate(
     audio_features = audio_features.unsqueeze(0).to(device).to(torch.bfloat16)
     overlap_info = overlap_info.unsqueeze(0).to(device).to(torch.bfloat16)
 
-    # AdapterWithAuxHead returns (prefix, scalar_pred); legacy adapters return prefix only.
+    # AdapterWithAuxHead returns (prefix, scalar_pred[, log_var]); legacy adapters return prefix only.
     out = adapter(audio_features, overlap_info)
-    prefix_embeds = out[0] if isinstance(out, tuple) else out
+    if isinstance(out, tuple):
+        prefix_embeds = out[0]
+        aux_scalar_pred = out[1] if len(out) > 1 else None   # E12: aux-head mean (was discarded here)
+        aux_log_var = out[2] if len(out) > 2 else None        # reliability head log-variance (if present)
+        # Reliability-head adapters return (prefix, (mean, log_var)) — a NESTED
+        # tuple (adapter.py forward). Normalize to flat mean/log_var.
+        if isinstance(aux_scalar_pred, tuple):
+            aux_scalar_pred, aux_log_var = aux_scalar_pred
+    else:
+        prefix_embeds, aux_scalar_pred, aux_log_var = out, None, None
 
     embed_layer = llm.get_input_embeddings()
     prompt_embeds = embed_layer(prompt_ids)
@@ -115,6 +165,19 @@ def generate(
     attention_maps: dict[str, torch.Tensor] = {}
     past_key_values = None
     pending_injection: torch.Tensor | None = None   # set after a section-open is emitted
+
+    # F1 (2026-07-16): stop on BOTH Qwen enders, matching the model's shipped
+    # generation_config eos_token_id=[<|im_end|>, <|endoftext|>]. Training
+    # supervises <|im_end|> (tokenizer.eos_token_id on the post-trained model),
+    # but on raw (non-chat-template) inputs the pretrained prior can emit the
+    # document ender <|endoftext|> instead; stopping on only one id sails past
+    # the other and the generation continues as fresh off-task text (the
+    # "boilerplate" degeneration class). skip_special_tokens=True then hides
+    # the missed ender from the logs.
+    eos_ids = {tokenizer.eos_token_id}
+    _eot = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    if _eot is not None and _eot != tokenizer.unk_token_id:
+        eos_ids.add(_eot)
 
     # Whether to ask the LM to return hidden states. Both the dynamic section
     # path and any <r>-marker firing need them; turning the flag off when not
@@ -135,9 +198,14 @@ def generate(
     # First forward: process prefix + prompt
     outputs = llm(inputs_embeds=inputs_embeds, use_cache=True, output_hidden_states=needs_hidden)
     past_key_values = outputs.past_key_values
-    next_token_id = sample_token(outputs.logits[:, -1, :], temperature, top_k, top_p)
+    next_token_id = sample_token(outputs.logits[:, -1, :], temperature, top_k, top_p,
+                                 prev_ids=generated_ids, repetition_penalty=repetition_penalty,
+                                 no_repeat_ngram_size=no_repeat_ngram_size)
     token_id = next_token_id.item()
     generated_ids.append(token_id)
+
+    if token_id in eos_ids:
+        max_new_tokens = 1   # first token is an ender — skip the loop entirely
 
     pending_injection, range_pending_alpha, range_body_ids = _maybe_fire_hooks(
         token_id, outputs, needs_hidden, section_ctx,
@@ -164,11 +232,13 @@ def generate(
             output_hidden_states=needs_hidden,
         )
         past_key_values = outputs.past_key_values
-        next_token_id = sample_token(outputs.logits[:, -1, :], temperature, top_k, top_p)
+        next_token_id = sample_token(outputs.logits[:, -1, :], temperature, top_k, top_p,
+                                     prev_ids=generated_ids, repetition_penalty=repetition_penalty,
+                                     no_repeat_ngram_size=no_repeat_ngram_size)
         token_id = next_token_id.item()
         generated_ids.append(token_id)
 
-        if token_id == tokenizer.eos_token_id:
+        if token_id in eos_ids:
             break
 
         # Accumulate body tokens while inside an <r>...</r> span.
@@ -185,6 +255,14 @@ def generate(
             pending_injection = pending
 
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    # E12: stash the aux-head prediction (per-feature mean, and log_var if a reliability head is
+    # present) so the caller can log it to inference_results.json for the digit-drift metric
+    # (|emitted - aux_mean|). Carried under a reserved key the caller pops; NOT an attention map.
+    if aux_scalar_pred is not None:
+        aux = {"aux_mean": aux_scalar_pred[0].float().cpu().tolist()}
+        if aux_log_var is not None:
+            aux["aux_log_var"] = aux_log_var[0].float().cpu().tolist()
+        attention_maps["_aux"] = aux
     return text, attention_maps
 
 
@@ -321,6 +399,8 @@ _STRUCTURAL_KEYS = (
     "lora_alpha",
     "lora_targets",
     "lora_dropout",
+    "compression",         # conv stride: a 4 ckpt in an 8 adapter loads the wrong geometry
+    "aux_pool",            # mean vs linear_softmax changes how the head reads the prefix
     "use_dora",            # DoRA must match train/inference or the delta won't load
     "init_lora_weights",   # PiSSA/standard init must match (see peft_config.py)
     "tagged_mode",  # tags vs legacy untagged prose — determines tokenizer setup
@@ -434,18 +514,47 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         print(f"[full-FT] lora_rank={config.get('lora_rank')!r} → loading LM weights directly")
 
     # Load checkpoint (use --checkpoint_device cpu for smaller GPUs)
+    # F12: fingerprint the checkpoint file (first 1 MiB + size + mtime, hex[:12])
+    # so resume can detect results written by DIFFERENT weights (see resume block).
+    ckpt_fingerprint = checkpoint_fingerprint(checkpoint_path)
+    print(f"[fingerprint] checkpoint {ckpt_fingerprint} ({checkpoint_path})")
     map_loc = config.get("checkpoint_device", "cuda")
     checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=map_loc)
     lm_hidden_size = llm.config.hidden_size
 
     adapter = (
-        build_adapter(config["adapter_variant"], lm_dim=lm_hidden_size)
+        build_adapter(
+            config["adapter_variant"],
+            lm_dim=lm_hidden_size,
+            # BUGFIX 2026-07-23: the sigma-head flag was NOT forwarded here, so a
+            # reliability_head=true checkpoint was loaded into a PLAIN aux head at
+            # RANDOM init (strict=False silently dropped the trained head weights).
+            # Every aux_mean logged by E12 was garbage, aux_log_var never existed,
+            # and slot_decode mode="verified" substituted random values. Forward the
+            # flag from the checkpoint's embedded config so the trained head loads.
+            reliability_head=bool(config.get("reliability_head", False)),
+            # Same class of bug as above: a compression=4 checkpoint loaded into a
+            # compression=8 adapter changes the conv stride, so the trained conv2
+            # weights would load into the wrong geometry. Read it from the ckpt config.
+            compression=int(config.get("compression", 8)),
+            # must match training or the head is applied at the wrong granularity
+            aux_pool=str(config.get("aux_pool", "mean")),
+        )
         .to(device)
         .to(torch.bfloat16)
     )
-    # strict=False: reliability/aux-head checkpoints (regress_head.*) carry keys the
-    # generation-time adapter doesn't build; the head is training-only, so ignore extras.
-    adapter.load_state_dict(checkpoint["adapter_state_dict"], strict=False)
+    missing, unexpected = adapter.load_state_dict(
+        checkpoint["adapter_state_dict"], strict=False
+    )
+    # Fail LOUD if head weights didn't line up: a missing aux/reliability head at
+    # inference means aux_mean/aux_log_var (E12, slot verified mode, sigma
+    # analyses) would silently be random-init garbage.
+    _head_missing = [k for k in missing if "head" in k or "regress" in k]
+    if _head_missing:
+        raise RuntimeError(
+            f"adapter head weights missing from checkpoint load: {_head_missing} — "
+            "reliability_head/config mismatch between training and inference?"
+        )
     # New checkpoints use `llm_state_dict`; legacy ones used `lora_state_dict`.
     # SLIM ckpts (ckpt_format="peft_slim") carry only LoRA + unfrozen rows and load
     # strict=False over the already-built (from_pretrained + get_peft_model) base;
@@ -497,9 +606,46 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     print(f"[prompt-prose] {inference_prompt!r}")
 
     # Dataset
-    test_set = PreprocessedDataset(test_dir, config.get("descriptions_path"))
+    # ⚠️ 4th OCCURRENCE OF THE UNFORWARDED-CONFIG BUG (fixed 2026-08-14). Previously this
+    # read `PreprocessedDataset(test_dir, config.get("descriptions_path"))` and dropped
+    # `zero_overlap_input`, whose default is False (`data/dataset.py:37`). The L7 audio-only
+    # arm was TRAINED with the overlap channel zeroed, so its `OverlapEmbedding` Linear(4,32)
+    # (`model/adapter.py:37`) received EXACTLY ZERO gradient and sits at random init —
+    # feeding it the oracle overlap at eval is structured OOD noise, and it silently
+    # corrupted a 6000-clip headline. Same class as the 2026-07-23 `reliability_head` fix
+    # and the 2026-08-10 `run_m3b_deletion` fix.
+    #
+    # The countermeasure is NOT another hand-forwarded kwarg: resolve every data-pipeline
+    # flag from the CHECKPOINT'S OWN training config (the model is what it was trained as),
+    # fall back to the eval YAML, and SHOUT when the two disagree.
+    ck_cfg = (checkpoint.get("config") or {}) if isinstance(checkpoint, dict) else {}
+
+    def _pipeline_flag(name: str, default):
+        train_v, yaml_v = ck_cfg.get(name, None), config.get(name, None)
+        if train_v is not None and yaml_v is not None and bool(train_v) != bool(yaml_v):
+            print(f"[warn] {name}: checkpoint trained with {train_v!r} but eval YAML says "
+                  f"{yaml_v!r} — using the CHECKPOINT value ({train_v!r}).")
+        return train_v if train_v is not None else (yaml_v if yaml_v is not None else default)
+
+    zero_overlap = bool(_pipeline_flag("zero_overlap_input", False))
+    test_set = PreprocessedDataset(
+        test_dir,
+        config.get("descriptions_path"),
+        zero_overlap_input=zero_overlap,
+    )
     assert len(test_set) > 0, f"No .pt files in {test_dir}"
-    print(f"Test set: {len(test_set)} samples from {test_dir}")
+    print(f"Test set: {len(test_set)} samples from {test_dir}  "
+          f"zero_overlap_input={zero_overlap}")
+    if zero_overlap:
+        # Positive control: with the channel zeroed the abstain gate's overlap_ratio is 0.0
+        # for EVERY clip, so the hard-coded `overlap_ratio >= HEDGE_OVERLAP_TAU` rule in
+        # slot_decode.py can never fire. Any abstention observed under this flag is
+        # therefore model-driven, not rule-driven — state which one produced a given table.
+        _s = test_set[0]
+        _oi = _s.get("overlap_info") if isinstance(_s, dict) else None
+        if _oi is not None:
+            print(f"[check] overlap_info abs-sum on sample 0 = {float(_oi.abs().sum()):.6f} "
+                  f"(must be 0.0)")
 
     # Load SP ground truth features if available (from Person A's Praat measurements)
     features_path = config.get("features_path")
@@ -524,20 +670,52 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
     # in save_dir, load it; any clip whose filename is already there is skipped.
     # Fresh completed entries are appended and the file is flushed every 50 clips
     # (atomic tmp-then-rename) so a crash only costs the last <50 clips.
+    #
+    # F12 guard: every entry is stamped with the checkpoint fingerprint. If the
+    # existing file was written by a DIFFERENT checkpoint, appending would silently
+    # merge generations from different weights — refuse, and divert this run to
+    # inference_results.<fingerprint>.json instead. Legacy files without
+    # fingerprints resume as before (unverifiable, not refused).
     os.makedirs(config["save_dir"], exist_ok=True)
-    output_path = os.path.join(config["save_dir"], "inference_results.json")
-    all_outputs: list = []
-    done_filenames: set = set()
-    if os.path.exists(output_path):
+    # --out lets several nodes work DISJOINT --start/--end ranges of the same checkpoint into
+    # SEPARATE shard files. Without it every process writes the one fixed path, so parallel
+    # shards race on the atomic tmp-then-rename and silently clobber each other — which is why
+    # a 6000-clip eval previously had to run for ~24 h on a single node. Merge shards afterwards
+    # with `scripts/merge_inference_shards.py`.
+    default_output_path = (args.out if getattr(args, "out", None)
+                           else os.path.join(config["save_dir"], "inference_results.json"))
+
+    def _load_results(path: str) -> list:
         try:
-            with open(output_path) as f:
-                all_outputs = json.load(f)
-            done_filenames = {e["filename"] for e in all_outputs if "filename" in e}
-            print(f"[resume] Found {len(done_filenames)} already-scored clips in {output_path}")
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"[resume] Could not parse existing {output_path} ({e}); starting fresh.")
-            all_outputs = []
-            done_filenames = set()
+            with open(path) as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, list):
+                print(f"[resume] Existing {path} is not a list; starting fresh.")
+                return []
+            return loaded
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[resume] Could not parse existing {path} ({e}); starting fresh.")
+            return []
+
+    existing = _load_results(default_output_path) if os.path.exists(default_output_path) else []
+    output_path, resume_ok = resolve_resume_output_path(
+        default_output_path, ckpt_fingerprint, results_fingerprints(existing),
+    )
+    if not resume_ok:
+        print(f"[resume] REFUSING to append: {default_output_path} holds generations from a "
+              f"DIFFERENT checkpoint (fingerprints {sorted(results_fingerprints(existing))} "
+              f"!= this checkpoint's {ckpt_fingerprint}).")
+        print(f"[resume] Writing this run's results to {output_path} instead.")
+        # The diverted file (if present from an earlier crash of THIS checkpoint) is
+        # still resumable — it was named by this fingerprint.
+        existing = _load_results(output_path) if os.path.exists(output_path) else []
+
+    all_outputs: list = existing
+    done_filenames: set = {
+        e["filename"] for e in all_outputs if isinstance(e, dict) and "filename" in e
+    }
+    if done_filenames:
+        print(f"[resume] Found {len(done_filenames)} already-scored clips in {output_path}")
 
     FLUSH_EVERY = 50
 
@@ -579,17 +757,39 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
                 "range_close_id": tokenizer.convert_tokens_to_ids(RANGE_CLOSE_TAG),
             }
 
-        generated, attention_maps = generate(
-            adapter, llm, tokenizer,
-            sample["audio_features"],
-            sample["overlap_info"],
-            prompt_ids, device,
-            max_new_tokens=config.get("max_target_length", 256),
-            temperature=config.get("temperature", 1.0),
-            top_k=config.get("top_k", 0),
-            top_p=config.get("top_p", 1.0),
-            section_ctx=clip_section_ctx,
-        )
+        slot_mode = config.get("slot_decode", "off")
+        slot_report = None
+        if slot_mode != "off":
+            # F18: constrained slot decoding — frame teacher-forced, LM fills
+            # numeric slots; "verified" substitutes the aux head's values.
+            from slot_decode import slot_generate
+            generated, slot_report = slot_generate(
+                adapter, llm, tokenizer,
+                sample["audio_features"], sample["overlap_info"],
+                prompt_ids, device,
+                mode=slot_mode,
+                # D2 (phase-2.5): .pt files carry no scalar overlap_ratio; derive the
+                # clip ratio from overlap_info col 0 (per-frame is_overlap mean) so
+                # the ILL_POSED hedge branch is reachable at eval.
+                overlap_ratio=float(sample["overlap_info"][:, 0].float().mean()),
+            )
+            attention_maps = {}
+        else:
+            generated, attention_maps = generate(
+                adapter, llm, tokenizer,
+                sample["audio_features"],
+                sample["overlap_info"],
+                prompt_ids, device,
+                max_new_tokens=config.get("max_target_length", 256),
+                temperature=config.get("temperature", 1.0),
+                top_k=config.get("top_k", 0),
+                top_p=config.get("top_p", 1.0),
+                repetition_penalty=config.get("repetition_penalty", 1.0),   # D4: config-wired (was unreachable)
+                no_repeat_ngram_size=config.get("no_repeat_ngram_size", 0),  # D4
+                section_ctx=clip_section_ctx,
+            )
+        # E12: pop the aux-head prediction (not an attention map) before serializing maps.
+        aux_pred = attention_maps.pop("_aux", None)
 
         # Measure duration from the WavLM frame count (50 Hz frame rate from
         # the encoder's 320-sample stride at 16 kHz). Stored as a sidecar
@@ -602,10 +802,22 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
 
         output_entry = {
             "filename": sample["filename"],
+            # F12: which weights produced this generation (guards resume-merge).
+            FINGERPRINT_KEY: ckpt_fingerprint,
             "generated": generated,
             "generated_clean": strip_all_tags(generated),
             "measured_duration_sec": measured_duration_sec,
         }
+        if aux_pred is not None:      # E12: aux-head mean (+ log_var) for the digit-drift metric
+            output_entry["aux_mean"] = aux_pred.get("aux_mean")
+        if slot_report is not None:
+            output_entry["slot_report"] = {
+                k: (v if k == "_summary" else {kk: vv for kk, vv in v.items()})
+                for k, v in slot_report.items()
+            }
+        # D1 (phase-2.5): aux_pred is None in slot mode (attention_maps={}); guard it.
+        if aux_pred is not None and aux_pred.get("aux_log_var") is not None:
+            output_entry["aux_log_var"] = aux_pred["aux_log_var"]
         if attention_maps:
             # Save as plain lists in JSON (per-clip); the plotting script reshapes
             # to (T_p, F_p) using the spec encoder's grid metadata.
@@ -674,7 +886,11 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
               f"Run again without --start/--end, or with the remaining range, to finish.")
 
     # Build a summary dict we'll both print and persist.
-    summary: dict = {"test_dir": test_dir, "n_samples": len(all_outputs)}
+    summary: dict = {
+        "test_dir": test_dir,
+        "n_samples": len(all_outputs),
+        FINGERPRINT_KEY: ckpt_fingerprint,
+    }
 
     # Print results
     if all_results:
@@ -734,7 +950,10 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
             print(f"  BERTScore-F1:  {gen_metrics['bertscore_f1']:.4f}")
 
     # Per-clip outputs were flushed incrementally during the loop, so just the summary here.
-    summary_path = os.path.join(config["save_dir"], "inference_summary.json")
+    # F12: mirror the results filename — a fingerprint-diverted run writes
+    # inference_summary.<fingerprint>.json so it can't clobber the other checkpoint's summary.
+    summary_name = os.path.basename(output_path).replace("inference_results", "inference_summary", 1)
+    summary_path = os.path.join(config["save_dir"], summary_name)
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nAggregate summary saved to {summary_path}")
@@ -789,11 +1008,19 @@ if __name__ == "__main__":
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--checkpoint_device", type=str, default="cuda", help="Device to load checkpoint (cpu for OOM on smaller GPUs)")
+    parser.add_argument("--out", type=str, default=None,
+                        help="Output JSON path. Use ONE PER SHARD when splitting a checkpoint's "
+                             "eval across nodes with --start/--end; the default single path is "
+                             "not safe for concurrent writers.")
     parser.add_argument("--start", type=int, default=0,
                         help="First test-set index to process (inclusive). Default 0.")
     parser.add_argument("--end", type=int, default=None,
                         help="Stop index (exclusive). Default = end of test set. "
                              "Combine with --start for range/parallel runs; reruns auto-skip already-scored clips.")
+    parser.add_argument("--slot_decode", type=str, default=None,
+                        choices=["off", "free_slots", "verified"],
+                        help="F18: constrained slot decoding (frame teacher-forced, "
+                             "LM fills numeric slots; verified substitutes aux values)")
     parser.add_argument("--max_new_tokens", type=int, default=None,
                         help="Override max_target_length for generation. "
                              "Training default was 256 — long descriptions get truncated mid-sentence. "
@@ -806,6 +1033,8 @@ if __name__ == "__main__":
     # CLI args override config
     if args.temperature is not None:
         config["temperature"] = args.temperature
+    if args.slot_decode is not None:
+        config["slot_decode"] = args.slot_decode
     if args.top_k is not None:
         config["top_k"] = args.top_k
     if args.top_p is not None:

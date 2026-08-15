@@ -125,7 +125,15 @@ def load_policy(config: dict, sft_checkpoint: str):
 
     lm_hidden_size = llm.config.hidden_size
     adapter = (
-        build_adapter(config["adapter_variant"], lm_dim=lm_hidden_size)
+        # BUGFIX 2026-08-10 (see inference.py:528): these flags shape the head;
+        # omitting them leaves a ReliabilityHead checkpoint at RANDOM init.
+        build_adapter(
+            config["adapter_variant"],
+            lm_dim=lm_hidden_size,
+            reliability_head=bool(config.get("reliability_head", False)),
+            compression=int(config.get("compression", 8)),
+            aux_pool=str(config.get("aux_pool") or "mean"),
+        )
         .to(device)
         .to(torch.bfloat16)
     )

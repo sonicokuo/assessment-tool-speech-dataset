@@ -1,0 +1,109 @@
+# RT1 HEADLINE RUN (F17, master plan 2026-07-16): b1 recipe + sigma-head (H2) + NTL.
+# The paper's #1 novelty (observability-aware abstention) trains HERE for the first time.
+# Derived from config.b1.grounded.yaml (PSC) with ONLY the deltas below; single-knob
+# discipline per the 2026-07-15 audit (no grounding terms — grounding is a later ablation).
+#
+# Deltas vs b1.grounded:
+#   reliability_head true, lambda_nll 0.1, beta_nll 0.5, stirn_stop_grad true  (H2: sigma
+#     trains via beta-NLL on the presence mask; mean stays MSE-faithful via Stirn stop-grad;
+#     lambda_mse MUST stay > 0 — train.py guards this)
+#   lambda_ntl 0.1 + ntl_form was  (R1/F13: magnitude-aware digit loss, prose + nums channels)
+#   epochs 6  (salvage 2026-07-16: srcc_robust peaks ep2-4 and plateaus; cosine completes
+#     inside a wall; per-epoch slim ckpts make any wall cheap)
+#   save_epoch_ckpts true, artifact_every_n_epochs 2  (F3/F7: peak weights can't be lost again)
+#   fresh save_dir + wandb project/run
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-08
+adapter_variant: film-attn
+artifact_every_n_epochs: 2
+batch_size: 6
+beats_cached: false
+beta_nll: 0.5
+bf16: true
+bleu_floor: 5.0
+data_dir: /ocean/projects/cis260125p/shared/data/processed_corrected
+descriptions_path: /ocean/projects/cis260125p/shared/data/descriptions_corrected_fw.json
+descriptions_path_test: /ocean/projects/cis260125p/shared/data/descriptions_corrected_fw.json
+descriptions_path_val: /ocean/projects/cis260125p/shared/data/descriptions_corrected_fw.json
+epochs: 4
+eval_every_epoch: 1
+features_csv:
+  train: /ocean/projects/cis260125p/shared/data/features_corrected_merged/train-100.csv
+  val: /ocean/projects/cis260125p/shared/data/features_corrected_merged/dev.csv
+features_path: /ocean/projects/cis260125p/shared/data/features.json
+grad_clip: 1.0
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+lam_nmae: 0.5
+lambda_ditto: 0.0
+lambda_liu: 0.0
+lambda_mse: 0.3
+lambda_nll: 0.1
+lambda_ntl: 0.1
+lambda_nums: 0.3
+lambda_prose: 1.0
+lambda_snr_irm: 0.0
+lambda_snr_map: 0.0
+lambda_snr_scalar: 0.0
+lambda_token_grounding: 0.0
+lambda_unlikelihood: 0.1
+lm_name: Qwen/Qwen3-8B
+log_every: 10
+log_val_samples_table: false
+lora_alpha: 32
+lora_dropout: 0.05
+lora_rank: 16
+lora_targets:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+lr_adapter: 0.0001
+lr_encoder: 1.0e-05
+lr_lm: 1.0e-05
+lr_scheduler: cosine
+max_nums_length: 96
+max_target_length: 512
+min_lr_ratio: 0.0
+ntl_form: was
+num_workers: 4
+optimizer: adamw
+pin_memory: true
+prompt: Describe the quality of this recording.
+prompt_nums: 'List the numerical features of this recording:'
+prompt_prose: Describe the quality of this recording.
+reliability_head: true
+resume_from: null
+save_dir: /ocean/projects/cis260125p/shared/checkpoints/full/bsigma_attn_seed73
+save_epoch_ckpts: true
+score_overlap_spans: false
+seed: 73
+select_metric: srcc_robust
+snr_map_dir:
+  train: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/train
+  val: /ocean/projects/cis260125p/shared/data/snr_map_targets_aug/dev
+snr_map_hidden: 256
+snr_map_huber_delta: 1.0
+snr_map_kernel_size: 5
+snr_map_predict_irm: false
+snr_map_snr_bias: 5.0
+stirn_stop_grad: true
+tagged_mode: false
+temperature: 1.0
+top_k: 1
+top_p: 1.0
+unfreeze_beats_top_n: 0
+unfreeze_wavlm_top_n: 0
+use_sections: false
+val_select_ema_beta: 0.7
+val_sfs_n: 32
+val_subset_size: 200
+wandb_entity: speech_quality_adapter
+wandb_project: aqua-nl-arch
+wandb_run_name: bsigma_attn_seed73
+warmup_ratio: 0.03
+weight_decay: 0.01

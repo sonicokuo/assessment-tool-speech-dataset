@@ -1,150 +1,350 @@
-"""sfs_reward.py — RLVR (RL with Verifiable Rewards) reward for AQUA-NL.
+"""sfs_reward.py — observability-gated RLVR reward for AQUA-NL (F19 rebuild).
 
-WHY THIS EXISTS
+WHY THE REBUILD
 ---------------
-AQUA-NL fine-tunes Qwen3-8B (LoRA) to generate speech-quality descriptions that
-state *measured* numbers ("The SNR is 16.10 dB. The F0 mean is 121.00 Hz.").
-We already have a fully deterministic verifier — the Signal Faithfulness Score
-(`src/sfs.py`): it regex-parses the numeric claims out of generated text and
-scores each claim against ground-truth SP features inside per-feature tolerances.
-A deterministic, ground-truth-checked scalar is exactly the signal RL-with-
-verifiable-rewards (RLVR / GRPO) wants. This module turns SFS into a per-sample
-reward and wraps it for TRL's GRPOTrainer.
+The previous reward in this module was tolerance-band SFS-F1 minus degeneration
+penalties. The band-F1 core is a RETIRED, SATURATED metric: bands are wide
+enough that a constant-mode policy (emit the population-median value for every
+feature on every clip — the observed f0_min=75-on-96%-of-clips collapse) scores
+near-ceiling, so under RL pressure it is a dead objective with no gradient
+toward actually reading the signal. The 2026-07-15 RL design memo (fix F19 in
+.claude/research/MASTER_PLAN_2026-07-16.md) specifies the replacement below.
 
-REWARD DESIGN
--------------
-    reward = f1_weight       * SFS_F1(text vs gt_features)
-           - rep_penalty     * rep_n(text, n)          # n-gram repetition fraction
-           - nonascii_penalty* nonascii_frac(text)     # foreign-token injection
+Two pieces of the old module are deliberately KEPT:
+  1. the rep_n / nonascii degeneration guards (SFS-style rewards are blind to
+     fluency collapse — repetition loops and foreign-token injection can carry
+     parseable numbers; the guard multiplies them away), and
+  2. the FIRST-CLAIM-ONLY / anti-spam reasoning (later duplicate numeric claims
+     for a slot are ignored, so value-spread gaming earns nothing).
 
-Two deliberate choices:
+THE REWARD (per clip, bounded in [0, 1])
+----------------------------------------
+Inputs: generated text y; GT dict from the clip's features-CSV row (the caller
+supplies it); per-slot observability o_f in {0,1}. The slot inventory is
+`data.feature_set.SUPERVISED_FEATURES` (single source of truth).
 
-1. SFS-**F1**, NOT recall.  Recall = (mentioned GT features / |GT features|).
-   It is trivially hackable by *number-spamming*: emit every plausible number
-   for every feature and recall saturates at 1.0 regardless of correctness,
-   because recall only asks "was the feature mentioned", not "was it right".
-   RL will find and exploit that. F1 = harmonic mean of precision and recall,
-   and precision = (correct claims / all claims) *punishes wrong and extra
-   numbers*. A spammer's precision collapses, dragging F1 down. So F1 rewards
-   "state the numbers you can get RIGHT", which is the actual task. (This is
-   the documented research finding for this project: optimize F1, not recall.)
+Observability (project rule, single source of truth in feature_set):
+    o_f = 0  iff  f in ILL_POSED_UNDER_OVERLAP_FEATURES
+              and clip overlap_ratio >= HEDGE_OVERLAP_TAU
+    o_f = 1  otherwise.
 
-2. An explicit anti-degeneration penalty.  SFS only parses NUMBERS, so it is
-   BLIND to fluency collapse: a checkpoint that emits "</sec></sec></sec>..."
-   tag-spam, a repetition loop, or Chinese-character injection can still contain
-   parseable numbers and therefore score non-zero SFS while being unreadable
-   garbage (this is the documented v11/v12 section-path failure). Under RL that
-   blindness is dangerous — the policy can drift toward high-SFS-but-degenerate
-   text. We subtract the same two cheap, model-free degeneration signals
-   `ckpt_selection.py` already uses for checkpoint selection: n-gram repetition
-   fraction and non-ASCII character fraction. The bet is that RL on
-   (SFS-F1 minus degeneration) can fix the degeneration that SFT alone could not,
-   because the reward actively discourages it every step.
+Slot classification via the ClaimParser:
+    VALUE                  first parsed numeric claim v_f (duplicates IGNORED)
+    HEDGE                  parse_hedges() hit, with attribution flag A_f (F20)
+    MENTIONED-UNPARSEABLE  slot noun present, no number, no hedge
+    ABSENT                 slot not realized at all
 
-This module is intentionally dependency-light: it imports ONLY `sfs.py`,
-`ckpt_selection.py`, and the stdlib. It does **not** import `trl`, so the reward
-is fully unit-testable on CPU with no GPU / no RL library installed. The TRL glue
-(`make_sfs_reward_func`) returns a plain closure with the GRPO reward signature;
-`grpo_train.py` is where `trl` actually gets imported.
+Per-slot reward r_f:
+    VALUE  & o_f = 1   ->  1 - min(|v_f - g_f| / s_f, 1)   (s_f = FEATURE_SCALES)
+    VALUE  & o_f = 0   ->  0.0   (over-claim: ANY number on an unobservable slot)
+    HEDGE  attributed  ->  0.8 if o_f = 0 else 0.2
+    HEDGE  generic     ->  0.4 if o_f = 0 else 0.2
+    MENTIONED-UNPARSEABLE -> 0.0
+    ABSENT             ->  0.0
+
+Sequence reward:
+    R(y) = G(y) * mean_f r_f
+    G(y) = template_validity(y) * (1 - rep_n(y, 4)) * (1 - nonascii_frac(y))
+    template_validity = fraction of inventory slots realized (VALUE or HEDGE).
+
+Why this resists the known attacks:
+  - CONSTANT-MODE: the VALUE ramp is continuous in |v-g|/s, so median-spam
+    averages strictly below truth on any spread of clips (no plateau).
+  - EASY-FEATURE-ONLY: ABSENT slots score 0 AND shrink template_validity, so
+    omission is doubly costly.
+  - HEDGE-SPAM: hedging an observable slot earns at most 0.2 < an honest value;
+    hedging is only profitable exactly where a number is impossible (o_f = 0).
+  - FORMAT-GAMING: only the first claim per slot counts; unparseable mentions
+    earn 0 (< any hedge).
+  - DEGENERATION: loops / non-ASCII multiply the whole sequence reward down.
+
+Dependency note: this module imports only feature_set, sfs, ckpt_selection and
+the stdlib — no trl, no GPU. feature_set imports torch at module level for
+tensor helpers this reward never calls; the tests stub torch out, keeping the
+reward unit-testable in a torch-free environment.
 """
 
 from __future__ import annotations
 
+import math
+import re
+import warnings
 from typing import Any, Callable, Mapping, Sequence
 
-# Both live in src/; conftest.py puts src/ on sys.path for tests, and
-# grpo_train.py / inference do the same `sys.path.insert(0, src)`.
-from eval.sfs import HybridClaimParser, SFSScorer
+# Single source of truth for the slot inventory, scales, and the observability
+# rule constants. (_GENUINE_ZERO_FEATURES / _to_float mirror the missing-value
+# semantics used by extract_scalars, so GT coercion cannot drift.)
+from data.feature_set import (
+    FEATURE_NAMES,
+    FEATURE_SCALES,
+    HEDGE_OVERLAP_TAU,
+    ILL_POSED_UNDER_OVERLAP_FEATURES,
+    SUPERVISED_FEATURES,
+    _GENUINE_ZERO_FEATURES,
+    _to_float,
+)
 from eval.ckpt_selection import nonascii_frac, rep_n
+from eval.sfs import ClaimParser, HybridClaimParser, SFSScorer
 
-# A single parser + scorer instance is reused across calls — both are stateless
-# (the parser only compiles regexes at import time; the scorer holds constant
-# tolerance tables), so sharing them avoids recompiling/reallocating per sample.
-_PARSER = HybridClaimParser()
-_SCORER = SFSScorer()
+# Shared, stateless parser instances (regexes compile once at import).
+_PARSER = HybridClaimParser()          # numeric claims (tagged or prose)
+_HEDGE_PARSER = ClaimParser()          # hedge claims (always prose)
+_SCORER = SFSScorer()                  # ONLY for the deprecated band-F1 path
+
+# Per-slot lookups in SUPERVISED_FEATURES order.
+_SCALE: dict[str, float] = dict(zip(FEATURE_NAMES, FEATURE_SCALES))
+_CSV_COL: dict[str, str] = {name: col for name, col, _fmt in SUPERVISED_FEATURES}
+
+# Sync check: the parser's literal hedge-feature coverage (kept literal there so
+# eval/sfs.py stays torch-free) must equal feature_set's ill-posed set.
+_HEDGEABLE = frozenset(
+    f for feats, _re in ClaimParser.HEDGE_FEATURE_PATTERNS for f in feats
+)
+assert _HEDGEABLE == ILL_POSED_UNDER_OVERLAP_FEATURES, (
+    "ClaimParser.HEDGE_FEATURE_PATTERNS drifted from "
+    "feature_set.ILL_POSED_UNDER_OVERLAP_FEATURES: "
+    f"{sorted(_HEDGEABLE)} != {sorted(ILL_POSED_UNDER_OVERLAP_FEATURES)}"
+)
+
+# ── Reward constants (F19) ────────────────────────────────────────────────────
+HEDGE_ATTRIBUTED_UNOBSERVABLE: float = 0.8   # hedge + overlap named + o_f = 0
+HEDGE_GENERIC_UNOBSERVABLE: float = 0.4      # hedge, no attribution,  o_f = 0
+HEDGE_OBSERVABLE: float = 0.2                # any hedge on an observable slot
+
+# Slot classes.
+SLOT_VALUE = "value"
+SLOT_HEDGE = "hedge"
+SLOT_MENTIONED = "mentioned_unparseable"
+SLOT_ABSENT = "absent"
+
+# Mention detection (for MENTIONED-UNPARSEABLE vs ABSENT). Numerically both
+# score 0 and neither counts toward template_validity; the distinction is kept
+# for dashboards ("the model talked about SNR but emitted no usable claim").
+_MENTION_RES: dict[str, "re.Pattern[str]"] = {
+    "snr": re.compile(r"\bsnr\b|signal[\s-]*to[\s-]*noise", re.IGNORECASE),
+    "srmr": re.compile(r"\bsrmr\b|reverberation", re.IGNORECASE),
+    "f0_mean": re.compile(
+        r"\bf0\b|\bpitch\b|fundamental\s+frequency", re.IGNORECASE),
+    "f0_sd": re.compile(
+        r"\bf0\b[^.!?]*(?:\bsd\b|deviation)|standard\s+deviation", re.IGNORECASE),
+    "speaking_rate": re.compile(r"speaking\s+rate", re.IGNORECASE),
+    "pause_count": re.compile(r"pause\s+count|\bpauses\b", re.IGNORECASE),
+    "pause_rate": re.compile(r"pause\s+rate", re.IGNORECASE),
+    "overlap_ratio": re.compile(r"overlap\s+ratio", re.IGNORECASE),
+    "jitter": re.compile(r"\bjitter\b", re.IGNORECASE),
+    "shimmer": re.compile(r"\bshimmer\b", re.IGNORECASE),
+    "hnr": re.compile(r"\bhnr\b|harmonics?[\s-]*to[\s-]*noise", re.IGNORECASE),
+}
+assert set(_MENTION_RES) == set(FEATURE_NAMES), "mention regexes must cover the inventory"
 
 
 __all__ = [
-    "sfs_f1",
-    "sfs_reward",
-    "make_sfs_reward_func",
+    "HEDGE_ATTRIBUTED_UNOBSERVABLE",
+    "HEDGE_GENERIC_UNOBSERVABLE",
+    "HEDGE_OBSERVABLE",
+    "classify_slots",
+    "observability_from_row",
+    "reward_components",
+    "observability_reward",
+    "make_reward_func",
+    "make_sfs_reward_func",       # deprecated name, returns the NEW reward
     "extract_completion_text",
+    "sfs_f1",                     # band-F1 helper (deprecated as a reward)
+    "deprecated_band_f1_reward",  # the retired reward, kept for comparison only
 ]
 
 
-# ── Core scalar reward ────────────────────────────────────────────────────────
-def sfs_f1(generated_text: str, gt_features: Mapping[str, Any]) -> float:
-    """SFS-F1 of one generated description against its ground-truth feature dict.
+# ── GT + observability from the features-CSV row ──────────────────────────────
+def _gt_value(row: Mapping[str, Any], slot: str) -> float:
+    """GT scalar for one slot from a features-CSV-shaped row.
 
-    Reuses the project's `HybridClaimParser` (tagged spans first, regex fallback)
-    and `SFSScorer` — the *same* code path the deterministic evaluation uses, so
-    the RL reward is exactly the metric the paper reports. No reimplementation.
-
-    `gt_features` is the per-clip ground-truth dict in the shape `SFSScorer.score`
-    expects: scalar features keyed by name (e.g. {"snr": 16.1, "f0_mean": 121.0})
-    plus optional "overlap_segments": [(start_s, end_s), ...] for the IoU path.
-
-    Returns the F1 in [0, 1]. Empty / unparseable text → 0.0 (precision 0).
+    Accepts either the CSV column name ("snr_db") or the slot short name
+    ("snr") as the key, so both raw CSV rows and SFSScorer-shaped dicts work.
+    Missing-value semantics mirror feature_set.extract_scalars: NaN-like cells
+    are missing, except the genuine-zero features (overlap_ratio, pause_count,
+    pause_rate) where missing means a real 0. Returns NaN when truly missing.
     """
-    if not generated_text:
+    csv_col = _CSV_COL[slot]
+    raw = row[csv_col] if csv_col in row else row.get(slot)
+    val = _to_float(raw)
+    if math.isnan(val) and slot in _GENUINE_ZERO_FEATURES:
         return 0.0
-    claims = _PARSER.parse(generated_text)
-    result = _SCORER.score(claims, dict(gt_features))
-    return float(result["f1"])
+    return val
 
 
-def sfs_reward(
-    generated_text: str,
-    gt_features: Mapping[str, Any],
+def observability_from_row(row: Mapping[str, Any]) -> dict[str, int]:
+    """Per-slot observability o_f from the clip's features row (project rule).
+
+    o_f = 0 iff the slot is in ILL_POSED_UNDER_OVERLAP_FEATURES AND the clip's
+    overlap_ratio >= HEDGE_OVERLAP_TAU; otherwise o_f = 1. A missing/NaN
+    overlap_ratio means no evidence of overlap -> everything observable
+    (matches feature_set._hedged_features).
+    """
+    ov = _gt_value(row or {}, "overlap_ratio")
+    heavy = (not math.isnan(ov)) and ov >= HEDGE_OVERLAP_TAU
+    return {
+        name: 0 if (heavy and name in ILL_POSED_UNDER_OVERLAP_FEATURES) else 1
+        for name in FEATURE_NAMES
+    }
+
+
+# ── Slot classification ───────────────────────────────────────────────────────
+def classify_slots(text: str) -> dict[str, dict]:
+    """Classify every inventory slot of `text` as VALUE / HEDGE /
+    MENTIONED-UNPARSEABLE / ABSENT.
+
+    Returns {slot: {"class": str, "value": float | None, "attributed": bool | None}}.
+
+    FIRST-CLAIM-ONLY: the parser deduplicates numeric claims per feature and we
+    additionally keep only the first here, so "SNR is 10 dB. SNR is 20 dB."
+    binds v_snr = 10 and the second claim earns nothing (anti value-spread).
+    A slot with both a number and a hedge classifies as VALUE (stating a number
+    while hedging is still an assertion — and still an over-claim when o_f = 0).
+    """
+    text = text or ""
+    values: dict[str, float] = {}
+    for claim in _PARSER.parse(text):
+        if claim.feature in _SCALE and claim.feature not in values:
+            values[claim.feature] = float(claim.value)
+
+    hedges = _HEDGE_PARSER.parse_hedges(text)
+
+    slots: dict[str, dict] = {}
+    for name in FEATURE_NAMES:
+        if name in values:
+            slots[name] = {"class": SLOT_VALUE, "value": values[name],
+                           "attributed": None}
+        elif name in hedges:
+            slots[name] = {"class": SLOT_HEDGE, "value": None,
+                           "attributed": bool(hedges[name]["attributed"])}
+        elif _MENTION_RES[name].search(text):
+            slots[name] = {"class": SLOT_MENTIONED, "value": None,
+                           "attributed": None}
+        else:
+            slots[name] = {"class": SLOT_ABSENT, "value": None,
+                           "attributed": None}
+    return slots
+
+
+def _slot_reward(
+    info: Mapping[str, Any],
+    gt: float,
+    scale: float,
+    observable: bool,
     *,
-    f1_weight: float = 1.0,
-    rep_penalty: float = 0.5,
-    nonascii_penalty: float = 1.0,
-    rep_n: int = 4,
+    hedge_attributed_unobs: float,
+    hedge_generic_unobs: float,
+    hedge_obs: float,
 ) -> float:
-    """Verifiable RL reward for ONE generated description.
+    """r_f for one classified slot (see module docstring for the table)."""
+    cls = info["class"]
+    if cls == SLOT_VALUE:
+        if not observable:
+            return 0.0  # over-claim: any number on an unobservable slot
+        if math.isnan(gt):
+            return 0.0  # unverifiable claim: no GT measurement for this clip
+        return 1.0 - min(abs(info["value"] - gt) / scale, 1.0)
+    if cls == SLOT_HEDGE:
+        if observable:
+            return hedge_obs
+        return hedge_attributed_unobs if info["attributed"] else hedge_generic_unobs
+    return 0.0  # MENTIONED-UNPARSEABLE and ABSENT
 
-        reward = f1_weight * SFS_F1(text vs gt)
-               - rep_penalty * rep_n_fraction(text, n=rep_n)
-               - nonascii_penalty * nonascii_fraction(text)
 
-    See the module docstring for why F1 (not recall) and why the degeneration
-    penalty. The reward is a single float; it is NOT clamped, so a heavily
-    degenerate completion with no correct claims can go negative — which is the
-    point: GRPO advantages are relative within a group, and a clearly-bad
-    completion should sit below a merely-mediocre one.
+# ── Sequence reward ───────────────────────────────────────────────────────────
+def reward_components(
+    text: str,
+    features_row: Mapping[str, Any] | None,
+    observability: Mapping[str, Any] | None = None,
+    *,
+    hedge_attributed_unobs: float = HEDGE_ATTRIBUTED_UNOBSERVABLE,
+    hedge_generic_unobs: float = HEDGE_GENERIC_UNOBSERVABLE,
+    hedge_obs: float = HEDGE_OBSERVABLE,
+    ngram: int = 4,
+) -> dict:
+    """Full reward breakdown for ONE completion — the auditable form of
+    `observability_reward` (per-slot classes and rewards, gate terms, R).
 
     Args:
-        generated_text:    the model's completion (decoded string).
-        gt_features:        per-clip ground-truth feature dict (SFSScorer shape).
-        f1_weight:          weight on the faithfulness term (default 1.0).
-        rep_penalty:        weight on the n-gram repetition penalty (default 0.5).
-        nonascii_penalty:   weight on the non-ASCII fraction penalty (default 1.0).
-        rep_n:              n for the repetition n-gram (default 4, matches
-                            ckpt_selection's default and the templated-prose
-                            separation point).
+        text:          the model's completion (decoded string).
+        features_row:  the clip's GT row (features-CSV column names or slot
+                       short names as keys).
+        observability: optional per-slot {slot: 0/1} override; slots absent
+                       from it keep the row-derived default rule.
+        hedge_*:       the hedge reward levels (defaults per the F19 memo).
+        ngram:         n for the repetition guard (default 4, matching
+                       ckpt_selection).
 
-    Returns:
-        float reward.
+    Returns a dict:
+        reward, gate, template_validity, mean_slot_reward, rep_fraction,
+        nonascii_fraction, slots={slot: {class, value, attributed, gt,
+        observable, reward}}.
     """
-    text = generated_text or ""
-    f1 = sfs_f1(text, gt_features)
-    # rep_n() and nonascii_frac() are imported from ckpt_selection — the exact
-    # same degeneration signals used for checkpoint selection, kept in one place.
-    rep_term = _rep_fraction(text, rep_n)
-    nonascii_term = nonascii_frac(text)
-    return (
-        f1_weight * f1
-        - rep_penalty * rep_term
-        - nonascii_penalty * nonascii_term
-    )
+    text = text or ""
+    row = features_row or {}
+
+    obs = observability_from_row(row)
+    if observability:
+        for name, flag in observability.items():
+            if name in obs:
+                obs[name] = int(flag)
+
+    slots = classify_slots(text)
+
+    per_slot: dict[str, dict] = {}
+    total = 0.0
+    realized = 0
+    for name in FEATURE_NAMES:
+        info = slots[name]
+        gt = _gt_value(row, name)
+        r = _slot_reward(
+            info, gt, _SCALE[name], bool(obs[name]),
+            hedge_attributed_unobs=hedge_attributed_unobs,
+            hedge_generic_unobs=hedge_generic_unobs,
+            hedge_obs=hedge_obs,
+        )
+        if info["class"] in (SLOT_VALUE, SLOT_HEDGE):
+            realized += 1
+        total += r
+        per_slot[name] = {
+            **info,
+            "gt": None if math.isnan(gt) else gt,
+            "observable": obs[name],
+            "reward": r,
+        }
+
+    n_slots = len(FEATURE_NAMES)
+    mean_slot_reward = total / n_slots
+    template_validity = realized / n_slots
+    rep_fraction = rep_n(text, ngram)
+    nonascii_fraction = nonascii_frac(text)
+    gate = template_validity * (1.0 - rep_fraction) * (1.0 - nonascii_fraction)
+
+    return {
+        "reward": gate * mean_slot_reward,
+        "gate": gate,
+        "template_validity": template_validity,
+        "mean_slot_reward": mean_slot_reward,
+        "rep_fraction": rep_fraction,
+        "nonascii_fraction": nonascii_fraction,
+        "slots": per_slot,
+    }
 
 
-# `rep_n` is both a kwarg name (the n-gram size) and the imported function name.
-# Alias the function so the kwarg can shadow it inside sfs_reward without losing
-# access to the callable.
-def _rep_fraction(text: str, n: int) -> float:
-    return rep_n(text, n)
+def observability_reward(
+    text: str,
+    features_row: Mapping[str, Any] | None,
+    observability: Mapping[str, Any] | None = None,
+    **cfg,
+) -> float:
+    """The F19 scalar reward R(y) in [0, 1] for one completion.
+
+        R(y) = G(y) * mean_f r_f
+        G(y) = template_validity * (1 - rep_n(y, 4)) * (1 - nonascii_frac(y))
+
+    See `reward_components` for the per-slot breakdown and kwargs.
+    """
+    return float(reward_components(text, features_row, observability, **cfg)["reward"])
 
 
 # ── TRL GRPO batch wrapper ────────────────────────────────────────────────────
@@ -167,7 +367,6 @@ def extract_completion_text(completion: Any) -> str:
         return completion
     if isinstance(completion, Mapping):
         return str(completion.get("content", "") or "")
-    # A list of chat-message dicts — take the last assistant-ish turn's content.
     if isinstance(completion, Sequence):
         if not completion:
             return ""
@@ -181,62 +380,45 @@ def extract_completion_text(completion: Any) -> str:
 def _resolve_gt_list(
     prompts: Sequence[Any] | None,
     completions: Sequence[Any],
-    gt_lookup: Any,
+    features_lookup: Any,
     kwargs: Mapping[str, Any],
 ) -> list[Mapping[str, Any]]:
-    """Figure out the per-completion ground-truth feature dicts.
+    """Per-completion GT feature rows (unchanged resolution contract).
 
-    The GT lookup mechanism is intentionally explicit and supports the two
-    natural ways TRL surfaces per-sample side information:
+    1. ALIGNED LIST via kwargs: TRL forwards non-standard dataset columns to the
+       reward function as kwarg lists aligned with `completions`; a column named
+       `gt_features` (or `gt` / `ground_truth` / `features`) is used directly.
+    2. `features_lookup` as an aligned Sequence.
+    3. `features_lookup` as a Mapping keyed by an id column
+       ("clip_ids"/"keys"/"ids"/"id"/"clip_id"/"clip_stem"/"filename") or,
+       failing that, by prompt text.
+    4. `features_lookup` as a callable: features_lookup(key) -> row dict.
 
-    1. PROMPT-KEYED dict (`gt_lookup` is a Mapping): map each prompt (or each
-       value of a `keys`/`clip_ids`/`id` kwargs column) to its GT dict. This is
-       the right shape when the dataset rows carry a stable clip id and you build
-       `{clip_id_or_prompt: gt_features}` once.
-
-    2. ALIGNED LIST passed through kwargs: TRL forwards every non-standard
-       dataset column to the reward function as a kwarg list aligned with
-       `completions`. So a dataset column named `gt_features` (or `gt`) arrives
-       as `kwargs["gt_features"]`, one GT dict per completion. If `gt_lookup` is
-       itself a list/sequence (not a Mapping), it is treated as that aligned list.
-
-    Resolution order: an aligned list in kwargs ("gt_features" / "gt") wins;
-    else a sequence `gt_lookup`; else a Mapping `gt_lookup` keyed by a kwargs id
-    column ("clip_ids"/"keys"/"ids"/"id"/"clip_id") or, failing that, by prompt.
-
-    Returns a list of GT dicts the same length as `completions`. Missing entries
-    become `{}` (which yields F1 0.0 — an honest "no GT, no credit").
+    Missing entries become {} (VALUE claims become unverifiable -> 0 reward).
     """
     n = len(completions)
 
-    # (2) aligned list passed via kwargs.
-    for key in ("gt_features", "gt", "ground_truth"):
+    for key in ("gt_features", "gt", "ground_truth", "features"):
         if key in kwargs and isinstance(kwargs[key], Sequence) and not isinstance(kwargs[key], (str, bytes)):
-            aligned = list(kwargs[key])
-            return _pad_to(aligned, n)
+            return _pad_to(list(kwargs[key]), n)
 
-    # gt_lookup itself given as an aligned sequence.
-    if isinstance(gt_lookup, Sequence) and not isinstance(gt_lookup, (str, bytes)):
-        return _pad_to(list(gt_lookup), n)
+    if isinstance(features_lookup, Sequence) and not isinstance(features_lookup, (str, bytes)):
+        return _pad_to(list(features_lookup), n)
 
-    # (1) Mapping lookup, keyed by an explicit id column or by the prompt text.
-    if isinstance(gt_lookup, Mapping):
+    if isinstance(features_lookup, Mapping):
         keys = _per_sample_keys(prompts, kwargs, n)
-        return [dict(gt_lookup.get(k, {})) if k is not None else {} for k in keys]
+        return [dict(features_lookup.get(k, {})) if k is not None else {} for k in keys]
 
-    # Callable lookup: gt_lookup(prompt) -> gt dict.
-    if callable(gt_lookup):
+    if callable(features_lookup):
         keys = _per_sample_keys(prompts, kwargs, n)
         out = []
         for k in keys:
             try:
-                out.append(dict(gt_lookup(k) or {}))
+                out.append(dict(features_lookup(k) or {}))
             except Exception:
                 out.append({})
         return out
 
-    # Nothing usable — empty GT for every sample (rewards collapse to the
-    # negative degeneration terms only, which is at least not silently wrong).
     return [{} for _ in range(n)]
 
 
@@ -245,7 +427,7 @@ def _per_sample_keys(
     kwargs: Mapping[str, Any],
     n: int,
 ) -> list[Any]:
-    """Per-sample key for a Mapping/callable GT lookup: prefer an explicit id
+    """Per-sample key for a Mapping/callable lookup: prefer an explicit id
     column forwarded through kwargs, else the prompt text."""
     for key in ("clip_ids", "keys", "ids", "id", "clip_id", "clip_stem", "filename"):
         if key in kwargs and isinstance(kwargs[key], Sequence) and not isinstance(kwargs[key], (str, bytes)):
@@ -264,56 +446,130 @@ def _pad_to(seq: list, n: int, fill: Any = None) -> list:
     return seq + [fill] * (n - len(seq))
 
 
-def make_sfs_reward_func(
-    gt_lookup: Any = None,
+def make_reward_func(
+    features_lookup: Any = None,
     *,
-    f1_weight: float = 1.0,
-    rep_penalty: float = 0.5,
-    nonascii_penalty: float = 1.0,
-    rep_n: int = 4,
+    gt_lookup: Any = None,
+    hedge_attributed_unobs: float = HEDGE_ATTRIBUTED_UNOBSERVABLE,
+    hedge_generic_unobs: float = HEDGE_GENERIC_UNOBSERVABLE,
+    hedge_obs: float = HEDGE_OBSERVABLE,
+    ngram: int = 4,
+    rep_n: int | None = None,
+    **deprecated_cfg,
 ) -> Callable[..., list[float]]:
-    """Build a TRL-GRPO-compatible batch reward function.
-
-    The returned closure has TRL's reward signature
+    """Build a TRL-GRPO-compatible batch reward function over the NEW
+    observability-gated reward (F19). Same wrapper contract as the old
+    `make_sfs_reward_func`:
 
         reward_func(prompts, completions, **kwargs) -> list[float]
 
-    and maps every completion to `sfs_reward(...)` against its ground-truth
-    feature dict. Completions may be plain strings or chat-message lists — both
-    are handled by `extract_completion_text`.
+    GT resolution (see `_resolve_gt_list`): pass the per-clip features row as a
+    dataset column (`gt_features=[...]`, recommended), OR an aligned list /
+    Mapping / callable as `features_lookup`. An optional `observability=[...]`
+    kwargs column (one {slot: 0/1} dict or None per completion) overrides the
+    row-derived observability rule per sample.
 
-    Ground-truth resolution (see `_resolve_gt_list` for the full contract):
-      - Pass GT as a dataset column so TRL forwards it via kwargs
-        (`gt_features=[...]` aligned with completions) — simplest and recommended.
-      - OR pass a list here as `gt_lookup` aligned with the batch.
-      - OR pass a Mapping `gt_lookup` keyed by clip id (forwarded via a
-        `clip_ids=[...]` kwargs column) or by prompt text.
-
-    The reward weights are bound at construction time so the GRPO loop just calls
-    `reward_func(prompts, completions, **kwargs)`.
-
-    NOTE: TRL also supports passing the function's `__name__` into logs; the
-    closure is named for that.
+    Back-compat: `gt_lookup=` is accepted as an alias for `features_lookup`
+    (grpo_train.py's existing keyword); `rep_n=` as an alias for `ngram`. The
+    retired band-F1 knobs (f1_weight / rep_penalty / nonascii_penalty) are
+    ACCEPTED but IGNORED with a DeprecationWarning — the new reward multiplies
+    the degeneration guards into G(y) instead of subtracting weighted terms.
     """
+    if features_lookup is None:
+        features_lookup = gt_lookup
+    if rep_n is not None:
+        ngram = int(rep_n)
+    if deprecated_cfg:
+        warnings.warn(
+            "make_reward_func: ignoring retired band-F1 reward kwargs "
+            f"{sorted(deprecated_cfg)} — the band-F1 core is a dead objective "
+            "under RL (F19); the observability-gated reward has no such knobs.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     def reward_func(prompts=None, completions=None, **kwargs) -> list[float]:
         if completions is None:
             completions = []
-        gt_list = _resolve_gt_list(prompts, completions, gt_lookup, kwargs)
+        rows = _resolve_gt_list(prompts, completions, features_lookup, kwargs)
+        obs_col = kwargs.get("observability")
+        if not (isinstance(obs_col, Sequence) and not isinstance(obs_col, (str, bytes))):
+            obs_col = None
         rewards: list[float] = []
-        for completion, gt in zip(completions, gt_list):
+        for i, (completion, row) in enumerate(zip(completions, rows)):
             text = extract_completion_text(completion)
+            obs = obs_col[i] if obs_col is not None and i < len(obs_col) else None
             rewards.append(
-                sfs_reward(
+                observability_reward(
                     text,
-                    gt or {},
-                    f1_weight=f1_weight,
-                    rep_penalty=rep_penalty,
-                    nonascii_penalty=nonascii_penalty,
-                    rep_n=rep_n,
+                    row or {},
+                    obs,
+                    hedge_attributed_unobs=hedge_attributed_unobs,
+                    hedge_generic_unobs=hedge_generic_unobs,
+                    hedge_obs=hedge_obs,
+                    ngram=ngram,
                 )
             )
         return rewards
 
-    reward_func.__name__ = "sfs_reward_func"
+    reward_func.__name__ = "observability_reward_func"
     return reward_func
+
+
+def make_sfs_reward_func(features_lookup: Any = None, **cfg) -> Callable[..., list[float]]:
+    """DEPRECATED NAME — returns the NEW observability-gated reward (F19).
+
+    Kept so `grpo_train.py`'s `from training.sfs_reward import
+    make_sfs_reward_func` keeps importing and its legacy kwargs keep parsing
+    (they are ignored with a DeprecationWarning). This does NOT build the
+    retired band-F1 reward; for that (analysis only, never as an RL objective)
+    call `deprecated_band_f1_reward` directly.
+    """
+    return make_reward_func(features_lookup, **cfg)
+
+
+# ── DEPRECATED band-F1 path (retired as an RL objective) ─────────────────────
+def sfs_f1(generated_text: str, gt_features: Mapping[str, Any]) -> float:
+    """Tolerance-band SFS-F1 of one description vs an SFSScorer-shaped GT dict.
+
+    DEPRECATED as an RL reward (kept for offline comparison dashboards). The
+    band saturates under constant-mode emission, so it must never be optimized
+    against — use `observability_reward` instead.
+    """
+    if not generated_text:
+        return 0.0
+    claims = _PARSER.parse(generated_text)
+    result = _SCORER.score(claims, dict(gt_features))
+    return float(result["f1"])
+
+
+def deprecated_band_f1_reward(
+    generated_text: str,
+    gt_features: Mapping[str, Any],
+    *,
+    f1_weight: float = 1.0,
+    rep_penalty: float = 0.5,
+    nonascii_penalty: float = 1.0,
+    ngram: int = 4,
+) -> float:
+    """RETIRED reward — DO NOT USE AS AN RL OBJECTIVE.
+
+    This is the pre-F19 reward, verbatim:
+
+        reward = f1_weight * SFS_band_F1(text vs gt)
+               - rep_penalty * rep_n(text, ngram)
+               - nonascii_penalty * nonascii_frac(text)
+
+    It is a DEAD OBJECTIVE under RL pressure: the tolerance bands are saturated
+    (a constant-mode policy emitting the population-median value for every
+    feature — the observed f0_min=75-on-96%-of-clips collapse — scores
+    near-ceiling), so optimizing it teaches the policy to ignore the audio.
+    Kept ONLY so old runs can be re-scored for comparison plots. The factory
+    (`make_reward_func` / `make_sfs_reward_func`) never builds this.
+    """
+    text = generated_text or ""
+    return (
+        f1_weight * sfs_f1(text, gt_features)
+        - rep_penalty * rep_n(text, ngram)
+        - nonascii_penalty * nonascii_frac(text)
+    )

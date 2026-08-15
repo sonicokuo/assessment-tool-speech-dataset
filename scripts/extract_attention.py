@@ -164,8 +164,17 @@ def load_model(config: dict, ck: dict, device):
         print(f"[LoRA] rank={config['lora_rank']}")
 
     lm_hidden_size = llm.config.hidden_size
+    # BUGFIX 2026-08-10 (see inference.py:528): forward the head-shaping flags from the
+    # checkpoint config. Omitting reliability_head builds nn.Linear where the checkpoint
+    # holds a ReliabilityHead, so the trained head never loads.
     adapter = (
-        build_adapter(config["adapter_variant"], lm_dim=lm_hidden_size)
+        build_adapter(
+            config["adapter_variant"],
+            lm_dim=lm_hidden_size,
+            reliability_head=bool(config.get("reliability_head", False)),
+            compression=int(config.get("compression", 8)),
+            aux_pool=str(config.get("aux_pool") or "mean"),
+        )
         .to(device)
         .to(torch.bfloat16)
     )

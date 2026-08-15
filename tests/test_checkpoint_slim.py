@@ -321,19 +321,34 @@ def test_val_subset_stratified_proportional():
 
 
 def test_overlap_bin_edges():
-    assert overlap_bin(0.0) == "low"
-    assert overlap_bin(0.15) == "low"
-    assert overlap_bin(0.16) == "med"
+    """Bins are THRESHOLD-ALIGNED to HEDGE_OVERLAP_TAU=0.5 (changed 2026-08-06).
+
+    The old edges (0.15, 0.45) were chosen for an assumed overlap distribution the data
+    does not have. Measured: dev/test are BIMODAL -- exactly 0 on every s1clean clip and
+    >=0.5 on 99.1-99.4% of mixtures, with only 19 (dev) / 27 (test) clips in between.
+    Worse, 0.45 straddled the decision threshold, so 12 of the 19 partial dev clips were
+    binned "high" -- i.e. labelled as the regime whose behaviour they were meant to probe.
+    Edges are now {0} / (0, 0.5) / [0.5, 1], and the upper edge is EXCLUSIVE so a clip at
+    exactly 0.5 lands in "high", matching the `overlap >= tau` abstention rule.
+    """
+    from data.feature_set import HEDGE_OVERLAP_TAU
+
+    assert overlap_bin(0.0) == "low"          # every s1clean clip
+    assert overlap_bin(0.001) == "med"        # any nonzero overlap leaves "low"
+    assert overlap_bin(0.15) == "med"         # was "low" under the old edges
     assert overlap_bin(0.45) == "med"
-    assert overlap_bin(0.46) == "high"
+    assert overlap_bin(0.4999) == "med"
+    assert overlap_bin(0.5) == "high"         # the threshold clip itself abstains
     assert overlap_bin(1.0) == "high"
+    # the bin boundary must track the abstention rule, not float free of it
+    assert overlap_bin(HEDGE_OVERLAP_TAU) == "high"
 
 
 def test_overlap_strata_from_csv_map():
     files = ["a.pt", "b.pt", "c.pt", "d.pt"]
     csv_map = {
-        "a.pt": {"overlap_ratio": "0.05"},   # low
-        "b.pt": {"overlap_ratio": "0.30"},   # med
+        "a.pt": {"overlap_ratio": "0.0"},    # low == exactly 0 under threshold-aligned edges
+        "b.pt": {"overlap_ratio": "0.30"},   # med (0 < ov < 0.5)
         "c.pt": {"overlap_ratio": "0.80"},   # high
         # d.pt missing → "unknown"
     }
@@ -358,7 +373,7 @@ def test_overlap_strata_pt_matches_wav_keyed_csv():
     engaged (seeded-uniform fallback). After the fix, a .pt file must resolve a
     .wav-keyed (and .flac-keyed) row."""
     # .wav-keyed CSV (Libri2Mix) — the exact case from the bug report.
-    csv_wav = {"1089-134686-0000.wav": {"overlap_ratio": "0.05"}}  # low
+    csv_wav = {"1089-134686-0000.wav": {"overlap_ratio": "0.0"}}   # low (== exactly 0)
     assert overlap_strata_from_csv_map(
         ["1089-134686-0000.pt"], csv_wav) == ["low"]
 
@@ -369,7 +384,7 @@ def test_overlap_strata_pt_matches_wav_keyed_csv():
     # Mixed extensions across the split all normalize to the same stem key.
     files = ["a.pt", "b.pt", "c.pt"]
     csv_mixed = {
-        "a.wav": {"overlap_ratio": "0.05"},    # low
+        "a.wav": {"overlap_ratio": "0.0"},     # low (== exactly 0)
         "b.flac": {"overlap_ratio": "0.30"},   # med
         "c.wav": {"overlap_ratio": "0.90"},    # high
     }

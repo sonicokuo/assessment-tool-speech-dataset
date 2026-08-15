@@ -50,8 +50,24 @@ def build_model_slim(cfg, ck, device):
             r=cfg["lora_rank"], lora_alpha=cfg["lora_alpha"],
             target_modules=cfg["lora_targets"], lora_dropout=cfg["lora_dropout"],
             bias="none", task_type="CAUSAL_LM"))
-    adapter = build_adapter(cfg["adapter_variant"], lm_dim=llm.config.hidden_size).to(device).to(torch.bfloat16)
-    adapter.load_state_dict(ck["adapter_state_dict"], strict=False)
+    # BUGFIX 2026-08-10, same class as inference.py's 2026-07-23 fix: without these
+    # flags a reliability_head=true / compression=4 / linear_softmax checkpoint loads
+    # into the WRONG module shapes, and strict=False silently leaves the aux head at
+    # RANDOM init. Everything downstream then looks structured but means nothing.
+    adapter = build_adapter(
+        cfg["adapter_variant"],
+        lm_dim=llm.config.hidden_size,
+        reliability_head=bool(cfg.get("reliability_head", False)),
+        compression=int(cfg.get("compression", 8)),
+        aux_pool=str(cfg.get("aux_pool") or "mean"),
+    ).to(device).to(torch.bfloat16)
+    missing, unexpected = adapter.load_state_dict(ck["adapter_state_dict"], strict=False)
+    _bad = [k for k in list(missing) + list(unexpected) if "head" in k or "regress" in k]
+    if _bad:
+        raise RuntimeError(
+            f"adapter head weights did not load: {_bad} — reliability_head/aux_pool/"
+            "compression mismatch between training and this script?"
+        )
     llm_sd = ck.get("llm_state_dict") or ck["lora_state_dict"]
     load_llm_state_dict(llm, llm_sd, ckpt_format=ck.get("ckpt_format"))
     adapter.eval(); llm.eval()

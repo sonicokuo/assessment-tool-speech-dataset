@@ -34,25 +34,25 @@ class TestModuleConstants:
         assert len(SPECIAL_TOKENS) == n_sections + n_features + 2 + n_range_markers
         assert CLOSE_TAG in SPECIAL_TOKENS
 
-    def test_catalog_has_9_tags(self):
-        # 2026-05-12 EMNLP rework: 8 scalar features + overlap_segments span set,
-        # distributed across the 6 sections in src/section_tags.py.
+    def test_catalog_has_12_tags(self):
+        # 2026-06-24 voice patch re-added hnr/jitter/shimmer to the catalog (9 -> 12):
+        # 11 scalar features (SUPERVISED_FEATURES) + overlap_segments span set,
+        # distributed across the 7 sections in src/data/section_tags.py.
         # If this count changes, double-check the section catalog still maps cleanly.
-        assert len(FEATURE_TAGS) == 9
+        assert len(FEATURE_TAGS) == 12
 
     def test_catalog_includes_expected_features(self):
         names = {ft.name for ft in FEATURE_TAGS}
         expected = {"snr", "srmr", "f0_mean", "f0_sd",
                     "speaking_rate", "pause_count", "pause_rate",
-                    "overlap_ratio", "overlap_segments"}
+                    "overlap_ratio", "overlap_segments",
+                    "hnr", "jitter", "shimmer"}   # 2026-06-24 voice patch re-added these 3
         assert names == expected
 
     def test_dropped_tags_not_present(self):
-        # Tags excluded on 2026-05-12 when realigning to the section catalog.
-        # If any reappear, the paper's "one figure per quality dimension"
-        # claim breaks because their attention story collides with a kept one.
-        dropped = {"duration", "sample_rate", "silence_ratio",
-                   "hnr", "jitter", "shimmer", "articulation_rate"}
+        # Tags excluded on 2026-05-12 and NOT re-added. (hnr/jitter/shimmer WERE re-added
+        # 2026-06-24, so they are no longer dropped.)
+        dropped = {"duration", "sample_rate", "silence_ratio", "articulation_rate"}
         names = {ft.name for ft in FEATURE_TAGS}
         assert dropped.isdisjoint(names)
 

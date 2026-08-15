@@ -30,12 +30,20 @@ def build_cover_lines(values: dict) -> list[str]:
     For the section-based EMNLP design use section_tags.build_section_body instead;
     this function is preserved so the existing inline-tag verbalizer still runs.
     """
-    from data.section_tags import FEATURE_BY_NAME, render_feature_span
+    from data.section_tags import FEATURE_BY_NAME, render_feature_span  # noqa: F401
+
+    class _Blank(dict):
+        # Templates gained a {qual} qualitative-descriptor field for the section-based
+        # builder; this legacy inline-tag path only has {value}, so fill any other
+        # placeholder with "" instead of raising KeyError.
+        def __missing__(self, key):
+            return ""
+
     lines: list[str] = []
     for ft in FEATURE_TAGS:
         if ft.name not in values:
             continue
-        body = ft.template.format(value=values[ft.name])
+        body = ft.template.format_map(_Blank(value=values[ft.name]))
         lines.append(render_feature_span(ft.name, body))
     return lines
 

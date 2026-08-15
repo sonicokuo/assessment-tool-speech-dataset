@@ -1,6 +1,37 @@
-"""Signal Faithfulness Score (SFS) — evaluation metric for speech quality descriptions.
+"""Claim parsing + legacy band scoring for speech-quality descriptions.
 
-SFS MEANS THE PRINCIPLED COVERAGE BAND. `SFSScorer()` with no arguments scores
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║ "SFS" NAMES THREE DIFFERENT METRICS IN THIS REPO. READ THIS BEFORE REPORTING     ║
+║ ANY NUMBER FROM THIS MODULE.                                                     ║
+║                                                                                  ║
+║  1. Absolute-tolerance band P/R/F1  (`SFSScorer(legacy=True)`, `TOLERANCES`)      ║
+║     The original +-2 dB / +-5 Hz dict. RETIRED. Back-compat shim only, kept to    ║
+║     reproduce historical numbers (e.g. the v9-era SFS-F1 0.52 in the paper        ║
+║     history). The rho=0.69 LLM-judge validation belongs to THIS metric and does   ║
+║     NOT transfer to (3).                                                          ║
+║                                                                                  ║
+║  2. Principled coverage band P/R/F1  (`SFSScorer()` default, Tier-3)              ║
+║     Bands from the measured GT-noise model + perceptual JND. Better founded than  ║
+║     (1), but still a BAND metric: it saturates ~0.95 on real output and is        ║
+║     non-discriminative between checkpoints. This is what `train.py` logs as       ║
+║     `val_bandF1_RETIRED`. NOT the headline. Do not put it in the paper.           ║
+║                                                                                  ║
+║  3. BAND-FREE per-feature SRCC / nMAE / coverage   <-- THE HEADLINE METRIC        ║
+║     Decided 2026-06-23, replacing the band family outright. Lives in              ║
+║     `scripts/score_matched_test.py` (test) and `scripts/bandfree_val_eval.py`     ║
+║     (val); the training-time selector is `val/srcc_robust`. It does NOT use       ║
+║     SFSScorer at all — only the PARSER from this module. It has no external       ║
+║     validation study; its GT is instrument output, so its validity rests on the   ║
+║     GT being sound (see the SRMR-on-anechoic-audio confound).                     ║
+║                                                                                  ║
+║ STILL FULLY IN USE and NOT retired: `ClaimParser` / `HybridClaimParser` (numeric  ║
+║ claim extraction) and `AbstentionDetector` (hedge recognition). Every band-free   ║
+║ script depends on the parser. Do not delete this module to "remove SFS".          ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+Details of (2), the default band, follow.
+
+`SFSScorer()` with no arguments scores
 against the Tier-3 coverage-derived tolerance `DEFAULT_TOLERANCE_CONFIG`, built
 from the measured per-feature GT-noise model (sigma_f) + perceptual JND_f +
 alpha=0.05 + the distribution family the measured tail demands. The legacy
@@ -383,6 +414,88 @@ class ClaimParser:
                 extra.append(Claim(feature="overlap_end", value=e_val, unit="s", raw_text=raw))
         return extra
 
+    # ── Hedge detection with overlap attribution (F20, ADD-only) ─────────────
+    # Per-feature HEDGE claims for the observability-gated RL reward (F19).
+    # A hedge is a sentence that names an ill-posed feature together with an
+    # inability cue ("unreliable", "cannot be reliably measured", "omitted",
+    # ...). The hedge is ATTRIBUTED when the SAME SENTENCE names overlap as the
+    # cause ("during overlap", "overlapping speech", "because ... overlap",
+    # "due to ... overlap").
+    #
+    # Feature coverage mirrors data/feature_set.ILL_POSED_UNDER_OVERLAP_FEATURES
+    # (f0_mean, f0_sd, jitter, shimmer, hnr). The set is kept LITERAL here so
+    # sfs.py stays torch-free (feature_set imports torch at module level);
+    # training/sfs_reward.py asserts the two stay in sync at import time.
+    # A pitch noun covers BOTH pitch scalars (mean + SD share estimability),
+    # mirroring AbstentionDetector.PITCH_FEATURES.
+    HEDGE_FEATURE_PATTERNS = [
+        (("f0_mean", "f0_sd"),
+         re.compile(r"(?:\bf0\b|\bpitch\b|fundamental\s+frequency)", re.IGNORECASE)),
+        (("jitter",), re.compile(r"\bjitter\b", re.IGNORECASE)),
+        (("shimmer",), re.compile(r"\bshimmer\b", re.IGNORECASE)),
+        (("hnr",),
+         re.compile(r"(?:\bhnr\b|harmonics?-to-noise(?:\s+ratio)?)", re.IGNORECASE)),
+    ]
+    # Inability cues. Aligned with AbstentionDetector._HEDGE_CUE_RE phrasings
+    # plus the builder's "omitted" / "not reliably measurable" forms.
+    _HEDGE_CUE_RE = re.compile(
+        r"(?:unreliable"
+        r"|can\s*not\s+be\s+(?:reliably\s+)?(?:measured|estimated|recovered|determined)"
+        r"|not\s+reliably\s+(?:measurable|estimable|measured|estimated)"
+        r"|not\s+(?:be\s+)?(?:asserted|reported|stated|estimated|measured|recovered|reliable)"
+        r"|left\s+unstated"
+        r"|ill-posed"
+        r"|omitted)",
+        re.IGNORECASE,
+    )
+    # Overlap named as the CAUSE of the hedge, sentence-scoped. The bracketed
+    # gaps use [^.!?]*? so a match can never cross a sentence boundary even if
+    # the sentence splitter under-splits.
+    _HEDGE_ATTRIBUTION_RE = re.compile(
+        r"(?:during\s+(?:the\s+)?overlap"
+        r"|overlap(?:ping|ped)?\s+speech"
+        r"|because\b[^.!?]*?\boverlap"
+        r"|due\s+to\b[^.!?]*?\boverlap"
+        r"|under\s+(?:heavy\s+|significant\s+)?overlap"
+        r"|overlap\b[^.!?]*?\b(?:makes|renders|prevents|corrupts))",
+        re.IGNORECASE,
+    )
+    # Same sentence-boundary convention as AbstentionDetector: split on real
+    # terminators followed by whitespace, never on the decimal point in "16.10".
+    _HEDGE_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+    def parse_hedges(self, text: str) -> dict:
+        """Detect per-feature HEDGE claims and their overlap attribution.
+
+        Args:
+            text: generated NL description.
+        Returns:
+            {feature: {"attributed": bool}} for every ill-posed feature the
+            text hedges (subset of f0_mean / f0_sd / jitter / shimmer / hnr).
+            A feature hedged in several sentences is attributed if ANY of those
+            sentences names overlap as the cause (OR across sentences).
+
+        Numeric-claim extraction (`parse`) is untouched: a sentence can yield
+        both a numeric claim and a hedge; precedence between them is the
+        reward's decision, not the parser's.
+        """
+        hedges: dict = {}
+        if not text:
+            return hedges
+        for sentence in self._HEDGE_SENT_SPLIT_RE.split(text):
+            if not self._HEDGE_CUE_RE.search(sentence):
+                continue
+            attributed = bool(self._HEDGE_ATTRIBUTION_RE.search(sentence))
+            for features, noun_re in self.HEDGE_FEATURE_PATTERNS:
+                if not noun_re.search(sentence):
+                    continue
+                for feature in features:
+                    prev = hedges.get(feature)
+                    hedges[feature] = {
+                        "attributed": attributed or bool(prev and prev["attributed"]),
+                    }
+        return hedges
+
 
 # ── Tagged-prose parser (EMNLP rework) ──────────────────────────────
 class TaggedClaimParser:
@@ -445,6 +558,11 @@ class HybridClaimParser:
     def parse(self, text: str) -> list["Claim"]:
         claims = self._tagged.parse(text)
         return claims if claims else self._legacy.parse(text)
+
+    def parse_hedges(self, text: str) -> dict:
+        """Hedge claims are always prose (never tagged spans) — delegate to the
+        regex parser's `parse_hedges` (F20). Same return shape."""
+        return self._legacy.parse_hedges(text)
 
 
 # ── Abstention / hedge detection (observability-aware rework) ────────────────

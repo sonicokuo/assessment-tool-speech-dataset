@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-"""Band-free SFS comparison across versions (decision 2026-06-23).
+"""HISTORICAL SCRIPT (D5, 2026-07-16): predates the B2 flip — its
+snr-EXCLUDED headline is the OLD anechoic-data convention, kept only to
+reproduce pre-2026-06 comparisons. The CURRENT headline is HEADLINE_FEATURES
+in src/eval/selection_metric.py (snr INCLUDED). Do not cite this script's
+mean for new results.
+
+Band-free SFS comparison across versions (decision 2026-06-23).
 
 Retires band precision/F1. Reports, per feature on STATED claims vs CLEAN GT:
   SRCC (Spearman), nMAE = MAE/std(GT), coverage = mentioned/total.

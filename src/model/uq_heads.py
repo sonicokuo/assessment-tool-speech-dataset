@@ -1,8 +1,33 @@
 """uq_heads.py — CHEAP uncertainty-quantification heads for the per-frame SNR map.
 
+!! NUMBER CORRECTION 2026-08-03 -- READ BEFORE CITING ANY SNR-MAP FIGURE !!
+This docstring used to say the dense SNR head reaches "Pearson 0.726". That was WRONG
+and the error propagated into three diffusion-map memos under .claude/research/findings/.
+Two different quantities were being conflated:
+
+  0.726  = TARGET RECOVERABILITY. How well the ORACLE dense map's active-frame mean
+           correlates with clean-GT SNR. It is a property of the TARGET, i.e. an upper
+           bound on what a perfect head could extract. Source: artifact-fix-gain.md,
+           which states it correctly.
+  0.263  = ACTUAL HEAD QUALITY. The trained head's predicted-vs-oracle timeline Pearson.
+           Verified 2026-08-03 from source artifacts on PSC:
+             checkpoints/newproj_full12_noNTL/snrmap_grounding_full.json  n=3000  0.2632
+             checkpoints/v24_snrmap/snr_map_eval_final.json               n=500   0.2928
+             checkpoints/v24_snrmap/snr_map_eval_ep1.json                 n=500   0.2579
+           MAE stays ~11.5-12.1 dB throughout.
+
+So the head recovers roughly a THIRD of the correlation the target makes available.
+Any argument of the form "the regression head already hits 0.726, so method X only ties
+it" is invalid -- the bar is 0.263, not 0.726.
+
+RELATED RETRACTION: these same eval files report deletion_win_rate = 1.0. That number is
+MAP-INTERNAL (masking map-selected frames moves the map head's own pooled readout, never
+the LM's emitted number) and must NOT be cited as generation-level causal grounding. The
+LM-emission-level deletion is NULL (0.325 vs 0.45 for model-randomization).
+
 WHY THIS EXISTS (the kill-fast gate)
 ------------------------------------
-The supervised dense local-SNR head (src/snr_map_head.py, Pearson 0.726) is a POINT
+The supervised dense local-SNR head (src/snr_map_head.py) is a POINT
 estimator: one SNR per frame, no "how sure am I". The paper wants a per-frame
 UNCERTAINTY that ranks where the prediction is wrong, so the model can ABSTAIN on the
 frames it cannot support. The INCUMBENT uncertainty channel is the heteroscedastic

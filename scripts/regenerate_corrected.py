@@ -83,7 +83,11 @@ def _add_noise(x, noise, snr_db, rng):
     ps = np.mean(x ** 2) + 1e-12
     pn = np.mean(noise ** 2) + 1e-12
     g = np.sqrt(ps / (pn * (10 ** (snr_db / 10.0))))
-    return x + g * noise
+    # Return the gain EXPLICITLY. It was briefly stashed in the process-global _G;
+    # that happens to be safe here (multiprocessing.Pool gives each worker its own _G
+    # and _process handles one clip at a time), but implicit cross-function state in a
+    # DATA-GENERATION script is not worth the fragility.
+    return x + g * noise, float(g)
 
 def _process(item):
     idx, mix_path = item
@@ -99,11 +103,16 @@ def _process(item):
         xr = sps.fftconvolve(x, h)[:len(x)]
         # 2) noise at independent SNR
         snr = float(rng.uniform(a.snr_lo, a.snr_hi))
-        wham_files = glob.glob(os.path.join(a.wham_dir, "*.wav"))
-        nz, nsr = sf.read(wham_files[rng.integers(len(wham_files))])
+        # REPRODUCIBILITY FIX 2026-08-11: glob.glob returns FILESYSTEM-ENUMERATION order,
+        # so the chosen WHAM file was not reproducible across machines and the exact noise
+        # stem could not be regenerated. The snr oracle contribution map needs the speech
+        # and noise components SEPARATELY, so this had to be deterministic.
+        wham_files = sorted(glob.glob(os.path.join(a.wham_dir, "*.wav")))
+        wham_pick = wham_files[rng.integers(len(wham_files))]
+        nz, nsr = sf.read(wham_pick)
         nz = nz.mean(1) if nz.ndim > 1 else nz
         if nsr != sr: nz = sps.resample_poly(nz.astype(np.float64), sr, nsr)
-        xd = _add_noise(xr, nz.astype(np.float64), snr, rng)
+        xd, noise_gain = _add_noise(xr, nz.astype(np.float64), snr, rng)
         # normalize to avoid clipping, write degraded wav
         peak = np.max(np.abs(xd)) or 1.0
         xd = 0.98 * xd / peak
@@ -115,7 +124,14 @@ def _process(item):
         # 4) prosody/f0 from CLEAN features (already extracted); jitter/shimmer/hnr on clean stem if --voice
         cf = _G["clean_feat"].get(stem, {})
         cf0 = _G["clean_f0"].get(stem, {})
+        # PROVENANCE 2026-08-11: enough to reconstruct the exact speech/noise split that
+        # defines snr_db, without depending on RNG-state replay. `noise_gain` is the `g`
+        # from _add_noise; with it, xr and g*noise are recoverable and the exactness check
+        # |10log10(sum a / sum b) - snr_db| < 1e-6 dB becomes runnable.
         row = dict(filename=stem, snr_db=snr, srmr=srmr,
+                   wham_file=os.path.basename(wham_pick),
+                   noise_gain=noise_gain,
+                   peak_norm=float(peak),
                    f0_mean_hz=cf0.get("f0_mean_hz"),
                    praat_speaking_rate_syl_sec=cf.get("praat_speaking_rate_syl_sec"),
                    praat_articulation_rate_syl_sec=cf.get("praat_articulation_rate_syl_sec"),

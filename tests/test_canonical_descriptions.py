@@ -52,14 +52,21 @@ def _clean_f0_entry():
 
 
 def _row(overlap_vad, fname="spk_clip.wav"):
-    """A CSV row dict. hnr / jitter / shimmer / overlap_ratio come from here."""
+    """A CSV row dict. hnr / jitter / shimmer / overlap_ratio come from here.
+
+    COLUMN NAMES MUST MIRROR features_corrected_merged/*.csv EXACTLY. This fixture used
+    to say "hnr_db" / "shimmer_pct", which matched the (buggy) FEATURE_ORDER rather than
+    the real CSV header ("hnr" / "shimmer"). Because the fixture and the bug agreed, the
+    whole suite passed green while hnr and shimmer were being dropped from 100% of real
+    targets. test_fixture_columns_match_feature_order below now pins them together.
+    """
     return {
         "filename": fname,
         "overlap_ratio": str(overlap_vad),
         "overlap_ratio_vad": str(overlap_vad),
-        "hnr_db": "12.40",
+        "hnr": "12.40",
         "jitter_local_pct": "1.23",
-        "shimmer_pct": "4.56",
+        "shimmer": "4.56",
         # CSV fallbacks (clean_features should win over these when present):
         "snr_db": "99.99",
         "srmr": "0.0001",
@@ -108,12 +115,13 @@ def test_all_twelve_roundtrip_low_overlap():
     for short_name, *_ in FEATURE_ORDER:
         assert short_name in got, f"{short_name} missing from parsed claims: {got}"
 
-    # Values round-trip within formatting precision.
+    # Values round-trip within formatting precision (F15: constant two-decimal
+    # surface form, so GT is compared after rounding to 2 decimals).
     expected = dict(EXPECTED_VALUES)
     expected["overlap_ratio"] = LOW_OVERLAP
     for feat, val in expected.items():
-        assert abs(got[feat] - val) < 1e-4, (
-            f"{feat}: parsed {got[feat]} != expected {val}"
+        assert abs(got[feat] - round(val, 2)) < 1e-4, (
+            f"{feat}: parsed {got[feat]} != expected {round(val, 2)}"
         )
 
 
@@ -151,7 +159,8 @@ def test_abstained_features_absent_under_high_overlap():
     for feat in ALWAYS_REPORT:
         assert feat in parsed, f"always-report feature {feat} missing under overlap"
     assert abs(parsed["snr"] - 15.63) < 1e-4
-    assert abs(parsed["overlap_ratio"] - HIGH_OVERLAP) < 1e-4
+    # F15: overlap is emitted at two decimals, so compare against the rounded GT.
+    assert abs(parsed["overlap_ratio"] - round(HIGH_OVERLAP, 2)) < 1e-4
 
 
 def test_abstention_detector_fires_under_overlap():
@@ -307,12 +316,13 @@ def test_number_formatting_precision():
     text = build_canonical_description(
         row, os.path.splitext(fname)[0], fname, cf, cf0, overlap_threshold=0.5,
     ).lower()  # connective glue may lowercase a clause-leading "The"
-    # srmr {:.4f}, snr {:.2f}, speaking_rate {:.3f}, pause_count {:d}, overlap {:.4f}
-    assert "the srmr is 5.1600." in text
+    # F15 (2026-07-16): every float is the constant two-decimal "{:.2f}";
+    # pause_count stays an integer.
+    assert "the srmr is 5.16." in text
     assert "the snr is 15.63 db." in text
-    assert "the speaking rate is 6.311 syl/sec." in text
+    assert "the speaking rate is 6.31 syl/sec." in text
     assert "the pause count is 3." in text
-    assert f"the overlap ratio is {LOW_OVERLAP:.4f}." in text
+    assert f"the overlap ratio is {LOW_OVERLAP:.2f}." in text
 
 
 def test_partition_is_exhaustive_and_disjoint():
@@ -325,3 +335,33 @@ def test_partition_is_exhaustive_and_disjoint():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_fixture_columns_match_feature_order():
+    """The fixture row must supply every CSV column FEATURE_ORDER asks for.
+
+    Regression guard for the 2026-07-28 bug: FEATURE_ORDER read "hnr_db"/"shimmer_pct"
+    while the real CSVs use "hnr"/"shimmer". row.get() returns None for a typo exactly as
+    it does for a missing measurement, so hnr and shimmer vanished from all 39,800 targets
+    silently -- and the suite stayed green because this fixture had been written to match
+    the buggy names. Pinning the fixture to FEATURE_ORDER means a future rename breaks a
+    test instead of the dataset.
+    """
+    from build_canonical_descriptions import FEATURE_ORDER, assert_feature_columns_exist
+
+    row = _row(LOW_OVERLAP)
+    # Only the features with NO clean-JSON alternative must come from the CSV row; the
+    # recoverable scalars (praat_*) are supplied by clean_features in this fixture.
+    csv_only = {"hnr", "jitter", "shimmer", "overlap_ratio"}
+    required = [c for n, c, _k, _f in FEATURE_ORDER if n in csv_only]
+    missing = [c for c in required if c not in row]
+    assert not missing, f"fixture row is missing CSV-only FEATURE_ORDER columns: {missing}"
+
+    # The exact typo that caused the bug must now be impossible to reintroduce silently.
+    assert [c for _n, c, _k, _f in FEATURE_ORDER if c in ("hnr_db", "shimmer_pct")] == []
+
+    # And the strict guard must actually raise when a referenced column is absent.
+    full_header = [c for _n, c, _k, _f in FEATURE_ORDER] + ["filename"]
+    assert assert_feature_columns_exist(full_header, strict=False) == []
+    with pytest.raises(SystemExit):
+        assert_feature_columns_exist([c for c in full_header if c not in ("hnr", "shimmer")])

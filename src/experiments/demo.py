@@ -80,13 +80,28 @@ def _load() -> dict:
 
     print(f"[load] checkpoint {args.checkpoint}")
     ck = torch.load(args.checkpoint, weights_only=False, map_location="cpu")
-    adapter = build_adapter(config["adapter_variant"], lm_dim=llm.config.hidden_size).to(device).to(torch.bfloat16)
+    # BUGFIX 2026-08-10 (see inference.py:528): these flags shape the head; omitting
+    # them leaves a ReliabilityHead checkpoint at RANDOM init under strict=False.
+    adapter = build_adapter(
+        config["adapter_variant"],
+        lm_dim=llm.config.hidden_size,
+        reliability_head=bool(config.get("reliability_head", False)),
+        compression=int(config.get("compression", 8)),
+        aux_pool=str(config.get("aux_pool") or "mean"),
+    ).to(device).to(torch.bfloat16)
     adapter.load_state_dict(ck["adapter_state_dict"])
     llm.load_state_dict(ck["lora_state_dict"])
     adapter.eval(); llm.eval()
     print(f"[load] adapter+LoRA loaded; epoch={ck.get('epoch')}, val_loss={ck.get('best_val_loss', 0):.4f}")
 
-    test_set = PreprocessedDataset(args.test_dir, config.get("descriptions_path"))
+    # 5th site of the unforwarded-config class, swept 2026-08-14 alongside the
+    # inference.py fix. The checkpoint's OWN training config wins: a model trained with
+    # `zero_overlap_input: true` never learned its overlap projection (zero gradient), so
+    # feeding it the oracle channel here is off-distribution.
+    _zero_ovl = bool((ck.get("config") or {}).get("zero_overlap_input",
+                                                  config.get("zero_overlap_input", False)))
+    test_set = PreprocessedDataset(args.test_dir, config.get("descriptions_path"),
+                                   zero_overlap_input=_zero_ovl)
     # Demo always uses the prose prompt for generation (same as inference).
     demo_prompt = config.get("prompt_prose") or config["prompt"]
     prompt_ids = tokenizer(demo_prompt, return_tensors="pt").input_ids.to(device)

@@ -7,7 +7,7 @@ abstain (band/hedge) on ill-posed features under overlap (single-speaker F0 from
 uncertainty, not a hand-set rule.
 
 This head replaces the plain aux regression head (Linear(d -> 8) predicting a mean)
-with a HETEROSCEDASTIC head: Linear(d -> 2*8) predicting, per feature, a mean AND a
+with a HETEROSCEDASTIC head: Linear(d -> 2*N_FEATURES) predicting, per feature, a mean AND a
 log-variance (log σ²). The per-feature predicted σ is the model's own "this feature
 is unreliable here" signal; at eval we abstain on a feature when its σ exceeds a
 threshold and sweep the threshold to draw a risk-coverage curve.
@@ -102,6 +102,7 @@ def heteroscedastic_nll(
     mask: torch.Tensor | None = None,
     scales: torch.Tensor | None = None,
     beta: float = 0.0,
+    stop_grad_mean: bool = False,
 ) -> torch.Tensor:
     """Masked heteroscedastic Gaussian NLL, optionally β-NLL (Kendall & Gal 2017; Seitzer 2022).
 
@@ -132,17 +133,25 @@ def heteroscedastic_nll(
         beta:     β-NLL exponent (Seitzer 2022). 0.0 -> plain Kendall & Gal NLL
                   (byte-identical to before). 0.5 recommended when the head must fit
                   high-variance features (e.g. F0 under overlap).
+        stop_grad_mean: Stirn et al. (AISTATS 2023) "faithful heteroscedastic regression".
+                  When True the squared-error term uses mean.detach(), so this NLL trains
+                  ONLY the log-variance (σ) and can no longer corrupt the mean. The mean must
+                  then be trained by a SEPARATE plain-MSE term (keep lambda_mse > 0): if the
+                  mean's only gradient path is removed, μ goes to garbage and σ calibrates
+                  against garbage residuals. Default False = joint (μ and σ both from the NLL).
 
     Returns:
         Scalar tensor: mean NLL over present slots (0.0 if nothing is present).
-        Finite and differentiable w.r.t. both mean and log_var.
+        Finite and differentiable w.r.t. log_var (and w.r.t. mean unless stop_grad_mean).
     """
     if scales is None:
         scales_t = torch.ones(mean.shape[-1], device=mean.device, dtype=mean.dtype)
     else:
         scales_t = scales.to(device=mean.device, dtype=mean.dtype)
 
-    err = (target.to(mean.dtype) - mean) / scales_t            # (B, F), unit-free
+    # Stirn stop-gradient: detach the mean so the variance term trains σ only.
+    mu = mean.detach() if stop_grad_mean else mean
+    err = (target.to(mean.dtype) - mu) / scales_t             # (B, F), unit-free
     # 0.5 * exp(-s) * err^2 + 0.5 * s
     per_feat = 0.5 * torch.exp(-log_var) * err.pow(2) + 0.5 * log_var   # (B, F)
 

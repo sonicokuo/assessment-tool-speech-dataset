@@ -118,10 +118,10 @@ def passes_degeneration_guard(
     frac_clips_high_rep: float = 0.0,
     *,
     bleu_rel_floor: float = 0.6,
-    rep_n_thresh: float = 0.95,
+    rep_n_thresh: float = 0.95,  # UNUSED since 2026-07-16 (kept for signature compat); rep_n_max no longer gates.
     nonascii_thresh: float = 0.05,
     clip_nonascii_thresh: float = 0.15,
-    clip_rep_thresh: float = 0.50,  # 2026-07-08: was 0.15; too tight for templated prose, froze baseline best.pt at ep0. Catastrophic single-clip loops still caught by rep_n_thresh=0.95.
+    clip_rep_thresh: float = 0.50,  # 2026-07-08: was 0.15; too tight for templated prose, froze baseline best.pt at ep0.
 ) -> tuple[bool, str]:
     """Return (is_clean, reason).
 
@@ -137,12 +137,19 @@ def passes_degeneration_guard(
         old `rep_n_max > 0.5` gate, so no best.pt was ever saved. A few bad clips
         are tolerated; a mostly-looping batch is still withheld. Mirrors the
         `frac_clips_nonascii` design.
-      - rep_n_max is kept ONLY as a catastrophic backstop at a HIGH threshold
-        (0.95): a single clip that is essentially one token repeated is so
-        broken it is worth rejecting even if it is alone, but normal looping
-        clips (~0.6-0.85) no longer trip it.
       - non-ASCII character fraction exceeds nonascii_thresh (foreign-token
         injection).
+
+    rep_n_max does NOT gate (removed 2026-07-16). It is a MAX-statistic, so it
+    scales with the number of val clips: with 200 clips (the current
+    val_subset_size) the single worst clip is statistically guaranteed to loop
+    a little, and the old `rep_n_max > 0.95` "catastrophic backstop" (designed
+    for 32-clip batches) fired at EVERY epoch >= 2 in BOTH recent runs — the
+    2026-07-16 offline replay showed this froze best.pt at ep1 twice. Real
+    batch-level collapse is already covered by the frac_clips_high_rep > 0.5
+    gate, which is an n-independent FRACTION. rep_n_max stays in
+    degeneration_stats (and the select/* wandb keys) as telemetry only; the
+    rep_n_thresh parameter is retained so existing call sites keep compiling.
 
     A None BLEU or None best_bleu skips only the BLEU check (the rep-n and
     non-ASCII guards still apply, so a degenerate first epoch is still caught).
@@ -157,9 +164,6 @@ def passes_degeneration_guard(
     if frac_clips_high_rep > clip_rep_thresh:
         return False, (f"frac_clips_high_rep {frac_clips_high_rep:.3f} > "
                        f"{clip_rep_thresh:.2f} (repetition/tag-spam in many clips)")
-    if rep_n_max > rep_n_thresh:
-        return False, (f"rep_n_max {rep_n_max:.3f} > {rep_n_thresh:.2f} "
-                       f"(catastrophic single-clip repetition)")
     if nonascii_frac_val > nonascii_thresh:
         return False, f"nonascii_frac {nonascii_frac_val:.4f} > {nonascii_thresh:.3f}"
     if frac_clips_nonascii > clip_nonascii_thresh:
@@ -176,9 +180,9 @@ def should_save_best(
     gen_texts: list[str],
     *,
     bleu_rel_floor: float = 0.6,
-    rep_n_thresh: float = 0.95,
+    rep_n_thresh: float = 0.95,  # UNUSED since 2026-07-16 (see passes_degeneration_guard); pass-through only.
     nonascii_thresh: float = 0.05,
-    clip_rep_thresh: float = 0.50,  # 2026-07-08: was 0.15; too tight for templated prose, froze baseline best.pt at ep0. Catastrophic single-clip loops still caught by rep_n_thresh=0.95.
+    clip_rep_thresh: float = 0.50,  # 2026-07-08: was 0.15; too tight for templated prose, froze baseline best.pt at ep0.
     n_gram: int = 4,
 ) -> tuple[bool, str]:
     """Top-level decision: save best.pt iff SFS improved AND the generations are
@@ -198,6 +202,24 @@ def should_save_best(
     if not ok:
         return False, f"sfs improved but degenerate ({reason})"
     return True, "sfs improved, clean"
+
+
+def update_best_bleu(
+    best_bleu: float | None,
+    bleu: float | None,
+    guard_ok: bool,
+) -> float | None:
+    """Running max of CLEAN-epoch BLEU — the guard's relative-floor reference.
+
+    Only epochs that PASS the degeneration guard may raise the reference
+    (2026-07-16 fix): before this, train.py updated best_val_bleu even on
+    withheld epochs, so a degenerate-but-high-BLEU epoch could ratchet the
+    floor up and reject every later legitimate epoch. Pure so it is
+    unit-testable without a training loop.
+    """
+    if not guard_ok or bleu is None:
+        return best_bleu
+    return bleu if best_bleu is None else max(best_bleu, bleu)
 
 
 # ── Stable / representative validation subset ────────────────────────────────
