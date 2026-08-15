@@ -105,12 +105,18 @@ def main() -> int:
     ap.add_argument("--pt_dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--n_pca", type=int, default=256,
+                    help="PCA dims for the error predictor (cost control; "
+                         "applied identically to arms B and C)")
     a = ap.parse_args()
 
     import torch
+    from sklearn.decomposition import PCA
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.linear_model import Ridge
     from sklearn.model_selection import KFold
+
+    n_pca = a.n_pca
 
     names = [f[0] if isinstance(f, (tuple, list)) else str(f) for f in SUPERVISED_FEATURES]
     cols = [f[1] if isinstance(f, (tuple, list)) and len(f) > 1 else f[0]
@@ -150,13 +156,28 @@ def main() -> int:
     print(f"pooled  (clean {int(is_clean.sum())} / mix {int((~is_clean).sum())})", flush=True)
 
     def posthoc(Xf, yhat, err, kf):
-        """Cross-validated |error| predictor. Sees the estimate and the features, NEVER y."""
+        """Cross-validated |error| predictor. Sees the estimate and the features, NEVER y.
+
+        PCA is a COST control, not a modelling choice. Boosting over the raw 2048-dim pooled
+        encoder costs ~30 min per feature (10 fits each scanning 2049 columns x 200 iters),
+        which is ~5h for the panel and leaves no slack on a single allocation. Projecting to
+        `n_pca` components first is ~8x cheaper.
+
+        IT CANNOT BIAS B vs C: both arms are projected with the SAME basis and the SAME
+        hyperparameters, and the projection is UNSUPERVISED (fit on training-fold X only, never
+        on y and never on the held-out fold). If the reduction costs any accuracy it costs both
+        arms alike, which SHRINKS |B-C| — conservative for the claim we would like to make.
+        """
         c = np.zeros_like(err)
-        Xe = np.column_stack([Xf, yhat])
-        for tr, te in kf.split(Xe):
+        for tr, te in kf.split(Xf):
+            pca = PCA(n_components=min(n_pca, Xf[tr].shape[0], Xf.shape[1]),
+                      svd_solver="randomized", random_state=0).fit(Xf[tr])
+            # the point estimate is appended AFTER projection so it is never diluted by it
+            Etr = np.column_stack([pca.transform(Xf[tr]), yhat[tr]])
+            Ete = np.column_stack([pca.transform(Xf[te]), yhat[te]])
             c[te] = HistGradientBoostingRegressor(
                 max_iter=200, learning_rate=0.1, max_depth=6,
-                random_state=0).fit(Xe[tr], err[tr]).predict(Xe[te])
+                random_state=0).fit(Etr, err[tr]).predict(Ete)
         return c
 
     def within(conf, err, cl):
@@ -224,6 +245,7 @@ def main() -> int:
 
         print(f"{nm:<15}{wA:8.3f}{wB:12.3f}{wC:13.3f}{wB - wC:+8.3f}{'|':>3}"
               f"{eA:9.3f}{eB:9.3f}{eC:9.3f}{win:>10}")
+        json.dump(summary, open(a.out + ".partial", "w"), indent=2)
         summary[nm] = {"within_A_sigma": wA, "within_B_ours_gbm": wB, "within_C_ridge_gbm": wC,
                        "within_B_minus_C": wB - wC, "eaurc_A": eA, "eaurc_B": eB, "eaurc_C": eC,
                        "winner": win}

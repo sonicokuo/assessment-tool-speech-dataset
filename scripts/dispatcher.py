@@ -301,6 +301,30 @@ JOBS = [
              f"{SH}/data/features_corrected_merged/test.csv "
              f"{SH}/aux_l7_unmasked_s73.json 0 zero_overlap"),
 
+    # ---- CONTRIBUTION 1's PANEL, MEASURABLE FOR THE FIRST TIME. Under `fw` the LM emitted
+    # NOTHING for hnr/f0_mean/f0_sd/shimmer (0.0%, G.2o), so a free-decode coverage column on
+    # the ill-posed panel was meaningless — it measured a target bug. fw2 restores all four to
+    # 98.3% (G.2r), so band-free SRCC + nMAE + COVERAGE vs INSTRUMENT GT is now well-defined on
+    # all 11 features. Sorted order interleaves each mixture with its _s1clean twin, so a
+    # 1500-clip prefix is ~750 of each rather than one condition.
+    dict(name="freedecode_fw2_s73", gpu=True,
+         produces=f"{SH}/freedecode_fw2_s73.json", needs=[],
+         cmd=f"{PY} -u src/inference.py "
+             f"--config {RV}/configs/config.l7audioonly.s73.fw2RETRAIN.yaml "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test --top_k 1 --start 0 --end 1500 "
+             f"--out {SH}/freedecode_fw2_s73.json"),
+
+    # Scored against the INSTRUMENT CSV (the default), so the parser touches predictions only
+    # and no value is laundered through the verbalizer into "truth".
+    dict(name="score_freedecode_fw2", gpu=False,
+         produces=f"{SH}/freedecode_fw2_s73.scored.txt",
+         needs=[f"{SH}/freedecode_fw2_s73.json"],
+         cmd=f"{PY} -u scripts/score_matched_test.py "
+             f"--features_csv {SH}/data/features_corrected_merged/test.csv "
+             f"{SH}/data/descriptions_corrected_fw2.json {SH}/freedecode_fw2_s73.json "
+             f"> {SH}/freedecode_fw2_s73.scored.txt 2>&1"),
+
     dict(name="pitch_probe_seed42", gpu=True,
          produces=f"{SH}/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "
