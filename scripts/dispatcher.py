@@ -336,6 +336,31 @@ JOBS = [
              f"{SH}/data/descriptions_corrected_fw2.json {SH}/freedecode_fw2_s73.json "
              f"> {SH}/freedecode_fw2_s73.scored.txt 2>&1"),
 
+    # ---- DID THE MASK FIX BUY ACCURACY BY BREAKING ABSTENTION? G.2u moved the ill-posed panel
+    # +0.087 and now beats the ridge, but the point estimate now trains on overlapped clips and
+    # may have learned to GUESS CONFIDENTLY where it previously had no signal. The sigma head's
+    # training set is unchanged (the NLL always kept the full presence mask) and prose hedging is
+    # untouched, but that is an argument, not a measurement. No abstention claim on this
+    # checkpoint until both of these return.
+    dict(name="sigma_unmasked", gpu=True,
+         produces=f"{SH}/aux_sigma_unmasked_s73.json",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
+         cmd=f"{PY} -u scripts/dump_aux_sigma.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/aux_sigma_unmasked_s73.json"),
+
+    # Coverage side: f0 was 99.0% on clean vs 2.1% under overlap on fw2. If unmasking made the
+    # model emit f0 under overlap, the abstention behaviour is damaged and contribution II with it.
+    dict(name="emission_unmasked", gpu=True,
+         produces=f"{SH}/temperature_redecode_unmasked.json",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
+         cmd=f"{PY} -u scripts/temperature_redecode.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
+             f"--config {RV}/configs/config.l7audioonly.s73.unmasked.yaml "
+             f"--test_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/temperature_redecode_unmasked.json --n 60 --temps 0.0"),
+
     dict(name="pitch_probe_seed42", gpu=True,
          produces=f"{SH}/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "
