@@ -226,6 +226,55 @@ JOBS = [
               f"--config {RV}/configs/config.l7audioonly.s42.fw2RETRAIN.yaml $R "
               f"&& touch {SH}/checkpoints/full/l7audioonly_fw2_seed42/TRAINING_COMPLETE")),
 
+    # ---- THE PAYOFF EVALS. Both fw2 retrains are done; these answer the two questions the
+    # G.2j retraction opened: (1) do f0/hnr/shimmer now EMIT (they had ZERO clean-clip
+    # supervision under fw), and (2) does the ILL-POSED panel close on the tuned L7 ridge
+    # (0.5372) now that those heads are no longer trained on clean clips only?
+    # aux_repool is the fast readout — minutes, and it gives the ridge comparison directly.
+    dict(name="aux_readout_fw2_s73", gpu=True,
+         produces=f"{SH}/aux_l7_fw2_s73.json",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/TRAINING_COMPLETE"],
+         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+             f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
+             f"{SH}/data/processed_layer7/test "
+             f"{SH}/data/features_corrected_merged/test.csv "
+             f"{SH}/aux_l7_fw2_s73.json 0 zero_overlap"),
+
+    dict(name="aux_readout_fw2_s42", gpu=True,
+         produces=f"{SH}/aux_l7_fw2_s42.json",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed42/TRAINING_COMPLETE"],
+         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+             f"{SH}/checkpoints/full/l7audioonly_fw2_seed42/best.pt "
+             f"{SH}/data/processed_layer7/test "
+             f"{SH}/data/features_corrected_merged/test.csv "
+             f"{SH}/aux_l7_fw2_s42.json 0 zero_overlap"),
+
+    # Emission is an LM-path question, so it needs the generation pass. 60 clean clips is
+    # enough to separate 0% from ~100%; the full 6000-clip eval follows only if this shows
+    # the features returning.
+    dict(name="emission_check_fw2", gpu=True,
+         produces=f"{SH}/temperature_redecode_fw2.json",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/TRAINING_COMPLETE"],
+         cmd=f"{PY} -u scripts/temperature_redecode.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
+             f"--config {RV}/configs/config.l7audioonly.s73.fw2RETRAIN.yaml "
+             f"--test_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/temperature_redecode_fw2.json --n 60 --temps 0.0"),
+
+    # ---- THE ARM-ISOLATING COMPARISON. residual_error_head showed a post-hoc GBM beating our
+    # LEARNED sigma head on 10/11 features (0.214 -> 0.300 within-condition), which CLOSES the
+    # per-claim gap but moves the credit from the sigma head to the post-hoc predictor. The
+    # reviewer's next question is immediate: give the RIDGE the same post-hoc predictor. Arms B
+    # and C share clips, folds and GBM hyperparameters, so B-C isolates our REPRESENTATION.
+    dict(name="abstention_3arm", gpu=False,
+         produces=f"{SH}/abstention_3arm_s73.json",
+         needs=[f"{SH}/aux_sigma_s73.json"],
+         cmd=f"{PY} -u scripts/abstention_3arm.py "
+             f"--aux_sigma {SH}/aux_sigma_s73.json "
+             f"--features_csv {SH}/data/features_corrected_merged/test.csv "
+             f"--pt_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/abstention_3arm_s73.json"),
+
     dict(name="pitch_probe_seed42", gpu=True,
          produces=f"{SH}/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "
@@ -236,8 +285,13 @@ JOBS = [
 ]
 
 
+JOB_BY_NAME = {j['name']: j for j in JOBS}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--cpu_jobs", type=int, default=3,
+                    help="max concurrent CPU-only jobs (not GPU-gated)")
     ap.add_argument("--per_node", type=int, default=2, help="max concurrent jobs per allocation")
     ap.add_argument("--interval", type=int, default=180)
     ap.add_argument("--once", action="store_true")
@@ -351,13 +405,24 @@ def main() -> int:
                     print(f"[skip] {nm}: {why}", flush=True)
                     continue
                 print(f"[gate-pass] {nm}: {why}", flush=True)
-            # LEAST-LOADED, not first-with-capacity. `free[0]` always picked the lowest job ID,
-            # so one allocation was packed to two heavy jobs while another sat idle.
-            free = sorted((n, i) for i, n in slots.items() if n > 0)
-            if not free:
-                status["pending"].append(nm)
-                continue
-            jid = free[-1][1]                       # most free slots wins
+            # CPU-ONLY JOBS MUST NOT QUEUE BEHIND GPU OCCUPANCY. Every job declared a `gpu` flag
+            # but nothing ever read it, so the ridge probes, the sweep scorers and the 3-arm
+            # abstention comparison — none of which touch the GPU — sat blocked whenever the two
+            # GPU slots were busy. They still run via `srun --overlap` (compute-node cores, not
+            # the login node), just against their own concurrency cap.
+            if not j.get("gpu", True):
+                if sum(1 for n in running if not JOB_BY_NAME[n].get("gpu", True)) >= a.cpu_jobs:
+                    status["pending"].append(nm)
+                    continue
+                jid = ids[0]
+            else:
+                # LEAST-LOADED, not first-with-capacity. `free[0]` always picked the lowest job ID,
+                # so one allocation was packed to two heavy jobs while another sat idle.
+                free = sorted((n, i) for i, n in slots.items() if n > 0)
+                if not free:
+                    status["pending"].append(nm)
+                    continue
+                jid = free[-1][1]                   # most free slots wins
             log = f"{SH}/logs/dispatch_{nm}.log"
             # setsid puts the job in its OWN session and process group, so it survives the
             # dispatcher being restarted. Without it the srun children stayed in tmux's process
@@ -372,7 +437,8 @@ def main() -> int:
             subprocess.run(full, shell=True)
             running[nm] = jid
             attempts[nm] = attempts.get(nm, 0) + 1
-            slots[jid] -= 1
+            if j.get("gpu", True):
+                slots[jid] -= 1
             print(f"[launch] {nm} on {jid} (attempt {attempts[nm]}) -> {log}", flush=True)
 
         json.dump(status, open(state_path, "w"), indent=2)
