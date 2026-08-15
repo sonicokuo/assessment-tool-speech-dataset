@@ -202,8 +202,19 @@ def main() -> int:
            f"{'|':>3}{'A eauc':>9}{'B eauc':>9}{'C eauc':>9}{'winner':>10}")
     print("\n" + hdr); print("-" * len(hdr))
     summary, kf = {}, KFold(n_splits=a.folds, shuffle=True, random_state=0)
+    # Resume: reload any completed features so a relaunch continues instead of restarting. Folds
+    # are seeded (random_state=0) so resumed and fresh rows are computed identically.
+    if os.path.exists(a.out + ".partial"):
+        try:
+            summary = json.load(open(a.out + ".partial"))
+            if summary:
+                print(f"[resume] {len(summary)} features already done: {sorted(summary)}", flush=True)
+        except Exception:                                        # noqa: BLE001
+            summary = {}
 
     for j, nm in enumerate(names):
+        if nm in summary:
+            continue                                             # already computed, see [resume]
         ok = np.array([nm in r["gt"] and np.isfinite(r["gt"][nm]) for r in keep])
         if ok.sum() < 300:
             continue
@@ -255,10 +266,12 @@ def main() -> int:
 
         print(f"{nm:<15}{wA:8.3f}{wB:12.3f}{wC:13.3f}{wB - wC:+8.3f}{'|':>3}"
               f"{eA:9.3f}{eB:9.3f}{eC:9.3f}{win:>10}")
-        json.dump(summary, open(a.out + ".partial", "w"), indent=2)
         summary[nm] = {"within_A_sigma": wA, "within_B_ours_gbm": wB, "within_C_ridge_gbm": wC,
                        "within_B_minus_C": wB - wC, "eaurc_A": eA, "eaurc_B": eB, "eaurc_C": eC,
                        "winner": win}
+        # Dump AFTER recording, so the partial always reflects completed work. Each feature costs
+        # ~12 min; without this a restart discards everything done so far, which happened twice.
+        json.dump(summary, open(a.out + ".partial", "w"), indent=2)
 
     for panel, feats in (("ROBUST5", ROBUST5), ("ILL-POSED", ILLPOSED)):
         have = [f for f in feats if f in summary and "within_B_ours_gbm" in summary[f]]
