@@ -361,6 +361,30 @@ JOBS = [
              f"--test_dir {SH}/data/processed_layer7/test "
              f"--out {SH}/temperature_redecode_unmasked.json --n 60 --temps 0.0"),
 
+    # ---- THE REAL ABSTENTION REGRESSION TEST. `emission_unmasked` reads ONLY _s1clean files
+    # (temperature_redecode.py:117-118), where overlap_ratio is exactly 0 and the hedge rule can
+    # never fire — so its 100%-across-the-board result confirms "no collapse on clean" and says
+    # NOTHING about abstention. The question the mask fix raises is whether the model still
+    # WITHHOLDS under overlap (fw2: f0 coverage 99.0% clean vs 2.1% overlap). Only a mixed
+    # clean+mixture decode answers that, because coverage must be split BY CONDITION.
+    dict(name="freedecode_unmasked", gpu=True,
+         produces=f"{SH}/freedecode_unmasked_s73.DONE",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
+         cmd=f"{PY} -u src/inference.py "
+             f"--config {RV}/configs/config.l7audioonly.s73.unmasked.yaml "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test --top_k 1 --start 0 --end 600 "
+             f"--out {SH}/freedecode_unmasked_s73.json "
+             f"&& touch {SH}/freedecode_unmasked_s73.DONE"),
+
+    dict(name="score_freedecode_unmasked", gpu=False,
+         produces=f"{SH}/freedecode_unmasked_s73.scored.txt",
+         needs=[f"{SH}/freedecode_unmasked_s73.DONE"],
+         cmd=f"{PY} -u scripts/score_matched_test.py "
+             f"--features_csv {SH}/data/features_corrected_merged/test.csv "
+             f"{SH}/data/descriptions_corrected_fw2.json {SH}/freedecode_unmasked_s73.json "
+             f"> {SH}/freedecode_unmasked_s73.scored.txt 2>&1"),
+
     dict(name="pitch_probe_seed42", gpu=True,
          produces=f"{SH}/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "
