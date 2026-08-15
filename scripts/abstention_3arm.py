@@ -146,10 +146,14 @@ def main() -> int:
     print(f"clips: {len(keep)}", flush=True)
 
     X = []
-    for r in keep:
+    for i, r in enumerate(keep):
         af = torch.load(os.path.join(a.pt_dir, r["stem"] + ".pt"),
                         map_location="cpu", weights_only=False)["audio_features"].float()
         X.append(np.concatenate([af.mean(0).numpy(), af.std(0).numpy()]).astype(np.float32))
+        # heartbeat: the dispatcher treats a stale log as a dead job and relaunches it, which
+        # spawned a duplicate writer on the same --out path twice. Loading is minutes of silence.
+        if (i + 1) % 250 == 0:
+            print(f"  loaded {i + 1}/{len(keep)}", flush=True)
     X = np.stack(X)
     X = (X - X.mean(0)) / (X.std(0) + 1e-6)
     is_clean = np.array([r["stem"].endswith("_s1clean") for r in keep])
@@ -204,6 +208,8 @@ def main() -> int:
         sg = np.array([r["sigma"][j] if r["sigma"].size > j else np.nan
                        for r, k in zip(keep, ok) if k])
         Xf, cl = X[ok], is_clean[ok]
+        print(f"  [{j + 1}/{len(names)}] fitting {nm} (n={int(ok.sum())}) ...",
+              flush=True)
 
         # VOID a feature whose GT is constant in EITHER condition: there err = |yhat - const| is
         # a deterministic function of the predictor's own input, and every arm scores spuriously.

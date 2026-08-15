@@ -350,10 +350,17 @@ def main() -> int:
     state_path = f"{SH}/dispatcher_state.json"
     running: dict[str, str] = {}                        # job name -> jobid
     attempts: dict[str, int] = {}                       # job name -> launches so far
+    # Persisted launch times (job name -> epoch seconds). In-memory state dies with a
+    # dispatcher restart, which is exactly when duplicate launches happen.
+    ledger_path = f"{SH}/logs/dispatch_ledger.json"
+    try:
+        ledger: dict[str, float] = json.load(open(ledger_path))
+    except Exception:                                   # noqa: BLE001
+        ledger = {}
     failed: dict[str, str] = {}                         # job name -> why it was given up on
     MAX_ATTEMPTS = 2
 
-    def in_flight(job, stale_after: int = 900) -> bool:
+    def in_flight(job, stale_after: int = 2400) -> bool:
         """Is this job ALREADY running, possibly launched by a previous dispatcher instance?
 
         Restarting the dispatcher must not duplicate work: a second copy of a job wastes a node
@@ -362,6 +369,18 @@ def main() -> int:
         being RECENTLY WRITTEN. A live job prints progress; a finished one has its marker; a dead
         one goes stale and becomes eligible again.
         """
+        # ⚠️ A MISSING LOG MUST NOT RESURRECT A LIVE JOB. Log mtime alone was the only liveness
+        # signal, so removing two logs by hand spawned a SECOND `abstention_3arm` beside the
+        # running one, both writing the same --out path. The launch ledger below is persisted
+        # across dispatcher restarts and cannot be affected by log manipulation.
+        #
+        # NOT pgrep: `pgrep -f <pattern>` excludes only ITSELF, not the `sh -c` wrapper
+        # subprocess spawns — whose argv contains the pattern. Every check would return >=1,
+        # every job would look permanently in flight, and the dispatcher would deadlock and
+        # never launch anything again. Verified before shipping; do not reintroduce it.
+        started = ledger.get(job["name"])
+        if started and (time.time() - started) < stale_after and not crashed(job):
+            return True
         log = f"{SH}/logs/dispatch_{job['name']}.log"
         if not os.path.exists(log):
             return False
@@ -489,6 +508,11 @@ def main() -> int:
             attempts[nm] = attempts.get(nm, 0) + 1
             if j.get("gpu", True):
                 slots[jid] -= 1
+            ledger[nm] = time.time()
+            try:
+                json.dump(ledger, open(ledger_path, "w"))
+            except Exception:                           # noqa: BLE001
+                pass
             print(f"[launch] {nm} on {jid} (attempt {attempts[nm]}) -> {log}", flush=True)
 
         json.dump(status, open(state_path, "w"), indent=2)
