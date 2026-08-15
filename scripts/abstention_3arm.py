@@ -173,7 +173,11 @@ def main() -> int:
         arms alike, which SHRINKS |B-C| — conservative for the claim we would like to make.
         """
         c = np.zeros_like(err)
-        for tr, te in kf.split(Xf):
+        for k, (tr, te) in enumerate(kf.split(Xf)):
+            # Per-FOLD heartbeat, not just per-feature. A single feature's fits take ~12 min, so
+            # a per-feature heartbeat still leaves the log silent long enough for the dispatcher
+            # to call the job dead and relaunch it — which cost ~15 min of work once already.
+            print(f"      fold {k + 1}/{kf.get_n_splits()}", flush=True)
             pca = PCA(n_components=min(n_pca, Xf[tr].shape[0], Xf.shape[1]),
                       svd_solver="randomized", random_state=0).fit(Xf[tr])
             # the point estimate is appended AFTER projection so it is never diluted by it

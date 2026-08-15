@@ -317,7 +317,12 @@ JOBS = [
          cmd=f"{PY} -u src/inference.py "
              f"--config {RV}/configs/config.l7audioonly.s73.fw2RETRAIN.yaml "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
-             f"--test_dir {SH}/data/processed_layer7/test --top_k 1 --start 0 --end 1500 "
+             # 600, NOT 1500: this shares ONE GPU with the unmasked retrain, which is the
+             # decisive experiment and needs ~7.3h of a ~9h window. 600 clips (~300 per
+             # condition, since sorted order interleaves each mixture with its twin) still
+             # gives a usable panel; inference.py auto-resumes, so clips already generated
+             # are kept. Report n with the panel.
+             f"--test_dir {SH}/data/processed_layer7/test --top_k 1 --start 0 --end 600 "
              f"--out {SH}/freedecode_fw2_s73.json "
              f"&& touch {SH}/freedecode_fw2_s73.DONE"),
 
