@@ -72,15 +72,30 @@ def main() -> int:
 
     tok = AutoTokenizer.from_pretrained(lm_name)
     llm = AutoModelForCausalLM.from_pretrained(lm_name, dtype=torch.bfloat16).to(a.device).eval()
-    if ck.get("lora_state_dict"):
-        from peft import LoraConfig, get_peft_model
-        lc = LoraConfig(r=cfg.get("lora_r", 16), lora_alpha=cfg.get("lora_alpha", 32),
-                        target_modules=cfg.get("lora_target_modules",
-                                               ["q_proj", "k_proj", "v_proj", "o_proj"]),
-                        lora_dropout=0.0, task_type="CAUSAL_LM")
-        llm = get_peft_model(llm, lc)
-        llm.load_state_dict(ck["lora_state_dict"], strict=False)
-        print("[lora] loaded", flush=True)
+    # ⚠️ USE THE CANONICAL LOADERS. The first version hand-rolled a LoraConfig with GUESSED
+    # target_modules and called load_state_dict(..., strict=False) without checking the result.
+    # Nothing loaded, the script silently probed the BASE model, and it produced a confident
+    # "COLLAPSED PRIOR" verdict from generic prose containing no numeric claims at all. That is
+    # the 4th occurrence of the load-with-strict=False-and-never-check bug class in this repo
+    # (inference.py, reliability_head, run_m3b_deletion). Mirror inference.py exactly instead.
+    from peft import LoraConfig, get_peft_model
+
+    from data.ckpt_io import load_llm_state_dict
+    from model.peft_config import lora_config_kwargs
+
+    merged_cfg = {**cfg_yaml, **cfg}
+    llm_sd = ck.get("llm_state_dict") or ck.get("lora_state_dict")
+    if llm_sd:
+        llm = get_peft_model(llm, LoraConfig(**lora_config_kwargs(merged_cfg)))
+        _missing, _unexpected = load_llm_state_dict(
+            llm, llm_sd, ckpt_format=ck.get("ckpt_format"))
+        if _unexpected:
+            print(f"[fatal] unexpected LLM keys: {list(_unexpected)[:5]}")
+            return 1
+        print(f"[lora] loaded (missing={len(list(_missing))} unexpected=0)", flush=True)
+    else:
+        print("[fatal] checkpoint has neither llm_state_dict nor lora_state_dict")
+        return 1
 
     adapter = build_adapter(
         variant=cfg.get("adapter_variant", "attn-concat"),
@@ -106,6 +121,11 @@ def main() -> int:
     pats = [(n, re.compile(p, re.I)) for n, p in PATTERNS]
     out, counts = [], {t: {n: 0 for n, _ in PATTERNS} for t in temps}
     hedge_ct = {t: 0 for t in temps}
+    # POSITIVE CONTROL, checked after the first clip: a correctly-loaded model emits "The SNR
+    # is <x> dB" on essentially every clip (measured 100% coverage). If it does not, the LoRA
+    # did not take and every verdict below is about the BASE model — abort rather than print a
+    # confident answer, which is exactly what the previous version did.
+    control_ok = None
 
     for i, fn in enumerate(files):
         d = torch.load(os.path.join(a.test_dir, fn), map_location="cpu", weights_only=False)
@@ -132,6 +152,16 @@ def main() -> int:
                 if HEDGE.search(txt):
                     hedge_ct[t] += 1
         out.append(rec)
+        if control_ok is None:
+            g0 = rec.get(f"gen_T{temps[0]}", "")
+            control_ok = bool(re.search(r"SNR is", g0, re.I))
+            print(f"[control] first clip emits an SNR clause: {control_ok}", flush=True)
+            if not control_ok:
+                print("[fatal] the model produced no SNR clause — the fine-tuned weights are "
+                      "NOT active. Any coverage verdict from this run would describe the base "
+                      "model. Sample of what it generated:")
+                print(f"        {g0[:220]!r}")
+                return 1
         if (i + 1) % 25 == 0:
             print(f"  {i+1}/{len(files)}", flush=True)
 

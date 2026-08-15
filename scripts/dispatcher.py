@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""dispatcher.py — autonomous job queue for the PSC nodes. Keeps nothing idle.
+
+WHY THIS EXISTS
+Nodes were sitting idle between jobs because every launch was manual: a job would finish, and
+nothing started until someone noticed. This runs ON PSC in a loop, so progress continues whether
+or not any interactive session is alive, and it survives disconnects.
+
+HOW IT WORKS
+Each job declares what it PRODUCES (a marker file) and what it NEEDS (marker files that must
+already exist). The loop repeatedly:
+  1. drops jobs whose `produces` already exists  (idempotent — safe to restart any time)
+  2. finds jobs whose `needs` are all satisfied
+  3. launches them onto any allocation with spare capacity
+  4. records state to a status JSON that an outside watcher can read
+
+Prerequisites are FILES, not job IDs, so a job that was run by hand still satisfies its
+dependents, and a crashed job simply re-runs on the next pass.
+
+BRANCHING ON RESULTS
+Some jobs are gated on a NUMERIC outcome, not merely on a file existing (e.g. "only train MDN if
+the oracle error ceiling is >= 0.30"). Those declare a `gate` callable that reads the upstream
+JSON and returns True/False. A gate that returns False parks the job as SKIPPED with its reason
+recorded, so the plan's decision tree executes itself instead of waiting for a human.
+
+SAFETY
+* never scancels an allocation — those are the author's.
+* one launch per job per pass; a job already running (tracked by marker-in-progress) is not
+  relaunched.
+* every command is wrapped so its stdout lands in a per-job log under $SH/logs/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import time
+
+SH = "/ocean/projects/cis260125p/shared"
+RV = f"{SH}/repo_verify"
+PY = f"{SH}/envs/project/bin/python"
+ENV = f"export HF_HOME={SH}/hf_cache HF_HUB_OFFLINE=1 PYTHONPATH={RV}/src"
+
+
+def sh(cmd: str, timeout: int = 60) -> str:
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=timeout).stdout.strip()
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def live_jobids() -> list[str]:
+    out = sh("squeue -u slin32 -h -o '%i %T' ")
+    return [ln.split()[0] for ln in out.splitlines()
+            if len(ln.split()) > 1 and ln.split()[1] == "RUNNING"]
+
+
+# ---------------------------------------------------------------- result gates
+def gate_ceiling_high(_):
+    """Q9 (MDN / residual head) runs only if per-claim ranking is ACHIEVABLE.
+
+    Reads the oracle error-ceiling result. >= 0.30 within-condition on any feature means the
+    information exists and sigma is merely weak -> the upgrades are justified. Below that they
+    would be chasing noise, so the job parks itself with the reason recorded.
+    """
+    p = f"{SH}/oracle_error_ceiling.json"
+    if not os.path.exists(p):
+        return None                                   # upstream not ready yet
+    try:
+        d = json.load(open(p))
+    except Exception:                                 # noqa: BLE001
+        return None
+    best = max((v.get("within") or 0.0) for v in d.values() if isinstance(v, dict))
+    return (best >= 0.30, f"max within-condition ceiling = {best:.3f}")
+
+
+JOBS = [
+    # ---- CPU, no GPU needed; these must never wait on a node ----
+    dict(name="zeroed_overlap_recapture", gpu=True,
+         produces=f"{SH}/saliency_zeroovl_test.npz", needs=[],
+         cmd=f"{PY} -u scripts/capture_saliency.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/saliency_zeroovl_test.npz --features f0_sd,f0_mean "
+             f"--zero_overlap --limit 600"),
+
+    dict(name="aux_sigma_dev", gpu=True,
+         produces=f"{SH}/aux_sigma_s73_dev.json", needs=[],
+         cmd=f"{PY} -u scripts/dump_aux_sigma.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/val "
+             f"--out {SH}/aux_sigma_s73_dev.json"),
+
+    dict(name="aux_readout_L24_audioonly", gpu=True,
+         produces=f"{SH}/aux_l24audioonly_s73.json", needs=[],
+         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+             f"{SH}/checkpoints/full/audioonly_attnconcat_seed73/best.pt "
+             f"{SH}/data/processed_corrected/test "
+             f"{SH}/data/features_corrected_merged/test.csv "
+             f"{SH}/aux_l24audioonly_s73.json 0 zero_overlap"),
+
+    # ---- gated on a NUMERIC upstream result ----
+    dict(name="mdn_or_residual_head", gpu=True, gate=gate_ceiling_high,
+         produces=f"{SH}/residual_head_s73.json",
+         needs=[f"{SH}/oracle_error_ceiling.json", f"{SH}/aux_sigma_s73.json"],
+         cmd=f"{PY} -u scripts/residual_error_head.py "
+             f"--aux_sigma {SH}/aux_sigma_s73.json "
+             f"--features_csv {SH}/data/features_corrected_merged/test.csv "
+             f"--pt_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/residual_head_s73.json"),
+
+    # ---- Q1 METHODS SWEEP: the genre invariant. Every accepted comparator swept the METHODS
+    # axis (min ~5, typically 8-11); we own the instrument and have never pointed it at a
+    # population of methods. capture_saliency already implements three with the D1 sign fix
+    # (signed sum for contribution-type methods, norm only for the sensitivity variant).
+    dict(name="sweep_grad", gpu=True,
+         produces=f"{SH}/sweep_grad_test.npz", needs=[],
+         cmd=f"{PY} -u scripts/capture_saliency.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test --method grad --zero_overlap "
+             f"--features f0_sd,f0_mean,hnr,shimmer,jitter --limit 600 "
+             f"--out {SH}/sweep_grad_test.npz"),
+
+    dict(name="sweep_gradxinput", gpu=True,
+         produces=f"{SH}/sweep_gradxinput_test.npz", needs=[],
+         cmd=f"{PY} -u scripts/capture_saliency.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test --method gradxinput --zero_overlap "
+             f"--features f0_sd,f0_mean,hnr,shimmer,jitter --limit 600 "
+             f"--out {SH}/sweep_gradxinput_test.npz"),
+
+    dict(name="sweep_ig", gpu=True,
+         produces=f"{SH}/sweep_ig_test.npz", needs=[],
+         cmd=f"{PY} -u scripts/capture_saliency.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test --method ig --zero_overlap "
+             f"--features f0_sd,f0_mean,hnr,shimmer,jitter --limit 600 "
+             f"--out {SH}/sweep_ig_test.npz"),
+
+    # Scoring is gated on the captures: each map is scored against the EXACT oracle map with
+    # trivial-null flooring and the resolution ceiling, so a number is only interpretable
+    # relative to (ceiling - worst_null).
+    dict(name="score_sweep_gradxinput", gpu=False,
+         produces=f"{SH}/score_sweep_gradxinput.txt",
+         needs=[f"{SH}/sweep_gradxinput_test.npz"],
+         cmd=f"{PY} -u scripts/score_attribution.py --oracle {SH}/oracle_maps_test.npz "
+             f"--model_maps {SH}/sweep_gradxinput_test.npz --feature f0_sd "
+             f"> {SH}/score_sweep_gradxinput.txt"),
+
+    dict(name="score_sweep_ig", gpu=False,
+         produces=f"{SH}/score_sweep_ig.txt",
+         needs=[f"{SH}/sweep_ig_test.npz"],
+         cmd=f"{PY} -u scripts/score_attribution.py --oracle {SH}/oracle_maps_test.npz "
+             f"--model_maps {SH}/sweep_ig_test.npz --feature f0_sd "
+             f"> {SH}/score_sweep_ig.txt"),
+
+    # ---- n=1 -> n=2 on the causal result. The f0_mean CAUSAL finding (b_int 0.377 vs b_within
+    # 0.052) is currently ONE seed; the calibration says no accepted comparator had n=1 on its
+    # flagship. Replicating on seed 42 is the cheapest breadth purchase available.
+    # ---- THE MOST DANGEROUS UN-RUN BASELINE. Our AURC gains are measured against emit-always
+    # only. The honest comparison is a ridge EQUIPPED with its own error predictor (a bare ridge
+    # has 100% coverage and cannot abstain). If it wins the ill-posed panel, contribution III is
+    # not a contribution on this corpus. A reviewer builds this in an afternoon — have it first.
+    dict(name="uq_ridge_baseline", gpu=False,
+         produces=f"{SH}/uq_ridge_baseline.json",
+         needs=[f"{SH}/aux_sigma_s73.json"],
+         cmd=f"{PY} -u scripts/uq_ridge_baseline.py "
+             f"--aux_sigma {SH}/aux_sigma_s73.json "
+             f"--features_csv {SH}/data/features_corrected_merged/test.csv "
+             f"--pt_dir {SH}/data/processed_layer7/test "
+             f"--out {SH}/uq_ridge_baseline.json"),
+
+    dict(name="pitch_probe_seed42", gpu=True,
+         produces=f"{SH}/pitch_intervention_s42.json", needs=[],
+         cmd=f"{PY} -u scripts/pitch_intervention.py "
+             f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed42/best.pt "
+             f"--test_dir {SH}/data/processed_layer7/test "
+             f"--clean_dir {SH}/data/audio_corrected/test-s1clean "
+             f"--out {SH}/pitch_intervention_s42.json --n 40"),
+]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--per_node", type=int, default=2, help="max concurrent jobs per allocation")
+    ap.add_argument("--interval", type=int, default=180)
+    ap.add_argument("--once", action="store_true")
+    a = ap.parse_args()
+
+    state_path = f"{SH}/dispatcher_state.json"
+    running: dict[str, str] = {}                        # job name -> jobid
+    attempts: dict[str, int] = {}                       # job name -> launches so far
+    failed: dict[str, str] = {}                         # job name -> why it was given up on
+    MAX_ATTEMPTS = 2
+
+    def in_flight(job, stale_after: int = 900) -> bool:
+        """Is this job ALREADY running, possibly launched by a previous dispatcher instance?
+
+        Restarting the dispatcher must not duplicate work: a second copy of a job wastes a node
+        and, for jobs that write one JSON, two writers can race on the same path. State lives in
+        memory, so it does not survive a restart — instead infer liveness from the job's log
+        being RECENTLY WRITTEN. A live job prints progress; a finished one has its marker; a dead
+        one goes stale and becomes eligible again.
+        """
+        log = f"{SH}/logs/dispatch_{job['name']}.log"
+        if not os.path.exists(log):
+            return False
+        return (time.time() - os.path.getmtime(log)) < stale_after
+
+    def crashed(job) -> str | None:
+        """A job that exits WITHOUT writing its marker has crashed. Relaunching once is right
+        (nodes die, files lock); relaunching forever is a loop on a broken script. Report the
+        actual error so a human reads a cause, not a silence."""
+        log = f"{SH}/logs/dispatch_{job['name']}.log"
+        if not os.path.exists(log):
+            return None
+        try:
+            tail = open(log, errors="ignore").read()[-4000:]
+        except Exception:                                # noqa: BLE001
+            return None
+        # "forcing job termination" is included because a killed job WRITES that line, which
+        # refreshes its log mtime and would otherwise make `in_flight()` treat a corpse as
+        # running for the full staleness window.
+        for marker in ("Traceback (most recent call last)", "[fatal]",
+                       "CUDA out of memory", "srun: error",
+                       "forcing job termination", "slurmstepd: error"):
+            if marker in tail:
+                line = next((ln.strip() for ln in reversed(tail.splitlines())
+                             if marker.split("(")[0].strip() in ln or ln.startswith(marker)),
+                            marker)
+                return line[:200]
+        return None
+
+    while True:
+        ids = live_jobids()
+        if not ids:
+            print("[dispatch] no RUNNING allocations; waiting", flush=True)
+        # a job is finished when its marker exists; drop it from the running set
+        for nm in list(running):
+            j = next((x for x in JOBS if x["name"] == nm), None)
+            if not j:
+                running.pop(nm, None)
+                continue
+            if os.path.exists(j["produces"]):
+                print(f"[done] {nm}", flush=True)
+                running.pop(nm, None)
+                continue
+            why = crashed(j)
+            if why:
+                running.pop(nm, None)
+                if attempts.get(nm, 0) >= MAX_ATTEMPTS:
+                    failed[nm] = why
+                    print(f"[FAILED] {nm} after {attempts[nm]} attempts: {why}", flush=True)
+                else:
+                    print(f"[retry] {nm} (attempt {attempts.get(nm, 0)}): {why}", flush=True)
+
+        slots = {i: a.per_node for i in ids}
+        for nm, jid in running.items():
+            if jid in slots:
+                slots[jid] -= 1
+
+        status = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "allocations": ids,
+                  "running": dict(running), "done": [], "skipped": {}, "pending": [],
+                  "failed": dict(failed), "attempts": dict(attempts)}
+
+        for j in JOBS:
+            nm = j["name"]
+            if os.path.exists(j["produces"]):
+                status["done"].append(nm)
+                continue
+            if nm in running or nm in failed:
+                continue
+            if in_flight(j):
+                # adopted from a previous dispatcher instance (or this one, pre-restart)
+                running.setdefault(nm, "adopted")
+                status["running"][nm] = "adopted"
+                continue
+            if not all(os.path.exists(n) for n in j["needs"]):
+                status["pending"].append(nm)
+                continue
+            g = j.get("gate")
+            if g:
+                res = g(j)
+                if res is None:
+                    status["pending"].append(nm)
+                    continue
+                ok, why = res
+                if not ok:
+                    status["skipped"][nm] = why
+                    print(f"[skip] {nm}: {why}", flush=True)
+                    continue
+                print(f"[gate-pass] {nm}: {why}", flush=True)
+            free = [i for i, n in slots.items() if n > 0]
+            if not free:
+                status["pending"].append(nm)
+                continue
+            jid = free[0]
+            log = f"{SH}/logs/dispatch_{nm}.log"
+            # setsid puts the job in its OWN session and process group, so it survives the
+            # dispatcher being restarted. Without it the srun children stayed in tmux's process
+            # group and a `tmux kill-session` SIGTERM'd them mid-run — observed as
+            # "srun: forcing job termination" truncating a completed analysis. `< /dev/null`
+            # detaches stdin so nothing blocks on a closed terminal.
+            full = (f"setsid nohup srun --jobid={jid} --overlap bash -c "
+                    f"'{ENV}; cd {RV} && {j['cmd']}' > {log} 2>&1 < /dev/null &")
+            # truncate the log on (re)launch so `crashed()` reads THIS attempt's output, not a
+            # stale traceback from the previous one — otherwise a retry is instantly marked dead
+            open(log, "w").close()
+            subprocess.run(full, shell=True)
+            running[nm] = jid
+            attempts[nm] = attempts.get(nm, 0) + 1
+            slots[jid] -= 1
+            print(f"[launch] {nm} on {jid} (attempt {attempts[nm]}) -> {log}", flush=True)
+
+        json.dump(status, open(state_path, "w"), indent=2)
+        if a.once:
+            return 0
+        time.sleep(a.interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

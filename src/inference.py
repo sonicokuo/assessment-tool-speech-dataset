@@ -628,14 +628,23 @@ def evaluate(config: dict, checkpoint_path: str, test_dir: str) -> None:
         return train_v if train_v is not None else (yaml_v if yaml_v is not None else default)
 
     zero_overlap = bool(_pipeline_flag("zero_overlap_input", False))
+    # ⚠️ `descriptions_path` MUST go through _pipeline_flag too. Passing it straight from the eval
+    # YAML is how three arms were believed to have trained on `fw2` when their checkpoints record
+    # `fw` — the `.fw2.yaml` configs were written a DAY AFTER those runs finished and only ever
+    # repointed EVAL. Because nothing ever read the checkpoint's own `descriptions_path`, a
+    # target-set defect (zero clean-clip f0/hnr/shimmer supervision) was misdiagnosed as a model
+    # failure ("coverage collapse") and three diagnostics were built on the false premise.
+    # The warning this now prints is the entire fix.
+    train_desc = _pipeline_flag("descriptions_path", None)
     test_set = PreprocessedDataset(
         test_dir,
-        config.get("descriptions_path"),
+        train_desc,
         zero_overlap_input=zero_overlap,
     )
     assert len(test_set) > 0, f"No .pt files in {test_dir}"
     print(f"Test set: {len(test_set)} samples from {test_dir}  "
-          f"zero_overlap_input={zero_overlap}")
+          f"zero_overlap_input={zero_overlap}\n"
+          f"[provenance] TRAINED on {os.path.basename(str(train_desc))}")
     if zero_overlap:
         # Positive control: with the channel zeroed the abstain gate's overlap_ratio is 0.0
         # for EVERY clip, so the hard-coded `overlap_ratio >= HEDGE_OVERLAP_TAU` rule in
