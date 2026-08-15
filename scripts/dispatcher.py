@@ -307,19 +307,25 @@ JOBS = [
     # 98.3% (G.2r), so band-free SRCC + nMAE + COVERAGE vs INSTRUMENT GT is now well-defined on
     # all 11 features. Sorted order interleaves each mixture with its _s1clean twin, so a
     # 1500-clip prefix is ~750 of each rather than one condition.
+    # ⚠️ THE MARKER, NOT THE JSON. inference.py flushes every 50 clips (atomic tmp->rename), so
+    # the .json EXISTS while the run is 50/1500 done. Depending on it meant the scorer would fire
+    # on a partial file and emit a confident 50-clip panel; `produces` pointing at it also meant
+    # a crashed run would never relaunch. The marker is written only on a zero-exit run.
+    # Relaunch is safe either way: inference.py auto-resumes, skipping already-scored filenames.
     dict(name="freedecode_fw2_s73", gpu=True,
-         produces=f"{SH}/freedecode_fw2_s73.json", needs=[],
+         produces=f"{SH}/freedecode_fw2_s73.DONE", needs=[],
          cmd=f"{PY} -u src/inference.py "
              f"--config {RV}/configs/config.l7audioonly.s73.fw2RETRAIN.yaml "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test --top_k 1 --start 0 --end 1500 "
-             f"--out {SH}/freedecode_fw2_s73.json"),
+             f"--out {SH}/freedecode_fw2_s73.json "
+             f"&& touch {SH}/freedecode_fw2_s73.DONE"),
 
     # Scored against the INSTRUMENT CSV (the default), so the parser touches predictions only
     # and no value is laundered through the verbalizer into "truth".
     dict(name="score_freedecode_fw2", gpu=False,
          produces=f"{SH}/freedecode_fw2_s73.scored.txt",
-         needs=[f"{SH}/freedecode_fw2_s73.json"],
+         needs=[f"{SH}/freedecode_fw2_s73.DONE"],
          cmd=f"{PY} -u scripts/score_matched_test.py "
              f"--features_csv {SH}/data/features_corrected_merged/test.csv "
              f"{SH}/data/descriptions_corrected_fw2.json {SH}/freedecode_fw2_s73.json "
