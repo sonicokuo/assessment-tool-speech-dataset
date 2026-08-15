@@ -275,6 +275,32 @@ JOBS = [
              f"--pt_dir {SH}/data/processed_layer7/test "
              f"--out {SH}/abstention_3arm_s73.json"),
 
+    # ---- G.2q: THE DECISIVE LEVER FOR THE ILL-POSED PANEL. The aux-MSE hedge mask supervises
+    # f0_mean/f0_sd/jitter/shimmer/hnr on CLEAN CLIPS ONLY (overlap>=0.5 covers 99.1% of
+    # mixtures), to avoid "mix-noisy" values that are BYTE-IDENTICAL to the clean twin's GT.
+    # The ridge trains on 100% of clips and beats us on exactly those five (0.5153 vs 0.4605).
+    # fw2 could not test this — the mask is overlap-driven, not target-driven. Prose/nums
+    # hedging and the sigma head are untouched, so contribution 2's abstention is preserved.
+    dict(name="retrain_unmasked_s73", gpu=True,
+         produces=f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE",
+         needs=[],
+         cmd=(f"L={SH}/checkpoints/full/l7audioonly_unmasked_seed73/last.pt; "
+              f"R=\"\"; [ -f \"$L\" ] && R=\"--resume_from $L\"; "
+              f"{PY} -u src/train.py "
+              f"--config {RV}/configs/config.l7audioonly.s73.unmasked.yaml $R "
+              f"&& touch {SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE")),
+
+    # Matched readout: same command as the fw/fw2 rows, so the ill-posed panel is comparable
+    # against the tuned L7 ridge (0.5153) on the identical 6000 clips.
+    dict(name="aux_readout_unmasked_s73", gpu=True,
+         produces=f"{SH}/aux_l7_unmasked_s73.json",
+         needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
+         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+             f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
+             f"{SH}/data/processed_layer7/test "
+             f"{SH}/data/features_corrected_merged/test.csv "
+             f"{SH}/aux_l7_unmasked_s73.json 0 zero_overlap"),
+
     dict(name="pitch_probe_seed42", gpu=True,
          produces=f"{SH}/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "

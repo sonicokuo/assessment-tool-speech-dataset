@@ -1064,9 +1064,20 @@ def compute_loss(
         # and nums targets. The heteroscedastic NLL below keeps the FULL presence mask so the
         # sigma head still sees the hard pairs and learns high sigma there. hedge_mask is bool
         # (True where abstained); absent -> falls back to the plain presence mask.
+        # ⚠️ `hedge_mask_aux_mse: false` DECOUPLES the point-estimate channel from the prose
+        # hedge, and the rationale above is FALSE for this corpus. The mask drops the 5
+        # ill-posed features on every clip with overlap_ratio >= 0.5 — 99.1% of test mixtures,
+        # while clean clips sit at exactly 0 — so those heads are supervised on CLEAN CLIPS
+        # ONLY, roughly half the data. The stated reason is to avoid "mix-noisy F0/voice
+        # values", but f0_mean, f0_sd, jitter, shimmer and hnr are all measured on the CLEAN
+        # STEM and are BYTE-IDENTICAL between each mixture and its _s1clean twin. There is no
+        # mix-noisy value to avoid: the target is the same number either way. Meanwhile the
+        # ridge baseline trains on 100% of clips and beats us on exactly these five features.
+        # Hedging the PROSE stays on — that is contribution 2's abstention behaviour and is
+        # unaffected; only the regression channel stops throwing away half its signal.
         gt_mask_b = gt_mask.to(device)
         hedge_b = batch.get("hedge_mask") if batch is not None else None
-        if hedge_b is not None:
+        if hedge_b is not None and bool(config.get("hedge_mask_aux_mse", True)):
             mse_mask_d = (gt_mask_b & ~hedge_b.to(device)).to(scalar_pred.dtype)
         else:
             mse_mask_d = gt_mask_b.to(scalar_pred.dtype)

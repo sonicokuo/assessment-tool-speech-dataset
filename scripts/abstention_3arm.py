@@ -192,9 +192,22 @@ def main() -> int:
             summary[nm] = {"voided": "constant GT within condition"}
             continue
 
+        # ⚠️ THE BASELINE MUST BE TUNED OR THE COMPARISON IS RIGGED. An untuned alpha=10 ridge is
+        # NOT the baseline of record — the project's own layer sweep found a TUNED layer-7 ridge
+        # beats our aux head (margin -0.0134), so handicapping arm C here would manufacture a
+        # win for arm B. alpha is selected per feature on an INNER split of the training fold
+        # only, so the test fold stays untouched and no arm sees more data than another.
         yh_ridge = np.zeros_like(y)
         for tr, te in kf.split(Xf):
-            yh_ridge[te] = Ridge(alpha=10.0).fit(Xf[tr], y[tr]).predict(Xf[te])
+            n_in = int(0.8 * tr.size)
+            fit_i, val_i = tr[:n_in], tr[n_in:]
+            best_a, best_e = 10.0, np.inf
+            for alpha in (0.1, 1.0, 10.0, 100.0, 1000.0):
+                e = float(np.mean(np.abs(
+                    Ridge(alpha=alpha).fit(Xf[fit_i], y[fit_i]).predict(Xf[val_i]) - y[val_i])))
+                if e < best_e:
+                    best_a, best_e = alpha, e
+            yh_ridge[te] = Ridge(alpha=best_a).fit(Xf[tr], y[tr]).predict(Xf[te])
 
         err_o, err_r = np.abs(yh_ours - y), np.abs(yh_ridge - y)
         confB = posthoc(Xf, yh_ours, err_o, kf)
