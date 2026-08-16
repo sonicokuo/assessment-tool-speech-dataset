@@ -107,7 +107,7 @@ JOBS = [
 
     dict(name="aux_readout_L24_audioonly", gpu=True,
          produces=f"{SH}/results/arms/aux_l24audioonly_s73.json", needs=[],
-         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+         cmd=f"{PY} -u scripts/aux_repool.py "
              f"{SH}/checkpoints/full/audioonly_attnconcat_seed73/best.pt "
              f"{SH}/data/processed_corrected/test "
              f"{SH}/data/features_corrected_merged/test.csv "
@@ -234,7 +234,7 @@ JOBS = [
     dict(name="aux_readout_fw2_s73", gpu=True,
          produces=f"{SH}/results/arms/aux_l7_fw2_s73.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/TRAINING_COMPLETE"],
-         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+         cmd=f"{PY} -u scripts/aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
@@ -243,7 +243,7 @@ JOBS = [
     dict(name="aux_readout_fw2_s42", gpu=True,
          produces=f"{SH}/results/arms/aux_l7_fw2_s42.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed42/TRAINING_COMPLETE"],
-         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+         cmd=f"{PY} -u scripts/aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_fw2_seed42/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
@@ -307,7 +307,7 @@ JOBS = [
     dict(name="aux_readout_unmasked_s73", gpu=True,
          produces=f"{SH}/results/arms/aux_l7_unmasked_s73.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
-         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+         cmd=f"{PY} -u scripts/aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
@@ -413,7 +413,7 @@ JOBS = [
     dict(name="aux_readout_unmasked_s42", gpu=True,
          produces=f"{SH}/results/arms/aux_l7_unmasked_s42.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed42/TRAINING_COMPLETE"],
-         cmd=f"cd {SH} && {PY} -u aux_repool.py "
+         cmd=f"{PY} -u scripts/aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_unmasked_seed42/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
