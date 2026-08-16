@@ -17,7 +17,11 @@ import json, sys, glob, os
 
 # PSC shared checkout first as a fallback, then the repo-relative src (inserted last so
 # it wins) — the script now also imports cleanly when run/tested from the repo itself.
-sys.path.insert(0, '/ocean/projects/cis260125p/shared/assessment-tool-redirect/src')
+# REMOVED 2026-08-16: this pointed at $SHARED/assessment-tool-redirect/src, a STALE PSC repo
+# checkout last touched 2026-06-24. The live tree is $SHARED/repo_verify. Importing feature_set
+# from a June checkout is precisely how a "single source of truth" becomes two without anyone
+# noticing — and this file already carried a LATENT-COUPLING FIX comment about that exact class.
+# The repo-relative insert below is sufficient and is what every other script uses.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 from data.feature_set import FEATURE_NAMES  # canonical 11-feature list (single source)
 from eval.sfs import HybridClaimParser, SFSScorer

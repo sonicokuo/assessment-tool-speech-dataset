@@ -62,11 +62,20 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+from data.feature_set import ILL_POSED_UNDER_OVERLAP_FEATURES  # noqa: E402
+from eval.selection_metric import HEADLINE_FEATURES  # noqa: E402
 from data.feature_set import SUPERVISED_FEATURES  # noqa: E402
 from eval.results_io import write_result  # noqa: E402
 
-ROBUST5 = ["snr", "srmr", "speaking_rate", "pause_count", "pause_rate"]
-ILLPOSED = ["f0_mean", "f0_sd", "jitter", "shimmer", "hnr"]
+# Panels derived from the single sources of truth, not retyped. These literals were
+# byte-identical to canonical when this was written (verified 2026-08-16) — the point is that a
+# future edit to feature_set.py can no longer silently disagree with three separate copies.
+# Four defects in this repo came from exactly that: hnr_db/shimmer_pct in the target builder, a
+# short-name GT lookup, slot_frames() ordering, and FEATS in score_matched_test.py which
+# silently reported 7 of 11 features.
+ROBUST5 = list(HEADLINE_FEATURES)
+ILLPOSED = sorted(ILL_POSED_UNDER_OVERLAP_FEATURES)
+
 
 
 def srcc(a, b) -> float:

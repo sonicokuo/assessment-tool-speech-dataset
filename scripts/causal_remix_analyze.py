@@ -39,10 +39,20 @@ import numpy as np
 # "reads the interferer" verdict — the same stale-GT error that invalidated the f0 arm.
 CLEAN_STEM = ("speaking_rate", "pause_count", "pause_rate", "jitter", "shimmer", "hnr")
 MIXTURE = ("f0_mean", "f0_sd", "srmr")
-CSV_COL = {"srmr": "srmr", "speaking_rate": "praat_speaking_rate_syl_sec",
-           "pause_count": "praat_pause_count", "pause_rate": "praat_pause_rate_per_min",
-           "jitter": "jitter_local_pct", "shimmer": "shimmer", "hnr": "hnr",
-           "f0_mean": "f0_mean_hz", "f0_sd": "f0_sd_hz"}
+# Column names DERIVED from the single source of truth, never retyped. The KEY SELECTION stays
+# explicit because it is meaningful (these are the features this test measures); only the
+# short-name -> CSV-column mapping is inherited, so a rename in feature_set.py cannot leave this
+# file silently pointing at a column that no longer exists. That failure mode is why hnr and
+# shimmer were valued in 0 of 39,800 targets.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
+from data.feature_set import SUPERVISED_FEATURES as _SF  # noqa: E402
+_CANON = {(f[0] if isinstance(f, (tuple, list)) else str(f)):
+          (f[1] if isinstance(f, (tuple, list)) and len(f) > 1 else f[0]) for f in _SF}
+
+CSV_COL = {k: _CANON[k] for k in
+           ("srmr", "speaking_rate", "pause_count", "pause_rate", "jitter",
+            "shimmer", "hnr", "f0_mean", "f0_sd")}
 
 
 def boot(v, n=4000, seed=0):
