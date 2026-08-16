@@ -38,6 +38,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from data.feature_set import SUPERVISED_FEATURES  # noqa: E402
+from eval.results_io import write_result  # noqa: E402
 
 ILLPOSED = ["f0_mean", "f0_sd", "jitter", "shimmer", "hnr"]
 ROBUST5 = ["snr", "srmr", "speaking_rate", "pause_count", "pause_rate"]
@@ -154,7 +155,8 @@ def main() -> int:
         if have:
             print(f"\n{panel} mean: clean|mean {np.nanmean([out[f]['clean|mean'] for f in have]):.4f}"
                   f"  all|m+s {np.nanmean([out[f]['all|m+s'] for f in have]):.4f}")
-    json.dump(out, open(a.out, "w"), indent=2)
+    write_result(out, out_path=a.out, producer="ridge_probe_2x2",
+                 checkpoint=getattr(a, "train_dir", None))
     print(f"\nwrote {a.out}")
     print("READ: 'all|mean' vs 'clean|mean' isolates SUPERVISION MASKING; 'clean|m+s' vs")
     print("'clean|mean' isolates POOLING. Our aux head is the clean|mean cell by construction.")

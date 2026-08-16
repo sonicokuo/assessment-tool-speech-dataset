@@ -48,6 +48,16 @@ def probe_json(p: pathlib.Path) -> dict:
         d = d[0] if d and isinstance(d[0], dict) else {}
     if not isinstance(d, dict):
         return out
+    # NEW-STYLE: a _provenance block written by eval.results_io.write_result is authoritative
+    # and needs no guessing. Files predating it fall through to the heuristics below.
+    prov = d.get("_provenance")
+    if isinstance(prov, dict):
+        out["producer"] = str(prov.get("producer") or "?")
+        out["ckpt"] = str(prov.get("arm") or prov.get("checkpoint") or "?")
+        if prov.get("n_clips") is not None:
+            out["n"] = str(prov["n_clips"])
+        return out
+
     for k in CKPT_KEYS:
         if k in d and d[k]:
             v = str(d[k])

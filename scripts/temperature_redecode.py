@@ -40,6 +40,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from model.adapter import build_adapter  # noqa: E402
+from eval.results_io import write_result  # noqa: E402
 
 PATTERNS = [("snr", r"SNR is"), ("srmr", r"SRMR is"), ("hnr", r"HNR is"),
             ("f0_mean", r"F0 mean is"), ("f0_sd", r"F0 standard deviation"),
@@ -191,7 +192,8 @@ def main() -> int:
             v = "matched control (must stay high)"
         print(f"{nm:<16}" + "".join(f"{x:9.1f}%" for x in row) + f"   {v}")
     print(f"{'hedge phrase':<16}" + "".join(f"{100.0 * hedge_ct[t] / n:9.1f}%" for t in temps))
-    json.dump(out, open(a.out, "w"))
+    write_result(out, out_path=a.out, producer="temperature_redecode",
+                 checkpoint=a.checkpoint, n=len(out))
     print(f"\nwrote {a.out}  n={len(out)}")
     return 0
 

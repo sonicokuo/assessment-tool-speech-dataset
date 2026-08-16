@@ -33,6 +33,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from data.feature_set import SUPERVISED_FEATURES  # noqa: E402
+from eval.results_io import write_result  # noqa: E402
 
 
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
@@ -148,7 +149,8 @@ def main() -> int:
         out[nm] = {r["stem"]: float(p_) for r, p_ in
                    zip([r for r, k in zip(keep, ok) if k], pred.tolist())}
 
-    json.dump({"summary": summary, "predicted_abs_error": out}, open(a.out, "w"))
+    write_result({"summary": summary, "predicted_abs_error": out}, out_path=a.out,
+                 producer="residual_error_head", checkpoint=a.aux_sigma, n=len(keep))
     print(f"\nwrote {a.out}")
     print("READ: `predicted_abs_error` drops into slot_decode(abstain_mask=...) as the gate")
     print("signal in place of sigma. A positive delta means abstention improves with NO retrain.")

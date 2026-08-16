@@ -37,6 +37,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from data.feature_set import SUPERVISED_FEATURES  # noqa: E402
+from eval.results_io import write_result  # noqa: E402
 
 ROBUST5 = ["snr", "srmr", "speaking_rate", "pause_count", "pause_rate"]
 ILLPOSED = ["f0_mean", "f0_sd", "jitter", "shimmer", "hnr"]
@@ -184,7 +185,8 @@ def main() -> int:
               f"{'OURS WINS' if o < r else 'RIDGE+UQ WINS'}")
         summary[f"_panel_{panel}"] = {"eaurc_ours": float(o), "eaurc_ridge_uq": float(r)}
 
-    json.dump(summary, open(a.out, "w"), indent=2)
+    write_result(summary, out_path=a.out, producer="uq_ridge_baseline",
+                 checkpoint=a.aux_sigma, n=len(keep))
     print(f"\nwrote {a.out}")
     print("READ: lower AURC is better. If ridge+UQ wins the ILL-POSED panel, abstention is not")
     print("a contribution on this corpus and the paper pivots to the ceiling + hedging + the")

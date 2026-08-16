@@ -51,6 +51,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from data.feature_set import SUPERVISED_FEATURES  # noqa: E402
+from eval.results_io import write_result  # noqa: E402
 
 
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
@@ -199,7 +200,8 @@ def main() -> int:
     print("\nREAD: the MIXTURES/CLEAN columns are the ones that matter. Ranking ACROSS")
     print("conditions is already solved (rho ~1.0); the open question is ranking WITHIN one.")
     print("This is an UPPER BOUND on any uncertainty head, sigma included.")
-    json.dump(summary, open(a.out, "w"), indent=2)
+    write_result(summary, out_path=a.out, producer="oracle_error_ceiling",
+                 checkpoint=getattr(a, "aux_sigma", None))
     print(f"\nwrote {a.out}")
     return 0
 

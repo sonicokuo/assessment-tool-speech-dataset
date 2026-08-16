@@ -63,6 +63,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from data.feature_set import SUPERVISED_FEATURES  # noqa: E402
+from eval.results_io import write_result  # noqa: E402
 
 ROBUST5 = ["snr", "srmr", "speaking_rate", "pause_count", "pause_rate"]
 ILLPOSED = ["f0_mean", "f0_sd", "jitter", "shimmer", "hnr"]
@@ -286,7 +287,8 @@ def main() -> int:
         summary[f"_panel_{panel}"] = {"A_sigma": float(mA), "B_ours_gbm": float(mB),
                                       "C_ridge_gbm": float(mC), "B_minus_C": float(mB - mC)}
 
-    json.dump(summary, open(a.out, "w"), indent=2)
+    write_result(summary, out_path=a.out, producer="abstention_3arm",
+                 checkpoint=a.aux_sigma, n=len(keep))
     print(f"\nwrote {a.out}")
     print("READ: B vs C is the ONLY arm pair that isolates our representation — same clips, same")
     print("folds, same GBM. If B ~ C, abstention quality belongs to frozen WavLM and not to us;")
