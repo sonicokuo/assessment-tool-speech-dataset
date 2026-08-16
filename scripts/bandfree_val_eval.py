@@ -26,9 +26,17 @@ from eval.selection_metric import HEADLINE_FEATURES  # frozen ROBUST5 (F8)
 DATA = '/ocean/projects/cis260125p/shared/data'
 # feature -> (gt_source, gt_col)  ; gt_source in {feat, f0, target}
 FEAT = {
-    'snr': ('feat', 'snr_db'), 'srmr': ('feat', 'srmr'), 'hnr': ('feat', 'hnr_db'),
+    # hnr/shimmer FIXED 2026-08-16. They read ('feat','hnr_db') and ('feat','shimmer_pct'),
+    # the exact two column names of the target-builder bug that valued both in 0 of 39,800
+    # targets. But the real defect was the SOURCE, not the key: clean_features_<split>.json
+    # contains neither feature under EITHER name (verified — its only keys are snr_db, srmr and
+    # seven praat_* fields), so renaming alone would have changed nothing. The GT lives in
+    # features_corrected_merged/<split>.csv as plain 'hnr'/'shimmer', populated 6000/6000 on
+    # both dev and test, which is what feature_set.py maps to and score_matched_test.py reads.
+    # load_gt() now overlays that CSV onto the 'feat' source.
+    'snr': ('feat', 'snr_db'), 'srmr': ('feat', 'srmr'), 'hnr': ('feat', 'hnr'),
     'f0_mean': ('f0', 'f0_mean_hz'), 'f0_sd': ('f0', 'f0_sd_hz'),
-    'jitter': ('feat', 'jitter_local_pct'), 'shimmer': ('feat', 'shimmer_pct'),
+    'jitter': ('feat', 'jitter_local_pct'), 'shimmer': ('feat', 'shimmer'),
     'speaking_rate': ('feat', 'praat_speaking_rate_syl_sec'),
     'articulation_rate': ('feat', 'praat_articulation_rate_syl_sec'),
     'pause_count': ('feat', 'praat_pause_count'),
@@ -58,6 +66,57 @@ def load_gt(split):
     if os.path.exists(p0):
         for k, v in json.load(open(p0)).items():
             c0[k] = v
+
+    # Overlay the instrument CSV onto the 'feat' source. clean_features_<split>.json carries
+    # only snr_db, srmr and the praat_* fields; hnr, shimmer and jitter_local_pct live ONLY in
+    # features_corrected_merged/<split>.csv — the same file feature_set.py maps to and
+    # score_matched_test.py reads. Without this, three features score as coverage-only while the
+    # panel still prints a number, which is how hnr and shimmer went unnoticed for weeks.
+    # Existing JSON keys win on conflict, so this can only ADD features, never silently
+    # redefine one that already resolved.
+    csv_p = f'{DATA}/features_corrected_merged/{split}.csv'
+    if os.path.exists(csv_p):
+        import csv as _csv
+        added = 0
+        with open(csv_p, newline='') as fh:
+            for row in _csv.DictReader(fh):
+                fn = (row.get('filename') or '').strip()
+                stem = fn[:-4] if fn.endswith('.wav') else fn
+                if not stem:
+                    continue
+                d = cf.setdefault(stem, {})
+                for col, val in row.items():
+                    if col and col not in d and val not in (None, ''):
+                        d[col] = val
+                        added += 1
+        print(f'[gt] overlaid {csv_p} onto feat source (+{added} field values)')
+    else:
+        print(f'[gt] WARNING: {csv_p} absent — hnr/shimmer/jitter will score coverage-only')
+
+    # Fail loudly rather than silently reporting coverage-only for a mapped feature.
+    #
+    # ⚠️ CHECK COVERAGE ACROSS ALL RECORDS, NOT ONE SAMPLE. The first version of this guard did
+    # `next(iter(cf.values())).keys()` and aborted claiming hnr/shimmer/jitter_local_pct were
+    # missing — while the overlay above had just added 89,576 field values. The two GT sources
+    # do not cover an identical clip set, so a single sampled record is not representative and
+    # a one-sample check produces a confident, wrong verdict. That is the same shape of error
+    # this guard exists to catch.
+    want = {c for s, c in FEAT.values() if s == 'feat' and c}
+    n_rec = len(cf) or 1
+    cover = {c: sum(1 for v in cf.values() if c in v) / n_rec for c in want}
+    absent = sorted(c for c, f in cover.items() if f == 0.0)
+    partial = sorted((c, f) for c, f in cover.items() if 0.0 < f < 0.5)
+    if absent:
+        raise SystemExit(
+            f'[bandfree_val_eval] feat GT resolves on ZERO clips for {absent} (split {split!r}).\n'
+            f'  Fix FEAT against src/data/feature_set.py:SUPERVISED_FEATURES. A mapped feature '
+            f'that resolves to nothing must ABORT, not degrade to a coverage-only row.'
+        )
+    if partial:
+        print('[gt] WARNING: mapped columns resolving on <50% of clips — SRCC for these is '
+              'computed on a SUBSET and is not comparable to a full-coverage number: '
+              + ', '.join(f'{c} {f:.1%}' for c, f in partial))
+    print('[gt] feat coverage: ' + ', '.join(f'{c}={cover[c]:.1%}' for c in sorted(cover)))
     return cf, c0
 
 P = HybridClaimParser()
