@@ -1,59 +1,45 @@
 #!/usr/bin/env python3
-"""metric_discriminative_validity.py — does our instrument metric catch what text metrics miss?
+"""metric_discriminative_validity.py — does the instrument metric catch failures that
+BLEU / ROUGE-L / BERTScore / a numeric-extraction strawman miss?
 
-WHY THIS IS CONTRIBUTION I's LOAD-BEARING EXPERIMENT
-Contribution I claims that numeric claims in generated descriptions must be scored against
-INSTRUMENT ground truth, rather than against human opinion (ALLD/MOS) or a GPT judge
-(QualiSpeech). That is a METHODOLOGY claim, and a methodology claim is only worth publishing if
-the proposed instrument DETECTS SOMETHING THE INCUMBENTS MISS. Asserting it is not enough; this
-script measures it.
+WHY THIS EXISTS
+Contribution I ("instrument-grounded numeric-claim faithfulness") is an EVALUATION
+PROTOCOL. A protocol earns a paper only by demonstrating DISCRIMINATIVE VALIDITY:
+it must move where the incumbent metrics do not, and be invariant where they move
+spuriously. That is a two-sided claim and needs a two-sided experiment.
 
-PART A — THE NATURAL EXPERIMENT (not synthetic, we did not plan it)
-A target-construction bug ("fw" targets) made the LM emit NOTHING for 4 of 11 features: hnr,
-f0_mean, f0_sd and shimmer all at 0.0% on CLEAN clips, where supervision is complete and the
-hedge rule cannot fire. `jitter` — the one ill-posed feature with no target defect — stayed at
-96.7% and is the control. Repairing the targets ("fw2") restored all four to 98.3%. We hold
-GREEDY GENERATIONS FROM BOTH CHECKPOINTS ON THE SAME CLIPS, so this is a paired comparison in
-which a third of the measured quantities silently vanished while the prose stayed fluent.
+METHODOLOGICAL PRECEDENT (verified 2026-08-15 from the arXiv abstracts):
+  Sai, Dixit, Sheth, Mohan & Khapra, "Perturbation CheckLists for Evaluating NLG
+      Evaluation Metrics", EMNLP 2021, arXiv:2109.05771 — perturb the output so that
+      quality changes along ONE criterion only; 25 metrics x 6 tasks x 18 criteria.
+  Kryscinski, McCann, Xiong & Socher, arXiv:1910.12840 — factual-consistency data
+      built by RULE-BASED TRANSFORMATIONS of source sentences.
+  Pagnoni, Balachandran & Tsvetkov, FRANK, NAACL 2021, arXiv:2104.13346 — a typology
+      of factual errors, used to benchmark factuality metrics.
+  Laban, Schnabel, Bennett & Hearst, SummaC, TACL 2021, arXiv:2111.09525.
 
-    If BLEU / ROUGE-L / BERTScore are ~flat across that pair, they are BLIND to the total
-    disappearance of 4 of 11 measured quantities. That is the argument for contribution I,
-    made on a REAL failure rather than a constructed one.
+⚠️ THE NAIVE fw-vs-fw2 EXPERIMENT ARGUES AGAINST US — MEASURED, DO NOT RUN IT THAT WAY.
+Scoring both arms against a FIXED COMPLETE reference, BLEU separates them by +25 sBLEU
+(paired CI [+25.11,+25.18] at n=600 in the synthetic replica). Four missing clauses are
+a large surface change and n-gram metrics see it. Two valid forms instead:
+  (A) SHARED-CLAUSE RESTRICTION — score every text metric on only the clauses BOTH arms
+      emit. Coverage is then matched by construction, the text metrics are matched, and
+      the ONLY moving quantity is the instrument panel on the repaired features.
+  (B) OWN-REFERENCE — score each arm against the reference it was TRAINED on, which is
+      what train.py's val block and inference.py actually logged. The broken arm scores
+      HIGHER. This is the real-world failure and it is documented in our own wandb.
 
-PART B — THE CONTROLLED CORRUPTION CURVE (part A is n=1 failure; this generalises it)
-Part A is a single anecdote and a reviewer will say so. Part B injects GRADED, DELIBERATE numeric
-corruptions into the SAME generations, holding the prose fixed, and traces every metric against
-corruption severity. Four corruption families, because they fail in different ways:
+Usage
+  # synthetic ladder (no checkpoints needed, CPU, seconds)
+  python scripts/metric_discriminative_validity.py ladder --features_csv test.csv -n 600
 
-    omit    — delete a fraction of numeric claims        (the fw failure mode: silence)
-    perturb — scale each value by a relative error       (plausible-but-wrong magnitudes)
-    shuffle — permute values BETWEEN features            (right numbers, wrong quantities)
-    collapse— replace every value with the corpus median (mode collapse / prior-only)
+  # real paired generations (fw vs fw2)
+  python scripts/metric_discriminative_validity.py paired \\
+      --gen_a $SHARED/temperature_redecode.json      --ref_a $SHARED/descriptions_corrected_fw.json  \\
+      --gen_b $SHARED/temperature_redecode_fw2.json  --ref_b $SHARED/descriptions_corrected_fw2.json \\
+      --features_csv $SHARED/features_corrected_merged/test.csv
 
-`shuffle` and `collapse` are the sharpest: they change NO tokens' plausibility and often keep the
-exact multiset of numbers, so a similarity metric cannot see them at all, while the instrument
-metric should fall to chance. A metric that cannot separate `collapse` from the truth is not
-measuring faithfulness.
-
-WHAT IS REPORTED
-For every (family, severity) cell: BLEU-4, ROUGE-L, BERTScore-F1 versus the reference targets, and
-the instrument panel (per-feature SRCC vs instrument GT, plus COVERAGE). Sensitivity is summarised
-as the RELATIVE DROP from the uncorrupted generations, so metrics on different scales are
-comparable. The headline statistic is the ratio of instrument-metric drop to text-metric drop: how
-many times more sensitive the instrument is to a purely numeric failure.
-
-CONTROLS, BECAUSE THIS PROJECT'S DEFECT RATE IS ~1 PER SCRIPT
-* Part A's confound is that the two checkpoints might differ in FLUENCY, not just numbers. The
-  `jitter` control feature (no target defect, 96.7% -> 98.3%) plus the robust five (100% -> 100%)
-  bound that: if the prose were broadly degraded, those would move too.
-* Part B holds the generating model FIXED and edits only numerals, so fluency is constant BY
-  CONSTRUCTION and any text-metric movement is attributable to the digits alone.
-* Corruption is applied to the PARSED SPAN, so a "corrupted" text differs from the original only
-  in the numerals. We verify this by asserting the non-numeric token stream is unchanged.
-* SRCC needs variance: cells whose corrupted predictions are constant (`collapse`) are reported
-  as nan rather than silently scored, and coverage is reported alongside every SRCC so an
-  abstaining or emptied arm can never look accurate. This project already produced exactly that
-  artifact once (an arm's f0 SRCC beat another's only because it emitted f0 on 50.5% of clips).
+Deps: sacrebleu, rouge-score, scipy; bert-score optional (--bertscore).
 """
 from __future__ import annotations
 
@@ -63,264 +49,487 @@ import json
 import os
 import random
 import re
+import statistics
 import sys
-
-import numpy as np
+from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
-from data.feature_set import SUPERVISED_FEATURES  # noqa: E402
-from eval.sfs import HybridClaimParser, SFSScorer  # noqa: E402
+import eval.sfs as sfs  # noqa: E402
 
-# short_name -> CSV column. NEVER look GT up by short name: this corpus has hnr_db/shimmer_pct
-# style columns, and assuming they matched is the exact bug that once zeroed shimmer and HNR in
-# 100% of training targets. A silent nan here would have made the control feature unreadable.
-CSV_COL = {(f[0] if isinstance(f, (tuple, list)) else str(f)):
-           (f[1] if isinstance(f, (tuple, list)) and len(f) > 1 else f[0])
-           for f in SUPERVISED_FEATURES}
+# ── canonical clause order + surface form, per build_canonical_descriptions.py:237-262 ──
+CLAUSES = [
+    ("snr",               "snr_db",                          "The SNR is {} dB."),
+    ("srmr",              "srmr",                            "The SRMR is {}."),
+    ("hnr",               "hnr",                             "The HNR is {} dB."),
+    ("f0_mean",           "f0_mean_hz",                      "The F0 mean is {} Hz."),
+    ("f0_sd",             "f0_sd_hz",                        "The F0 standard deviation SD is {} Hz."),
+    ("jitter",            "jitter_local_pct",                "The jitter is {} percent."),
+    ("shimmer",           "shimmer",                         "The shimmer is {} percent."),
+    ("speaking_rate",     "praat_speaking_rate_syl_sec",     "The speaking rate is {} syl/sec."),
+    ("articulation_rate", "praat_articulation_rate_syl_sec", "The articulation rate is {} syl/sec."),
+    ("pause_count",       "praat_pause_count",               "The pause count is {}."),
+    ("pause_rate",        "praat_pause_rate_per_min",        "The pause rate is {} per min."),
+    ("overlap_ratio",     "overlap_ratio",                   "The overlap ratio is {}."),
+]
+# legacy CSV spellings (the pre-2026-07-28 columns) accepted as fallbacks
+ALT_COL = {"hnr": "hnr_db", "shimmer": "shimmer_pct"}
 
-ROBUST5 = ["snr", "srmr", "speaking_rate", "pause_count", "pause_rate"]
-ILLPOSED = ["f0_mean", "f0_sd", "jitter", "shimmer", "hnr"]
-# the four features the fw target bug silenced, plus the control that it did not touch
-FW_SILENCED = ["hnr", "f0_mean", "f0_sd", "shimmer"]
-FW_CONTROL = "jitter"
+ALL_FEATS = [c[0] for c in CLAUSES]
+INT_FEATS = frozenset({"pause_count"})
+DEAD4 = ("hnr", "f0_mean", "f0_sd", "shimmer")          # the fw target-bug casualties
+ILL5 = ("hnr", "f0_mean", "f0_sd", "jitter", "shimmer")  # ILL_POSED_UNDER_OVERLAP
+HEDGE_SENT = ("Because the speakers overlap heavily, the F0 mean, F0 standard deviation SD, "
+              "jitter, shimmer and HNR cannot be reliably estimated and are not reported.")
 
-NUM_RE = re.compile(r"-?\d+\.?\d*")
+# FLUENCY-AXIS control renderings: different surface, identical numbers, parser-compatible.
+PARA = {
+    "snr": "A signal-to-noise ratio SNR of {} dB was measured.",
+    "srmr": "We obtain a reverberation score SRMR of {}.",
+    "hnr": "The harmonics-to-noise ratio HNR of {} dB characterises the voice.",
+    "f0_mean": "Mean pitch of {} Hz is observed across voiced frames.",
+    "f0_sd": "Across the utterance the F0 SD is {} Hz.",
+    "jitter": "Cycle-to-cycle period variation, jitter of {} percent, is present.",
+    "shimmer": "Amplitude variation, shimmer of {} percent, is present.",
+    "speaking_rate": "Delivery proceeds at a speaking rate of {} syl/sec.",
+    "articulation_rate": "Excluding pauses, the articulation rate of {} syl/sec applies.",
+    "pause_count": "The talker produces {} pauses.",
+    "pause_rate": "The pause rate is {} per min.",
+    "overlap_ratio": "Concurrent talk covers the clip with a ratio of {}.",
+}
 
-
-def srcc(a, b) -> float:
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    ok = np.isfinite(a) & np.isfinite(b)
-    a, b = a[ok], b[ok]
-    if a.size < 10 or np.allclose(a, a[0]) or np.allclose(b, b[0]):
-        return float("nan")
-    def rk(x):
-        o = np.argsort(x, kind="mergesort"); r = np.empty(x.size, float); sx = x[o]; i = 0
-        while i < x.size:
-            j = i + 1
-            while j < x.size and sx[j] == sx[i]:
-                j += 1
-            r[o[i:j]] = 0.5 * (i + j - 1); i = j
-        return r
-    ra, rb = rk(a) - rk(a).mean(), rk(b) - rk(b).mean()
-    d = float(np.sqrt((ra ** 2).sum() * (rb ** 2).sum()))
-    return float((ra * rb).sum() / d) if d > 0 else float("nan")
-
-
-def load_gt(features_csv: str, names: list[str]) -> dict:
-    gt = {}
-    for r in csv.DictReader(open(features_csv)):
-        fn = r.get("filename") or ""
-        stem = fn[:-4] if fn.endswith(".wav") else fn
-        row = {}
-        for nm in names:
-            col = CSV_COL.get(nm, nm)
-            raw = r.get(col, r.get(nm, ""))
-            try:
-                row[nm] = float(raw)
-            except (TypeError, ValueError):
-                pass
-        gt[stem] = row
-    return gt
+NUMRE = re.compile(r"-?\d+\.?\d*")
+_P = sfs.ClaimParser()
+_A = sfs.AbstentionDetector()
 
 
-def claims_of(parser, text: str) -> dict:
+# ── metric backends (fail soft, exactly like src/eval/text_metrics.py) ──────────
+def _bleu_corpus(h, r):
+    import sacrebleu
+    return sacrebleu.corpus_bleu(h, [r]).score
+
+
+def _bleu_sent(h, r):
+    import sacrebleu
+    return [sacrebleu.sentence_bleu(a, [b]).score for a, b in zip(h, r)]
+
+
+def _rouge_l(h, r):
+    from rouge_score import rouge_scorer
+    sc = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+    return [sc.score(b, a)["rougeL"].fmeasure for a, b in zip(h, r)]
+
+
+def mask_numbers(t):
+    """FLUENCY CONTROL: strip every numeral. A number-only corruption leaves this at 100."""
+    return NUMRE.sub("<NUM>", t)
+
+
+def numset_f1(hyp, ref):
+    """THE STRAWMAN a reviewer will propose: extract every numeral, compare as multisets.
+    Blind to feature/value mis-binding by construction (measured: 0.877 under FEATURE-SWAP)."""
+    h, r = NUMRE.findall(hyp), NUMRE.findall(ref)
+    if not h or not r:
+        return 0.0
+    ch, cr = Counter(h), Counter(r)
+    inter = sum((ch & cr).values())
+    p, rc = inter / sum(ch.values()), inter / sum(cr.values())
+    return 2 * p * rc / (p + rc) if (p + rc) else 0.0
+
+
+# ── instrument metric ──────────────────────────────────────────────────────────
+def parse_feats(text):
     out = {}
-    for c in parser.parse(text or ""):
-        if c.feature in SFSScorer.TOLERANCES and c.feature not in out:
+    for c in _P.parse(text or ""):
+        if c.feature not in out:
             out[c.feature] = c.value
     return out
 
 
-def instrument_panel(parser, gens: dict, gt: dict, feats: list[str]) -> dict:
-    """Per-feature SRCC vs instrument GT + COVERAGE. Coverage is reported ALWAYS: an arm that
-    emits nothing must not be able to look accurate on the few clips it did emit."""
-    parsed = {k: claims_of(parser, v) for k, v in gens.items()}
-    out = {}
+def instrument(preds, gts, feats=ALL_FEATS):
+    """band-free SRCC + nMAE + coverage + constant-predictor floor, per feature.
+
+    THREE-WAY COVERAGE, which score_matched_test.py does not currently do: a claim is
+    ASSERTED, HEDGED (AbstentionDetector fires) or SILENTLY OMITTED. Conflating the last
+    two is the defect the unit-swap row exposes.
+    """
+    from scipy.stats import spearmanr
+    res = {}
     for f in feats:
-        pairs = [(p[f], gt[k][f]) for k, p in parsed.items()
-                 if f in p and k in gt and f in gt[k] and np.isfinite(gt[k][f])]
-        n_gt = sum(1 for k in parsed if k in gt and f in gt[k] and np.isfinite(gt[k][f]))
-        out[f] = {
-            "srcc": srcc([a for a, _ in pairs], [b for _, b in pairs]) if pairs else float("nan"),
-            "coverage": (len(pairs) / n_gt) if n_gt else float("nan"),
-            "n": len(pairs),
-        }
-    return out
-
-
-def corrupt(parser, text: str, family: str, sev: float, rng: random.Random,
-            medians: dict) -> str:
-    """Rewrite ONLY the numerals of the parsed claims. Prose is untouched by construction, so any
-    text-metric movement is attributable to digits alone."""
-    cl = parser.parse(text or "")
-    if not cl:
-        return text
-    out = text
-    for c in cl:
-        span = c.raw_text
-        m = NUM_RE.search(span)
-        if not m:
+        xs, ys, n_gt = [], [], 0
+        for p, g in zip(preds, gts):
+            if f not in g:
+                continue
+            n_gt += 1
+            if f in p:
+                xs.append(p[f]); ys.append(g[f])
+        if not n_gt:
             continue
-        if family == "omit":
-            if rng.random() >= sev:
-                continue
-            new = None                                    # drop the whole clause below
-        elif family == "perturb":
-            new = f"{c.value * (1.0 + sev * rng.choice([-1.0, 1.0])):.2f}"
-        elif family == "shuffle":
-            if rng.random() >= sev:
-                continue
-            other = rng.choice([x for x in cl if x.feature != c.feature] or [c])
-            new = f"{other.value:.2f}"
-        elif family == "collapse":
-            if rng.random() >= sev:
-                continue
-            new = f"{medians.get(c.feature, c.value):.2f}"
+        cov = len(xs) / n_gt
+        if len(xs) >= 10:
+            sd = statistics.pstdev(ys)
+            mu = sum(ys) / len(ys)
+            nmae = sum(abs(a - b) for a, b in zip(xs, ys)) / len(xs) / sd if sd > 1e-9 else float("nan")
+            floor = sum(abs(mu - b) for b in ys) / len(ys) / sd if sd > 1e-9 else float("nan")
+            sr = float(spearmanr(xs, ys).correlation)
         else:
-            raise ValueError(family)
+            nmae = floor = sr = float("nan")
+        res[f] = {"srcc": sr, "nmae": nmae, "cov": cov, "floor": floor, "n": len(xs)}
+    return res
 
-        if new is None:
-            # remove the sentence containing this claim, which is what "silence" looks like
-            i = out.find(span)
-            if i < 0:
-                continue
-            s = out.rfind(".", 0, i) + 1
-            e = out.find(".", i)
-            e = len(out) if e < 0 else e + 1
-            out = (out[:s] + out[e:]).replace("  ", " ")
-        else:
-            rep = span[:m.start()] + new + span[m.end():]
-            out = out.replace(span, rep, 1)
+
+def panel(ins, feats):
+    sr = [ins[f]["srcc"] for f in feats if f in ins and ins[f]["srcc"] == ins[f]["srcc"]]
+    nm = [ins[f]["nmae"] for f in feats if f in ins and ins[f]["nmae"] == ins[f]["nmae"]]
+    cv = [ins[f]["cov"] for f in feats if f in ins]
+    return ((sum(sr) / len(sr)) if sr else float("nan"),
+            (sum(nm) / len(nm)) if nm else float("nan"),
+            (sum(cv) / len(cv)) if cv else float("nan"))
+
+
+# ── rendering + corruption operators ───────────────────────────────────────────
+def fmt(feat, v):
+    return f"{int(round(v))}" if feat in INT_FEATS else f"{v:.2f}"
+
+
+def render(vals, para=False, drop=(), unit_swap=(), hedge=False):
+    out = []
+    for feat, _col, tmpl in CLAUSES:
+        if feat in drop or feat not in vals:
+            continue
+        s = (PARA[feat] if para else tmpl).format(fmt(feat, vals[feat]))
+        if feat in unit_swap:
+            s = (s.replace(" dB.", " percent.").replace(" Hz.", " percent.")
+                  .replace(" syl/sec.", " per min."))
+        out.append(s)
+    if hedge:
+        out.append(HEDGE_SENT)
+    return " ".join(out)
+
+
+def load_rows(csv_path, n):
+    rows = []
+    for r in csv.DictReader(open(csv_path)):
+        d, ok = {"__stem": (r.get("filename") or "").rsplit(".", 1)[0]}, True
+        for feat, col, _ in CLAUSES:
+            v = r.get(col)
+            if v in (None, "", "nan"):
+                v = r.get(ALT_COL.get(feat, ""))
+            try:
+                x = float(v)
+                if x != x:
+                    raise ValueError
+                d[feat] = x
+            except (TypeError, ValueError):
+                ok = False
+                break
+        if ok:
+            rows.append(d)
+        if n and len(rows) >= n:
+            break
+    return rows
+
+
+def op_noise(rows, feats, mult, rng):
+    sds = {f: statistics.pstdev([d[f] for d in rows]) for f in feats}
+    out = []
+    for d in rows:
+        nd = dict(d)
+        for f in feats:
+            nd[f] = d[f] + rng.gauss(0, mult * sds[f])
+            if f in INT_FEATS:
+                nd[f] = max(0.0, nd[f])
+        out.append(nd)
     return out
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--gens_fw", help="fw-arm generations JSON (the broken targets)")
-    ap.add_argument("--gens_fw2", required=True, help="fw2-arm generations JSON (repaired)")
-    ap.add_argument("--descriptions", required=True, help="reference targets JSON")
-    ap.add_argument("--features_csv", required=True, help="INSTRUMENT ground truth")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--gen_key", default="gen_T0.0")
-    ap.add_argument("--no_bertscore", action="store_true")
-    ap.add_argument("--seed", type=int, default=0)
-    a = ap.parse_args()
+def op_digit_perm(rows, feats, rng):
+    """same digit tokens, different value — the corruption n-gram metrics reward."""
+    out = []
+    for d in rows:
+        nd = dict(d)
+        for f in feats:
+            s = fmt(f, d[f])
+            dg = [c for c in s if c.isdigit()]
+            rng.shuffle(dg)
+            it = iter(dg)
+            try:
+                nd[f] = float("".join(next(it) if c.isdigit() else c for c in s))
+            except Exception:
+                pass
+        out.append(nd)
+    return out
 
-    from eval.text_metrics import compute_generation_metrics
 
-    parser = HybridClaimParser()
-    feats = ROBUST5 + ILLPOSED
-    gt = load_gt(a.features_csv, feats)
-    missing = [f for f in feats if not any(f in row for row in gt.values())]
-    if missing:
-        raise SystemExit(f"GT columns never resolved for {missing} — check CSV_COL mapping "
-                         f"against {a.features_csv}. Refusing to report nan coverage as a result.")
-    refs_all = json.load(open(a.descriptions))
-
-    def load_gens(p):
-        d = json.load(open(p))
-        recs = d if isinstance(d, list) else list(d.values())
-        out = {}
-        for r in recs:
-            if not isinstance(r, dict):
-                continue
-            k = r.get("clip") or r.get("filename") or ""
-            k = k[:-4] if k.endswith(".wav") else k
-            g = r.get(a.gen_key) or r.get("generated") or r.get("prediction") or ""
-            if k and g:
-                out[k] = g
-        return out
-
-    fw2 = load_gens(a.gens_fw2)
-    fw = load_gens(a.gens_fw) if a.gens_fw else {}
-    report = {}
-
-    def text_metrics(gens: dict, keys: list[str]) -> dict:
-        hyps = [gens[k] for k in keys]
-        refs = [refs_all.get(k, "") for k in keys]
-        return compute_generation_metrics(hyps, refs, use_bertscore=not a.no_bertscore)
-
-    # ---------------------------------------------------------------- PART A
-    if fw:
-        shared = sorted(set(fw) & set(fw2) & set(refs_all))
-        print(f"\n=== PART A — natural experiment (paired, n={len(shared)}) ===", flush=True)
-        if len(shared) < 10:
-            print("  too few paired clips with references; skipping Part A")
-        else:
-            tm_fw, tm_fw2 = text_metrics(fw, shared), text_metrics(fw2, shared)
-            ip_fw = instrument_panel(parser, {k: fw[k] for k in shared}, gt, feats)
-            ip_fw2 = instrument_panel(parser, {k: fw2[k] for k in shared}, gt, feats)
-            print(f"  {'metric':<22}{'fw (broken)':>14}{'fw2 (fixed)':>14}{'delta':>10}")
-            print("  " + "-" * 60)
-            for k in ("bleu", "rouge_l", "bertscore_f1"):
-                x, y = tm_fw.get(k), tm_fw2.get(k)
-                if x is None or y is None:
-                    print(f"  {k:<22}{'n/a':>14}{'n/a':>14}{'':>10}")
-                    continue
-                print(f"  {k:<22}{x:14.4f}{y:14.4f}{y - x:+10.4f}")
-            print(f"  {'-- coverage --':<22}")
-            for f in FW_SILENCED + [FW_CONTROL]:
-                cx, cy = ip_fw[f]["coverage"], ip_fw2[f]["coverage"]
-                tag = "  <- CONTROL (undamaged)" if f == FW_CONTROL else ""
-                print(f"  {f:<22}{cx:14.4f}{cy:14.4f}{cy - cx:+10.4f}{tag}")
-            report["part_a"] = {"n": len(shared), "text_fw": tm_fw, "text_fw2": tm_fw2,
-                                "instrument_fw": ip_fw, "instrument_fw2": ip_fw2}
-
-    # ---------------------------------------------------------------- PART B
-    keys = sorted(set(fw2) & set(refs_all) & set(gt))
-    print(f"\n=== PART B — controlled corruption curve (n={len(keys)}) ===", flush=True)
-    base_gens = {k: fw2[k] for k in keys}
-    medians = {}
+def op_shuffle(rows, feats, rng):
+    """destroy clip-specificity, preserve every marginal distribution exactly."""
+    out = [dict(d) for d in rows]
     for f in feats:
-        vals = [claims_of(parser, base_gens[k]).get(f) for k in keys]
-        vals = [v for v in vals if v is not None and np.isfinite(v)]
-        if vals:
-            medians[f] = float(np.median(vals))
+        col = [d[f] for d in rows]
+        rng.shuffle(col)
+        for i, d in enumerate(out):
+            d[f] = col[i]
+    return out
 
-    base_tm = text_metrics(base_gens, keys)
-    base_ip = instrument_panel(parser, base_gens, gt, feats)
-    base_srcc = float(np.nanmean([base_ip[f]["srcc"] for f in ROBUST5]))
-    print(f"  baseline: BLEU {base_tm.get('bleu')} ROUGE {base_tm.get('rouge_l')} "
-          f"BERTScore {base_tm.get('bertscore_f1')} | instrument robust5 SRCC {base_srcc:.4f}")
 
-    hdr = (f"  {'family':<10}{'sev':>5}{'BLEU':>9}{'ROUGE':>9}{'BERTSc':>9}"
-           f"{'SRCC':>9}{'cov':>7}{'txt drop':>10}{'inst drop':>11}{'ratio':>8}")
-    print("\n" + hdr); print("  " + "-" * (len(hdr) - 2))
-    rows = []
-    for family in ("omit", "perturb", "shuffle", "collapse"):
-        for sev in (0.25, 0.5, 1.0):
-            rng = random.Random(a.seed)
-            cg = {k: corrupt(parser, base_gens[k], family, sev, rng, medians) for k in keys}
-            tm = text_metrics(cg, keys)
-            ip = instrument_panel(parser, cg, gt, feats)
-            sc = float(np.nanmean([ip[f]["srcc"] for f in ROBUST5]))
-            cov = float(np.nanmean([ip[f]["coverage"] for f in ROBUST5]))
-            # relative drop from the uncorrupted generations, so scales are comparable
-            def drop(new, old):
-                return float("nan") if (new is None or old in (None, 0)) else (old - new) / abs(old)
-            td = float(np.nanmean([drop(tm.get(k), base_tm.get(k))
-                                   for k in ("bleu", "rouge_l", "bertscore_f1")]))
-            idrop = drop(sc, base_srcc)
-            ratio = (idrop / td) if (np.isfinite(td) and abs(td) > 1e-9) else float("inf")
-            print(f"  {family:<10}{sev:5.2f}"
-                  f"{(tm.get('bleu') or float('nan')):9.4f}"
-                  f"{(tm.get('rouge_l') or float('nan')):9.4f}"
-                  f"{(tm.get('bertscore_f1') or float('nan')):9.4f}"
-                  f"{sc:9.4f}{cov:7.3f}{td:10.3f}{idrop:11.3f}{ratio:8.1f}")
-            rows.append({"family": family, "severity": sev, "text": tm,
-                         "instrument_robust5_srcc": sc, "coverage_robust5": cov,
-                         "text_rel_drop": td, "instrument_rel_drop": idrop, "ratio": ratio})
-    report["part_b"] = {"n": len(keys), "baseline_text": base_tm,
-                        "baseline_instrument_robust5_srcc": base_srcc, "cells": rows}
+def op_feature_swap(rows, feats, rng):
+    """right numbers, wrong slots. Defeats naive numeric extraction by construction."""
+    out = []
+    for d in rows:
+        perm = list(feats)
+        rng.shuffle(perm)
+        nd = dict(d)
+        for src, dst in zip(feats, perm):
+            nd[dst] = d[src]
+        out.append(nd)
+    return out
 
-    json.dump(report, open(a.out, "w"), indent=2)
-    print(f"\nwrote {a.out}")
-    print("READ: `ratio` is how many times more sensitive the instrument metric is than the mean")
-    print("text metric, for a failure that is PURELY numeric. `shuffle` and `collapse` are the")
-    print("sharpest cases — the prose and often the exact multiset of numbers are unchanged, so a")
-    print("similarity metric is structurally incapable of seeing them. Report coverage beside")
-    print("every SRCC: an emptied arm must never be able to look accurate on what little remains.")
-    return 0
+
+def op_constant(rows, feats):
+    mus = {f: sum(d[f] for d in rows) / len(rows) for f in feats}
+    return [dict(d, **mus) for d in rows]
+
+
+def paired_boot(a, b, n_boot=10000, seed=0, groups=None):
+    """paired percentile bootstrap on mean(a)-mean(b); `groups` enables twin-clustering."""
+    rng = random.Random(seed)
+    d = [x - y for x, y in zip(a, b)]
+    if groups is None:
+        idxs = [[i] for i in range(len(d))]
+    else:
+        byg = {}
+        for i, g in enumerate(groups):
+            byg.setdefault(g, []).append(i)
+        idxs = list(byg.values())
+    m = sum(d) / len(d)
+    s = []
+    for _ in range(n_boot):
+        pick = [idxs[rng.randrange(len(idxs))] for _ in range(len(idxs))]
+        flat = [i for c in pick for i in c]
+        s.append(sum(d[i] for i in flat) / len(flat))
+    s.sort()
+    return m, s[int(0.025 * n_boot)], s[int(0.975 * n_boot)]
+
+
+def tost(a, b, margin, **kw):
+    """equivalence test — the correct form for a BLINDNESS (null) claim.
+    EQUIVALENT iff the whole CI lies inside +/- margin."""
+    m, lo, hi = paired_boot(a, b, **kw)
+    return m, lo, hi, (lo > -margin and hi < margin)
+
+
+def score_all(hyps, refs, gts, bertscore=False, feats=ALL_FEATS):
+    row = {"BLEU": _bleu_corpus(hyps, refs)}
+    sb = _bleu_sent(hyps, refs)
+    rl = _rouge_l(hyps, refs)
+    row["sBLEU"] = sum(sb) / len(sb)
+    row["ROUGE_L"] = sum(rl) / len(rl)
+    row["maskBLEU"] = _bleu_corpus([mask_numbers(h) for h in hyps],
+                                   [mask_numbers(r) for r in refs])
+    row["numF1"] = sum(numset_f1(h, r) for h, r in zip(hyps, refs)) / len(hyps)
+    if bertscore:
+        from bert_score import score as _bs
+        _, _, f1 = _bs(hyps, refs, lang="en", rescale_with_baseline=True, verbose=False)
+        row["BERTScore"] = float(f1.mean())
+    ins = instrument([parse_feats(h) for h in hyps], gts, feats)
+    s, n, c = panel(ins, feats)
+    row.update({"SRCC": s, "nMAE": n, "cov": c})
+    return row, sb, rl, ins
+
+
+HDR = ["BLEU", "sBLEU", "ROUGE_L", "BERTScore", "maskBLEU", "numF1", "SRCC", "nMAE", "cov"]
+
+
+def show(name, row):
+    cells = "".join(f"{row[k]:>10.4f}" if k in row else f"{'--':>10}" for k in HDR)
+    print(f"  {name:<26}{cells}")
+
+
+def cmd_ladder(a):
+    rng = random.Random(a.seed)
+    rows = load_rows(a.features_csv, a.n)
+    refs = [render(d) for d in rows]
+    gts = [parse_feats(r) for r in refs]
+    missing = {f: sum(1 for g in gts if f not in g) for f in ALL_FEATS}
+    bad = {k: v for k, v in missing.items() if v}
+    print(f"[data] n={len(rows)}  parser round-trip failures on the reference: {bad or 'none'}")
+    print(f"[note] a non-empty dict above is a PARSER BUG and invalidates every row below.\n")
+
+    systems = [
+        ("PERFECT (upper bound)",       [dict(d) for d in rows], {}),
+        *[(f"noise {m:>4}sd all", op_noise(rows, ALL_FEATS, m, rng), {})
+          for m in (0.05, 0.10, 0.25, 0.50, 1.00, 2.00, 3.00)],
+        ("digit-permute all",           op_digit_perm(rows, ALL_FEATS, rng), {}),
+        ("FEATURE-SWAP (right nums)",   op_feature_swap(rows, ALL_FEATS, rng), {}),
+        ("shuffle across clips",        op_shuffle(rows, ALL_FEATS, rng), {}),
+        ("constant predictor",          op_constant(rows, ALL_FEATS), {}),
+        ("SIGN FLIP snr",               [dict(d, snr=-d["snr"]) for d in rows], {}),
+        ("UNIT SWAP on 4",              [dict(d) for d in rows], {"unit_swap": DEAD4}),
+        ("OMIT 1 (hnr)",                [dict(d) for d in rows], {"drop": ("hnr",)}),
+        ("OMIT 4 (= the fw bug)",       [dict(d) for d in rows], {"drop": DEAD4}),
+        ("OMIT 8 of 12",                [dict(d) for d in rows], {"drop": tuple(ALL_FEATS[2:10])}),
+        ("PARAPHRASE (nums exact)",     [dict(d) for d in rows], {"para": True}),
+        ("PARAPHRASE + shuffle",        op_shuffle(rows, ALL_FEATS, rng), {"para": True}),
+    ]
+    print("=== CORRUPTION LADDER: text metrics vs the instrument ===")
+    print(f"  {'system':<26}" + "".join(f"{h:>10}" for h in HDR))
+    rec = []
+    for nm, vals, kw in systems:
+        hyps = [render(v, **kw) for v in vals]
+        row, _sb, _rl, _ins = score_all(hyps, refs, gts, bertscore=a.bertscore)
+        show(nm, row)
+        rec.append((nm, row))
+
+    # ordering agreement over the population that all emit 12 numeric clauses
+    from scipy.stats import kendalltau
+    numeric = [r for r in rec if not r[0].startswith(("OMIT", "PARAPHRASE", "UNIT", "PERFECT"))]
+    print("\n=== ORDERING AGREEMENT (the headline blindness statistic) ===")
+    print("  population = systems that all emit 12 numeric clauses, so coverage is matched")
+    S = [r[1]["SRCC"] for r in numeric]
+    keep = [i for i, v in enumerate(S) if v == v]
+    for k in ("BLEU", "ROUGE_L", "BERTScore", "numF1", "maskBLEU"):
+        if k not in numeric[0][1]:
+            continue
+        M = [numeric[i][1][k] for i in keep]
+        Sk = [S[i] for i in keep]
+        inv = tot = 0
+        for i in range(len(M)):
+            for j in range(i + 1, len(M)):
+                if abs(Sk[i] - Sk[j]) < 1e-6:
+                    continue
+                tot += 1
+                inv += (Sk[i] - Sk[j]) * (M[i] - M[j]) < 0
+        print(f"  {k:<10} Kendall tau vs SRCC {kendalltau(M, Sk).correlation:+.3f}   "
+              f"pairwise inversions {inv}/{tot} = {100*inv/max(tot,1):.1f}%")
+
+    # abstention vs fabrication on high-overlap clips
+    hi = [d for d in rows if d.get("overlap_ratio", 0) >= 0.5]
+    if len(hi) >= 30:
+        print(f"\n=== ABSTENTION vs FABRICATION, {len(hi)} clips at overlap >= 0.5 ===")
+        rh = [render(d) for d in hi]
+        gh = [parse_feats(x) for x in rh]
+        for nm, hyps in (("ABSTAINS (correct)", [render(d, drop=ILL5, hedge=True) for d in hi]),
+                         ("FABRICATES (fluent)", [render(v) for v in op_shuffle(hi, ILL5, rng)])):
+            row, _, _, ins = score_all(hyps, rh, gh, bertscore=a.bertscore, feats=list(ILL5))
+            show(nm, row)
+        print("  a text metric that prefers the fabricator cannot be used to evaluate abstention.")
+
+
+def _load_gen(path):
+    """accepts inference_results.json (list of {filename,generated}) or
+    temperature_redecode.json (list of {clip, gen_T0.0})."""
+    d = json.load(open(path))
+    recs = d if isinstance(d, list) else list(d.values())
+    out = {}
+    for r in recs:
+        stem = str(r.get("filename") or r.get("clip") or "").replace(".wav", "").replace(".pt", "")
+        g = r.get("generated")
+        if g is None:
+            for k in r:
+                if k.startswith("gen_T"):
+                    g = r[k]
+                    break
+        if stem and g:
+            out[stem] = g
+    return out
+
+
+def cmd_paired(a):
+    ga, gb = _load_gen(a.gen_a), _load_gen(a.gen_b)
+    ra, rb = json.load(open(a.ref_a)), json.load(open(a.ref_b))
+    stems = sorted(set(ga) & set(gb) & set(ra) & set(rb))
+    print(f"[paired] arm A n={len(ga)}  arm B n={len(gb)}  intersection n={len(stems)}")
+    if len(stems) < 100:
+        print("[warn] n<100. A BLINDNESS claim is an EQUIVALENCE claim and needs a tight CI;\n"
+              "       budget n>=500 paired clips before asserting any null.")
+    HA = [ga[s] for s in stems]
+    HB = [gb[s] for s in stems]
+    RA = [ra[s] for s in stems]
+    RB = [rb[s] for s in stems]
+    gtsB = [parse_feats(x) for x in RB]          # complete reference defines GT
+
+    print("\n=== FORM 0 (NAIVE — measured to ARGUE AGAINST US; reported for completeness) ===")
+    print(f"  {'arm':<26}" + "".join(f"{h:>10}" for h in HDR))
+    rowA, sbA, rlA, insA = score_all(HA, RB, gtsB, bertscore=a.bertscore)
+    rowB, sbB, rlB, insB = score_all(HB, RB, gtsB, bertscore=a.bertscore)
+    show("A vs complete ref", rowA)
+    show("B vs complete ref", rowB)
+    m, lo, hi = paired_boot(sbB, sbA)
+    print(f"  paired sBLEU delta B-A = {m:+.2f} [{lo:+.2f},{hi:+.2f}]"
+          f"  -> a large positive here means the surface change is visible; NOT our claim")
+
+    print("\n=== FORM A (SHARED-CLAUSE RESTRICTION — the valid natural experiment) ===")
+    emitted_A = {f for f in ALL_FEATS
+                 if sum(1 for h in HA if f in parse_feats(h)) > 0.5 * len(HA)}
+    shared = [f for f in ALL_FEATS if f in emitted_A]
+    dropped = [f for f in ALL_FEATS if f not in shared]
+    print(f"  clauses arm A emits: {sorted(shared)}")
+    print(f"  clauses arm A never emits (the natural lesion): {sorted(dropped)}")
+    if dropped:
+        refS = [render(parse_feats(r), drop=tuple(dropped)) for r in RB]
+        HBs = [render(parse_feats(h), drop=tuple(dropped)) for h in HB]
+        HAs = [render(parse_feats(h), drop=tuple(dropped)) for h in HA]
+        print(f"  {'arm (shared clauses only)':<26}" + "".join(f"{h:>10}" for h in HDR))
+        rA, sbA2, rlA2, _ = score_all(HAs, refS, gtsB, bertscore=a.bertscore, feats=shared)
+        rB, sbB2, rlB2, _ = score_all(HBs, refS, gtsB, bertscore=a.bertscore, feats=shared)
+        show("A", rA)
+        show("B", rB)
+        for nm, xa, xb, marg in (("sBLEU", sbB2, sbA2, a.margin_bleu),
+                                 ("ROUGE_L", rlB2, rlA2, a.margin_rouge)):
+            m, lo, hi, eq = tost(xb, xa, marg)
+            print(f"  TOST {nm:<8} delta {m:+.4f} [{lo:+.4f},{hi:+.4f}] margin +/-{marg} -> "
+                  f"{'EQUIVALENT (blind)' if eq else 'NOT equivalent'}")
+        print("  instrument panel on the DROPPED features (the whole effect):")
+        for nm, H in (("A", HA), ("B", HB)):
+            ins = instrument([parse_feats(h) for h in H], gtsB, dropped)
+            s, n, c = panel(ins, dropped)
+            print(f"    arm {nm}: coverage {c:.4f}  SRCC {s:.4f}  nMAE {n:.4f}")
+
+    print("\n=== FORM B (OWN-REFERENCE — what train.py/inference.py actually logged) ===")
+    print(f"  {'arm vs its OWN ref':<26}" + "".join(f"{h:>10}" for h in HDR))
+    gtsA = [parse_feats(x) for x in RA]
+    rA2, sbA3, rlA3, _ = score_all(HA, RA, gtsA, bertscore=a.bertscore)
+    show("A vs ref A", rA2)
+    show("B vs ref B", rowB)
+    m, lo, hi = paired_boot(sbA3, sbB)
+    print(f"  paired sBLEU delta A-B = {m:+.2f} [{lo:+.2f},{hi:+.2f}]"
+          f"  {'<<< THE BROKEN ARM SCORES HIGHER' if lo > 0 else ''}")
+    print("  instrument metric on the SAME generations, complete 12-feature panel:")
+    for nm, ins in (("A", insA), ("B", insB)):
+        s, n, c = panel(ins, ALL_FEATS)
+        print(f"    arm {nm}: coverage {c:.4f}  SRCC {s:.4f}  nMAE {n:.4f}")
+
+    print("\n=== FLUENCY CONTROL (rules out 'the checkpoints just differ in fluency') ===")
+    for nm, H in (("A", HA), ("B", HB)):
+        mb = _bleu_corpus([mask_numbers(x) for x in H], [mask_numbers(x) for x in RB])
+        ln = sum(len(x.split()) for x in H) / len(H)
+        ttr = sum(len(set(x.split())) / max(len(x.split()), 1) for x in H) / len(H)
+        print(f"  arm {nm}: masked-number BLEU {mb:6.2f}   mean length {ln:6.1f} tok   TTR {ttr:.3f}")
+    print("  masked-number BLEU equal => the arms are fluency-matched and every text-metric")
+    print("  difference is attributable to numeric content, not to prose quality.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    L = sub.add_parser("ladder")
+    L.add_argument("--features_csv", required=True)
+    L.add_argument("-n", type=int, default=600)
+    L.add_argument("--seed", type=int, default=0)
+    L.add_argument("--bertscore", action="store_true")
+    L.set_defaults(fn=cmd_ladder)
+    P = sub.add_parser("paired")
+    P.add_argument("--gen_a", required=True, help="the DEFECTIVE arm (fw)")
+    P.add_argument("--ref_a", required=True, help="the reference arm A was TRAINED on")
+    P.add_argument("--gen_b", required=True, help="the REPAIRED arm (fw2)")
+    P.add_argument("--ref_b", required=True, help="the reference arm B was trained on (complete)")
+    P.add_argument("--features_csv", default=None)
+    P.add_argument("--bertscore", action="store_true")
+    P.add_argument("--margin_bleu", type=float, default=1.0)
+    P.add_argument("--margin_rouge", type=float, default=0.01)
+    P.set_defaults(fn=cmd_paired)
+    a = ap.parse_args()
+    return a.fn(a) or 0
 
 
 if __name__ == "__main__":
