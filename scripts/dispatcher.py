@@ -77,7 +77,7 @@ def gate_ceiling_high(_):
     information exists and sigma is merely weak -> the upgrades are justified. Below that they
     would be chasing noise, so the job parks itself with the reason recorded.
     """
-    p = f"{SH}/oracle_error_ceiling.json"
+    p = f"{SH}/results/observability/oracle_error_ceiling.json"
     if not os.path.exists(p):
         return None                                   # upstream not ready yet
     try:
@@ -91,82 +91,82 @@ def gate_ceiling_high(_):
 JOBS = [
     # ---- CPU, no GPU needed; these must never wait on a node ----
     dict(name="zeroed_overlap_recapture", gpu=True,
-         produces=f"{SH}/saliency_zeroovl_test.npz", needs=[],
+         produces=f"{SH}/results/attribution/saliency_zeroovl_test.npz", needs=[],
          cmd=f"{PY} -u scripts/capture_saliency.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/saliency_zeroovl_test.npz --features f0_sd,f0_mean "
+             f"--out {SH}/results/attribution/saliency_zeroovl_test.npz --features f0_sd,f0_mean "
              f"--zero_overlap --limit 600"),
 
     dict(name="aux_sigma_dev", gpu=True,
-         produces=f"{SH}/aux_sigma_s73_dev.json", needs=[],
+         produces=f"{SH}/results/observability/aux_sigma_s73_dev.json", needs=[],
          cmd=f"{PY} -u scripts/dump_aux_sigma.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/val "
-             f"--out {SH}/aux_sigma_s73_dev.json"),
+             f"--out {SH}/results/observability/aux_sigma_s73_dev.json"),
 
     dict(name="aux_readout_L24_audioonly", gpu=True,
-         produces=f"{SH}/aux_l24audioonly_s73.json", needs=[],
+         produces=f"{SH}/results/arms/aux_l24audioonly_s73.json", needs=[],
          cmd=f"cd {SH} && {PY} -u aux_repool.py "
              f"{SH}/checkpoints/full/audioonly_attnconcat_seed73/best.pt "
              f"{SH}/data/processed_corrected/test "
              f"{SH}/data/features_corrected_merged/test.csv "
-             f"{SH}/aux_l24audioonly_s73.json 0 zero_overlap"),
+             f"{SH}/results/arms/aux_l24audioonly_s73.json 0 zero_overlap"),
 
     # ---- gated on a NUMERIC upstream result ----
     dict(name="mdn_or_residual_head", gpu=True, gate=gate_ceiling_high,
-         produces=f"{SH}/residual_head_s73.json",
-         needs=[f"{SH}/oracle_error_ceiling.json", f"{SH}/aux_sigma_s73.json"],
+         produces=f"{SH}/results/observability/residual_head_s73.json",
+         needs=[f"{SH}/results/observability/oracle_error_ceiling.json", f"{SH}/results/observability/aux_sigma_s73.json"],
          cmd=f"{PY} -u scripts/residual_error_head.py "
-             f"--aux_sigma {SH}/aux_sigma_s73.json "
+             f"--aux_sigma {SH}/results/observability/aux_sigma_s73.json "
              f"--features_csv {SH}/data/features_corrected_merged/test.csv "
              f"--pt_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/residual_head_s73.json"),
+             f"--out {SH}/results/observability/residual_head_s73.json"),
 
     # ---- Q1 METHODS SWEEP: the genre invariant. Every accepted comparator swept the METHODS
     # axis (min ~5, typically 8-11); we own the instrument and have never pointed it at a
     # population of methods. capture_saliency already implements three with the D1 sign fix
     # (signed sum for contribution-type methods, norm only for the sensitivity variant).
     dict(name="sweep_grad", gpu=True,
-         produces=f"{SH}/sweep_grad_test.npz", needs=[],
+         produces=f"{SH}/results/attribution/sweep_grad_test.npz", needs=[],
          cmd=f"{PY} -u scripts/capture_saliency.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test --method grad --zero_overlap "
              f"--features f0_sd,f0_mean,hnr,shimmer,jitter --limit 600 "
-             f"--out {SH}/sweep_grad_test.npz"),
+             f"--out {SH}/results/attribution/sweep_grad_test.npz"),
 
     dict(name="sweep_gradxinput", gpu=True,
-         produces=f"{SH}/sweep_gradxinput_test.npz", needs=[],
+         produces=f"{SH}/results/attribution/sweep_gradxinput_test.npz", needs=[],
          cmd=f"{PY} -u scripts/capture_saliency.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test --method gradxinput --zero_overlap "
              f"--features f0_sd,f0_mean,hnr,shimmer,jitter --limit 600 "
-             f"--out {SH}/sweep_gradxinput_test.npz"),
+             f"--out {SH}/results/attribution/sweep_gradxinput_test.npz"),
 
     dict(name="sweep_ig", gpu=True,
-         produces=f"{SH}/sweep_ig_test.npz", needs=[],
+         produces=f"{SH}/results/attribution/sweep_ig_test.npz", needs=[],
          cmd=f"{PY} -u scripts/capture_saliency.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test --method ig --zero_overlap "
              f"--features f0_sd,f0_mean,hnr,shimmer,jitter --limit 600 "
-             f"--out {SH}/sweep_ig_test.npz"),
+             f"--out {SH}/results/attribution/sweep_ig_test.npz"),
 
     # Scoring is gated on the captures: each map is scored against the EXACT oracle map with
     # trivial-null flooring and the resolution ceiling, so a number is only interpretable
     # relative to (ceiling - worst_null).
     dict(name="score_sweep_gradxinput", gpu=False,
-         produces=f"{SH}/score_sweep_gradxinput.txt",
-         needs=[f"{SH}/sweep_gradxinput_test.npz"],
+         produces=f"{SH}/results/attribution/score_sweep_gradxinput.txt",
+         needs=[f"{SH}/results/attribution/sweep_gradxinput_test.npz"],
          cmd=f"{PY} -u scripts/score_attribution.py --oracle {SH}/oracle_maps_test.npz "
-             f"--model_maps {SH}/sweep_gradxinput_test.npz --feature f0_sd "
-             f"> {SH}/score_sweep_gradxinput.txt"),
+             f"--model_maps {SH}/results/attribution/sweep_gradxinput_test.npz --feature f0_sd "
+             f"> {SH}/results/attribution/score_sweep_gradxinput.txt"),
 
     dict(name="score_sweep_ig", gpu=False,
-         produces=f"{SH}/score_sweep_ig.txt",
-         needs=[f"{SH}/sweep_ig_test.npz"],
+         produces=f"{SH}/results/attribution/score_sweep_ig.txt",
+         needs=[f"{SH}/results/attribution/sweep_ig_test.npz"],
          cmd=f"{PY} -u scripts/score_attribution.py --oracle {SH}/oracle_maps_test.npz "
-             f"--model_maps {SH}/sweep_ig_test.npz --feature f0_sd "
-             f"> {SH}/score_sweep_ig.txt"),
+             f"--model_maps {SH}/results/attribution/sweep_ig_test.npz --feature f0_sd "
+             f"> {SH}/results/attribution/score_sweep_ig.txt"),
 
     # ---- n=1 -> n=2 on the causal result. The f0_mean CAUSAL finding (b_int 0.377 vs b_within
     # 0.052) is currently ONE seed; the calibration says no accepted comparator had n=1 on its
@@ -176,13 +176,13 @@ JOBS = [
     # has 100% coverage and cannot abstain). If it wins the ill-posed panel, contribution III is
     # not a contribution on this corpus. A reviewer builds this in an afternoon — have it first.
     dict(name="uq_ridge_baseline", gpu=False,
-         produces=f"{SH}/uq_ridge_baseline.json",
-         needs=[f"{SH}/aux_sigma_s73.json"],
+         produces=f"{SH}/results/baselines/uq_ridge_baseline.json",
+         needs=[f"{SH}/results/observability/aux_sigma_s73.json"],
          cmd=f"{PY} -u scripts/uq_ridge_baseline.py "
-             f"--aux_sigma {SH}/aux_sigma_s73.json "
+             f"--aux_sigma {SH}/results/observability/aux_sigma_s73.json "
              f"--features_csv {SH}/data/features_corrected_merged/test.csv "
              f"--pt_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/uq_ridge_baseline.json"),
+             f"--out {SH}/results/baselines/uq_ridge_baseline.json"),
 
     # ---- CRITICAL PATH as of the G.2j retraction. All three shipping arms trained on `fw`
     # (checkpoint-verified), whose clean clips carry ZERO f0/hnr/shimmer supervision. Every
@@ -207,13 +207,13 @@ JOBS = [
     # mean+std; our head is mean-only, and f0_sd IS a variability statistic)? A 2x2 linear probe
     # on the same frozen features answers it with no training. CPU-only.
     dict(name="ridge_probe_2x2", gpu=False,
-         produces=f"{SH}/ridge_probe_2x2.json", needs=[],
+         produces=f"{SH}/results/baselines/ridge_probe_2x2.json", needs=[],
          cmd=f"{PY} -u scripts/ridge_probe_2x2.py "
              f"--train_dir {SH}/data/processed_layer7/train "
              f"--test_dir {SH}/data/processed_layer7/test "
              f"--train_csv {SH}/data/features_corrected_merged/train-100.csv "
              f"--test_csv {SH}/data/features_corrected_merged/test.csv "
-             f"--out {SH}/ridge_probe_2x2.json"),
+             f"--out {SH}/results/baselines/ridge_probe_2x2.json"),
 
     # Second seed on the CORRECTED targets. Two seeds is the minimum for any stability claim,
     # and this fills the otherwise-idle allocation: the 2x2 ridge probe is CPU-only sklearn, so
@@ -232,34 +232,34 @@ JOBS = [
     # (0.5372) now that those heads are no longer trained on clean clips only?
     # aux_repool is the fast readout — minutes, and it gives the ridge comparison directly.
     dict(name="aux_readout_fw2_s73", gpu=True,
-         produces=f"{SH}/aux_l7_fw2_s73.json",
+         produces=f"{SH}/results/arms/aux_l7_fw2_s73.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/TRAINING_COMPLETE"],
          cmd=f"cd {SH} && {PY} -u aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
-             f"{SH}/aux_l7_fw2_s73.json 0 zero_overlap"),
+             f"{SH}/results/arms/aux_l7_fw2_s73.json 0 zero_overlap"),
 
     dict(name="aux_readout_fw2_s42", gpu=True,
-         produces=f"{SH}/aux_l7_fw2_s42.json",
+         produces=f"{SH}/results/arms/aux_l7_fw2_s42.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed42/TRAINING_COMPLETE"],
          cmd=f"cd {SH} && {PY} -u aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_fw2_seed42/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
-             f"{SH}/aux_l7_fw2_s42.json 0 zero_overlap"),
+             f"{SH}/results/arms/aux_l7_fw2_s42.json 0 zero_overlap"),
 
     # Emission is an LM-path question, so it needs the generation pass. 60 clean clips is
     # enough to separate 0% from ~100%; the full 6000-clip eval follows only if this shows
     # the features returning.
     dict(name="emission_check_fw2", gpu=True,
-         produces=f"{SH}/temperature_redecode_fw2.json",
+         produces=f"{SH}/results/arms/temperature_redecode_fw2.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_fw2_seed73/TRAINING_COMPLETE"],
          cmd=f"{PY} -u scripts/temperature_redecode.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
              f"--config {RV}/configs/config.l7audioonly.s73.fw2RETRAIN.yaml "
              f"--test_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/temperature_redecode_fw2.json --n 60 --temps 0.0"),
+             f"--out {SH}/results/arms/temperature_redecode_fw2.json --n 60 --temps 0.0"),
 
     # ---- THE ARM-ISOLATING COMPARISON. residual_error_head showed a post-hoc GBM beating our
     # LEARNED sigma head on 10/11 features (0.214 -> 0.300 within-condition), which CLOSES the
@@ -279,13 +279,13 @@ JOBS = [
     # normalisation, the audited src/eval/faithfulness_metrics module instead of hand-rolled
     # AURC, and arm B reading the ADAPTER representation (dump_aux_sigma --dump_repr).
     dict(name="abstention_3arm", gpu=False, disabled=True,
-         produces=f"{SH}/abstention_3arm_s73.json",
-         needs=[f"{SH}/aux_sigma_s73.json"],
+         produces=f"{SH}/results/observability/abstention_3arm_s73.json",
+         needs=[f"{SH}/results/observability/aux_sigma_s73.json"],
          cmd=f"{PY} -u scripts/abstention_3arm.py "
-             f"--aux_sigma {SH}/aux_sigma_s73.json "
+             f"--aux_sigma {SH}/results/observability/aux_sigma_s73.json "
              f"--features_csv {SH}/data/features_corrected_merged/test.csv "
              f"--pt_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/abstention_3arm_s73.json"),
+             f"--out {SH}/results/observability/abstention_3arm_s73.json"),
 
     # ---- G.2q: THE DECISIVE LEVER FOR THE ILL-POSED PANEL. The aux-MSE hedge mask supervises
     # f0_mean/f0_sd/jitter/shimmer/hnr on CLEAN CLIPS ONLY (overlap>=0.5 covers 99.1% of
@@ -305,13 +305,13 @@ JOBS = [
     # Matched readout: same command as the fw/fw2 rows, so the ill-posed panel is comparable
     # against the tuned L7 ridge (0.5153) on the identical 6000 clips.
     dict(name="aux_readout_unmasked_s73", gpu=True,
-         produces=f"{SH}/aux_l7_unmasked_s73.json",
+         produces=f"{SH}/results/arms/aux_l7_unmasked_s73.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
          cmd=f"cd {SH} && {PY} -u aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
-             f"{SH}/aux_l7_unmasked_s73.json 0 zero_overlap"),
+             f"{SH}/results/arms/aux_l7_unmasked_s73.json 0 zero_overlap"),
 
     # ---- CONTRIBUTION 1's PANEL, MEASURABLE FOR THE FIRST TIME. Under `fw` the LM emitted
     # NOTHING for hnr/f0_mean/f0_sd/shimmer (0.0%, G.2o), so a free-decode coverage column on
@@ -325,7 +325,7 @@ JOBS = [
     # a crashed run would never relaunch. The marker is written only on a zero-exit run.
     # Relaunch is safe either way: inference.py auto-resumes, skipping already-scored filenames.
     dict(name="freedecode_fw2_s73", gpu=True,
-         produces=f"{SH}/freedecode_fw2_s73.DONE", needs=[],
+         produces=f"{SH}/results/arms/freedecode_fw2_s73.DONE", needs=[],
          cmd=f"{PY} -u src/inference.py "
              f"--config {RV}/configs/config.l7audioonly.s73.fw2RETRAIN.yaml "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_fw2_seed73/best.pt "
@@ -335,18 +335,18 @@ JOBS = [
              # gives a usable panel; inference.py auto-resumes, so clips already generated
              # are kept. Report n with the panel.
              f"--test_dir {SH}/data/processed_layer7/test --top_k 1 --start 0 --end 600 "
-             f"--out {SH}/freedecode_fw2_s73.json "
-             f"&& touch {SH}/freedecode_fw2_s73.DONE"),
+             f"--out {SH}/results/arms/freedecode_fw2_s73.json "
+             f"&& touch {SH}/results/arms/freedecode_fw2_s73.DONE"),
 
     # Scored against the INSTRUMENT CSV (the default), so the parser touches predictions only
     # and no value is laundered through the verbalizer into "truth".
     dict(name="score_freedecode_fw2", gpu=False,
-         produces=f"{SH}/freedecode_fw2_s73.scored.txt",
-         needs=[f"{SH}/freedecode_fw2_s73.DONE"],
+         produces=f"{SH}/results/arms/freedecode_fw2_s73.scored.txt",
+         needs=[f"{SH}/results/arms/freedecode_fw2_s73.DONE"],
          cmd=f"{PY} -u scripts/score_matched_test.py "
              f"--features_csv {SH}/data/features_corrected_merged/test.csv "
-             f"{SH}/data/descriptions_corrected_fw2.json {SH}/freedecode_fw2_s73.json "
-             f"> {SH}/freedecode_fw2_s73.scored.txt 2>&1"),
+             f"{SH}/data/descriptions_corrected_fw2.json {SH}/results/arms/freedecode_fw2_s73.json "
+             f"> {SH}/results/arms/freedecode_fw2_s73.scored.txt 2>&1"),
 
     # ---- DID THE MASK FIX BUY ACCURACY BY BREAKING ABSTENTION? G.2u moved the ill-posed panel
     # +0.087 and now beats the ridge, but the point estimate now trains on overlapped clips and
@@ -355,23 +355,23 @@ JOBS = [
     # untouched, but that is an argument, not a measurement. No abstention claim on this
     # checkpoint until both of these return.
     dict(name="sigma_unmasked", gpu=True,
-         produces=f"{SH}/aux_sigma_unmasked_s73.json",
+         produces=f"{SH}/results/observability/aux_sigma_unmasked_s73.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
          cmd=f"{PY} -u scripts/dump_aux_sigma.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/aux_sigma_unmasked_s73.json"),
+             f"--out {SH}/results/observability/aux_sigma_unmasked_s73.json"),
 
     # Coverage side: f0 was 99.0% on clean vs 2.1% under overlap on fw2. If unmasking made the
     # model emit f0 under overlap, the abstention behaviour is damaged and contribution II with it.
     dict(name="emission_unmasked", gpu=True,
-         produces=f"{SH}/temperature_redecode_unmasked.json",
+         produces=f"{SH}/results/arms/temperature_redecode_unmasked.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
          cmd=f"{PY} -u scripts/temperature_redecode.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
              f"--config {RV}/configs/config.l7audioonly.s73.unmasked.yaml "
              f"--test_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/temperature_redecode_unmasked.json --n 60 --temps 0.0"),
+             f"--out {SH}/results/arms/temperature_redecode_unmasked.json --n 60 --temps 0.0"),
 
     # ---- THE REAL ABSTENTION REGRESSION TEST. `emission_unmasked` reads ONLY _s1clean files
     # (temperature_redecode.py:117-118), where overlap_ratio is exactly 0 and the hedge rule can
@@ -380,22 +380,22 @@ JOBS = [
     # WITHHOLDS under overlap (fw2: f0 coverage 99.0% clean vs 2.1% overlap). Only a mixed
     # clean+mixture decode answers that, because coverage must be split BY CONDITION.
     dict(name="freedecode_unmasked", gpu=True,
-         produces=f"{SH}/freedecode_unmasked_s73.DONE",
+         produces=f"{SH}/results/arms/freedecode_unmasked_s73.DONE",
          needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed73/TRAINING_COMPLETE"],
          cmd=f"{PY} -u src/inference.py "
              f"--config {RV}/configs/config.l7audioonly.s73.unmasked.yaml "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_unmasked_seed73/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test --top_k 1 --start 0 --end 600 "
-             f"--out {SH}/freedecode_unmasked_s73.json "
-             f"&& touch {SH}/freedecode_unmasked_s73.DONE"),
+             f"--out {SH}/results/arms/freedecode_unmasked_s73.json "
+             f"&& touch {SH}/results/arms/freedecode_unmasked_s73.DONE"),
 
     dict(name="score_freedecode_unmasked", gpu=False,
-         produces=f"{SH}/freedecode_unmasked_s73.scored.txt",
-         needs=[f"{SH}/freedecode_unmasked_s73.DONE"],
+         produces=f"{SH}/results/arms/freedecode_unmasked_s73.scored.txt",
+         needs=[f"{SH}/results/arms/freedecode_unmasked_s73.DONE"],
          cmd=f"{PY} -u scripts/score_matched_test.py "
              f"--features_csv {SH}/data/features_corrected_merged/test.csv "
-             f"{SH}/data/descriptions_corrected_fw2.json {SH}/freedecode_unmasked_s73.json "
-             f"> {SH}/freedecode_unmasked_s73.scored.txt 2>&1"),
+             f"{SH}/data/descriptions_corrected_fw2.json {SH}/results/arms/freedecode_unmasked_s73.json "
+             f"> {SH}/results/arms/freedecode_unmasked_s73.scored.txt 2>&1"),
 
     # ---- SEED 42 OF THE UNMASKED ARM. Now REQUIRED, not optional: the corrected ridge baseline
     # (TUNED L7 = 0.7200 / 0.5372, not the untuned 0.7035 / 0.5153 first used) puts our ill-posed
@@ -411,32 +411,32 @@ JOBS = [
               f"&& touch {SH}/checkpoints/full/l7audioonly_unmasked_seed42/TRAINING_COMPLETE")),
 
     dict(name="aux_readout_unmasked_s42", gpu=True,
-         produces=f"{SH}/aux_l7_unmasked_s42.json",
+         produces=f"{SH}/results/arms/aux_l7_unmasked_s42.json",
          needs=[f"{SH}/checkpoints/full/l7audioonly_unmasked_seed42/TRAINING_COMPLETE"],
          cmd=f"cd {SH} && {PY} -u aux_repool.py "
              f"{SH}/checkpoints/full/l7audioonly_unmasked_seed42/best.pt "
              f"{SH}/data/processed_layer7/test "
              f"{SH}/data/features_corrected_merged/test.csv "
-             f"{SH}/aux_l7_unmasked_s42.json 0 zero_overlap"),
+             f"{SH}/results/arms/aux_l7_unmasked_s42.json 0 zero_overlap"),
 
     # Sigma error-ranking on the unmasked arm: the other half of the abstention regression test.
     # Ran attached once and died with the ssh session; belongs in the dispatcher, detached.
     dict(name="residual_head_unmasked", gpu=False,
-         produces=f"{SH}/residual_head_unmasked_s73.json",
-         needs=[f"{SH}/aux_sigma_unmasked_s73.json"],
+         produces=f"{SH}/results/observability/residual_head_unmasked_s73.json",
+         needs=[f"{SH}/results/observability/aux_sigma_unmasked_s73.json"],
          cmd=f"{PY} -u scripts/residual_error_head.py "
-             f"--aux_sigma {SH}/aux_sigma_unmasked_s73.json "
+             f"--aux_sigma {SH}/results/observability/aux_sigma_unmasked_s73.json "
              f"--features_csv {SH}/data/features_corrected_merged/test.csv "
              f"--pt_dir {SH}/data/processed_layer7/test "
-             f"--out {SH}/residual_head_unmasked_s73.json"),
+             f"--out {SH}/results/observability/residual_head_unmasked_s73.json"),
 
     dict(name="pitch_probe_seed42", gpu=True,
-         produces=f"{SH}/pitch_intervention_s42.json", needs=[],
+         produces=f"{SH}/results/causal/pitch_intervention_s42.json", needs=[],
          cmd=f"{PY} -u scripts/pitch_intervention.py "
              f"--checkpoint {SH}/checkpoints/full/l7audioonly_attnconcat_seed42/best.pt "
              f"--test_dir {SH}/data/processed_layer7/test "
              f"--clean_dir {SH}/data/audio_corrected/test-s1clean "
-             f"--out {SH}/pitch_intervention_s42.json --n 40"),
+             f"--out {SH}/results/causal/pitch_intervention_s42.json --n 40"),
 ]
 
 
