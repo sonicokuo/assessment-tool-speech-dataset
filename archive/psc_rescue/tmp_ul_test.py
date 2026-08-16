@@ -1,0 +1,18 @@
+import torch, torch.nn.functional as F
+def unlikelihood_token_loss(logits, targets, mask, eps=1e-6):
+    B,L,V=logits.shape; p=F.softmax(logits.float(),-1)
+    ctx=targets.unsqueeze(1).expand(B,L,L); tri=torch.tril(torch.ones(L,L,device=logits.device),-1).bool()
+    valid=tri.unsqueeze(0).expand(B,L,L).clone(); valid&=(ctx!=targets.unsqueeze(2))
+    valid&=mask.bool().unsqueeze(2)&mask.bool().unsqueeze(1)
+    p_cand=torch.gather(p,2,ctx.clamp(min=0))
+    return -(torch.log(torch.clamp(1.0-p_cand,min=eps))*valid.float()).sum()/valid.float().sum().clamp(min=1)
+B,L,V=2,6,50; targets=torch.tensor([[1,2,3,4,5,6],[1,2,3,4,5,6]]); mask=torch.ones(B,L)
+# Case A: at last pos (target=6) model confidently emits token 1 = a PREVIOUS NON-target token (wrong repetition)
+lA=torch.zeros(B,L,V); lA[:,5,1]=8.0; lA.requires_grad_(True)
+ulA=unlikelihood_token_loss(lA,targets,mask); ulA.backward()
+# Case B: at last pos model confidently emits token 6 = the correct target (no wrong repetition)
+lB=torch.zeros(B,L,V); lB[:,5,6]=8.0; lB.requires_grad_(True)
+ulB=unlikelihood_token_loss(lB,targets,mask)
+print(f'UL(wrong-repetition of prev token)={ulA.item():.4f}  UL(correct-target)={ulB.item():.4f}')
+print(f'finite={torch.isfinite(ulA).item()} grad_nonzero={lA.grad.abs().sum().item()>0}')
+print('VERDICT:','OK - penalizes wrong repetition, finite, differentiable' if (ulA.item()>ulB.item()+0.01 and torch.isfinite(ulA).item() and lA.grad.abs().sum().item()>0) else 'FAIL')
